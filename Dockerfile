@@ -32,10 +32,10 @@ ENV GO_DISCOVERY_DATABASE_USER=postgres \
     GO_DISCOVERY_DATABASE_HOST=postgres \
     GO_DISCOVERY_DATABASE_NAME=discovery-db
 
-EXPOSE 8080
+EXPOSE 3000
 # The entrypoint is missing the value of the -proxy_url argument.
 # This is intentional so users can use the docker image by running it as
 #
 #    docker run pkgsite <proxy-url>
 #
-ENTRYPOINT ["frontend", "-http", ":8080", "-static", "/var/lib/pkgsite/content/static", "-third_party", "/var/lib/pkgsite/third_party", "-direct_proxy", "-proxy_url"]
+ENTRYPOINT ["frontend", "-http", ":3000", "-static", "/var/lib/pkgsite/content/static", "-third_party", "/var/lib/pkgsite/third_party", "-direct_proxy", "-proxy_url"]
