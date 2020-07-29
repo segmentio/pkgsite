@@ -50,8 +50,8 @@ func New(rawurl string) (_ *Client, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("url.Parse: %v", err)
 	}
-	if url.Scheme != "https" {
-		return nil, fmt.Errorf("scheme must be https (got %s)", url.Scheme)
+	if url.Scheme != "http" && url.Scheme != "https" {
+		return nil, fmt.Errorf("scheme must be http or https (got %s)", url.Scheme)
 	}
 	cleanURL := strings.TrimRight(rawurl, "/")
 	return &Client{url: cleanURL, httpClient: &http.Client{Transport: &ochttp.Transport{}}}, nil
