@@ -1,0 +1,17 @@
+.dockerignore
+Dockerfile
+docker-compose*
+.circleci
+.dockerignore
+.git
+.github
+.gitignore
+*.so
+*.out
+*.md
+*.test
+*_test.go
+/frontend
+/prober
+/teeproxy
+/worker

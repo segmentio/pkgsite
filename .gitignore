@@ -5,6 +5,10 @@
 *.dll
 *.so
 *.dylib
+/frontend
+/prober
+/teeproxy
+/worker
 
 # Test binary, built with `go test -c`
 *.test
@@ -34,3 +38,6 @@ go-discovery*.json
 
 #### Loadtest Related Files ####
 results.bin
+
+# Emacs
+*~

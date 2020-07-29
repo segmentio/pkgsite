@@ -42,6 +42,7 @@ var (
 		"for direct proxy mode and frontend fetches")
 	directProxy = flag.Bool("direct_proxy", false, "if set to true, uses the module proxy referred to by this URL "+
 		"as a direct backend, bypassing the database")
+	httpAddr = flag.String("http", "localhost:8080", "address to listen for incoming requests on")
 )
 
 func main() {
@@ -167,7 +168,7 @@ func main() {
 		middleware.Timeout(54*time.Second),
 		middleware.Experiment(experimenter),
 	)
-	addr := cfg.HostAddr("localhost:8080")
+	addr := cfg.HostAddr(*httpAddr)
 	log.Infof(ctx, "Listening on addr %s", addr)
 	log.Fatal(ctx, http.ListenAndServe(addr, mw(router)))
 }
