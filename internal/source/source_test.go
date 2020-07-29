@@ -274,6 +274,16 @@ func TestModuleInfo(t *testing.T) {
 			"https://gitea.com/azhai/xorm/raw/tag/v1.0.3/log/logger.go",
 		},
 		{
+			"gogs",
+			"gogs.doschain.org/doschain/slog", "v1.0.0", "doc.go",
+
+			"https://gogs.doschain.org/doschain/slog",
+			"https://gogs.doschain.org/doschain/slog/src/v1.0.0",
+			"https://gogs.doschain.org/doschain/slog/src/v1.0.0/doc.go",
+			"https://gogs.doschain.org/doschain/slog/src/v1.0.0/doc.go#L1",
+			"https://gogs.doschain.org/doschain/slog/raw/v1.0.0/doc.go",
+		},
+		{
 			"v2 as a branch",
 			"github.com/jrick/wsrpc/v2", "v2.1.1", "rpc.go",
 
@@ -848,5 +858,28 @@ func TestJSON(t *testing.T) {
 		if out != want {
 			t.Errorf("got  %#v\nwant %#v", out, want)
 		}
+	}
+}
+
+func TestURLTemplates(t *testing.T) {
+	// Check that templates contain the right variables.
+
+	for _, p := range patterns {
+		check := func(tmpl string, vars ...string) {
+			if tmpl == "" {
+				return
+			}
+			for _, v := range vars {
+				w := "{" + v + "}"
+				if !strings.Contains(tmpl, w) {
+					t.Errorf("in pattern %s, template %q is missing %s", p.pattern, tmpl, w)
+				}
+			}
+		}
+
+		check(p.templates.Directory, "commit", "dir")
+		check(p.templates.File, "commit", "file")
+		check(p.templates.Line, "commit", "file", "line")
+		check(p.templates.Raw, "commit", "file")
 	}
 }

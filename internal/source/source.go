@@ -449,7 +449,7 @@ var patterns = []struct {
 		templates: githubURLTemplates,
 	},
 	{
-		// Assume that any site beginning "gitlab." works like gitlab.com.
+		// Assume that any site beginning with "gitlab." works like gitlab.com.
 		pattern:   `^(?P<repo>gitlab\.[a-z0-9A-Z.-]+/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
 		templates: githubURLTemplates,
 	},
@@ -488,29 +488,39 @@ var patterns = []struct {
 		templates: urlTemplates{
 			Directory: "{repo}/-/tree/{commit}/{dir}",
 			File:      "{repo}/-/blob/{commit}/{file}",
-			Line:      "{repo}/-/blob/{commit}/{file}#L1",
+			Line:      "{repo}/-/blob/{commit}/{file}#L{line}",
 			Raw:       "{repo}/-/raw/{commit}/{file}",
 		},
 	},
 	{
-		pattern: `^(?P<repo>gitea\.com/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
-		templates: urlTemplates{
-			Directory: "{repo}/src/{commit}/{dir}",
-			File:      "{repo}/src/{commit}/{file}",
-			Line:      "{repo}/src/{commit}/{file}#L1",
-			Raw:       "{repo}/raw/{commit}/{file}",
-		},
-		transformCommit: func(commit string, isHash bool) string {
-			// Hashes use "commit", tags use "tag".
-			// Short hashes aren't currently supported, but we build the URL
-			// anyway in the hope that someday they will be.
-			if isHash {
-				return "commit/" + commit
-			}
-			return "tag/" + commit
-		},
+		pattern:         `^(?P<repo>gitea\.com/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
+		templates:       giteaURLTemplates,
+		transformCommit: giteaTransformCommit,
 	},
-
+	{
+		// Assume that any site beginning with "gitea." works like gitea.com.
+		pattern:         `^(?P<repo>gitea\.[a-z0-9A-Z.-]+/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
+		templates:       giteaURLTemplates,
+		transformCommit: giteaTransformCommit,
+	},
+	{
+		pattern:         `^(?P<repo>go\.isomorphicgo\.org/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
+		templates:       giteaURLTemplates,
+		transformCommit: giteaTransformCommit,
+	},
+	{
+		pattern:         `^(?P<repo>git\.openprivacy\.ca/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
+		templates:       giteaURLTemplates,
+		transformCommit: giteaTransformCommit,
+	},
+	{
+		pattern: `^(?P<repo>gogs\.[a-z0-9A-Z.-]+/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
+		// Gogs uses the same basic structure as Gitea, but omits the type of
+		// commit ("tag" or "commit"), so we don't need a transformCommit
+		// function. Gogs does not support short hashes, but we create those
+		// URLs anyway. See gogs/gogs#6242.
+		templates: giteaURLTemplates,
+	},
 	// Patterns that match the general go command pattern, where they must have
 	// a ".git" repo suffix in an import path. If matching a repo URL from a meta tag,
 	// there is no ".git".
@@ -539,6 +549,7 @@ var patterns = []struct {
 func init() {
 	for i := range patterns {
 		re := regexp.MustCompile(patterns[i].pattern)
+		// The pattern regexp must contain a group named "repo".
 		found := false
 		for _, n := range re.SubexpNames() {
 			if n == "repo" {
@@ -551,6 +562,17 @@ func init() {
 		}
 		patterns[i].re = re
 	}
+}
+
+// giteaTransformCommit transforms commits for the Gitea code hosting system.
+func giteaTransformCommit(commit string, isHash bool) string {
+	// Hashes use "commit", tags use "tag".
+	// Short hashes aren't currently supported, but we build the URL
+	// anyway in the hope that someday they will be.
+	if isHash {
+		return "commit/" + commit
+	}
+	return "tag/" + commit
 }
 
 // urlTemplates describes how to build URLs from bits of source information.
@@ -574,6 +596,12 @@ var (
 		Directory: "{repo}/src/{commit}/{dir}",
 		File:      "{repo}/src/{commit}/{file}",
 		Line:      "{repo}/src/{commit}/{file}#lines-{line}",
+		Raw:       "{repo}/raw/{commit}/{file}",
+	}
+	giteaURLTemplates = urlTemplates{
+		Directory: "{repo}/src/{commit}/{dir}",
+		File:      "{repo}/src/{commit}/{file}",
+		Line:      "{repo}/src/{commit}/{file}#L{line}",
 		Raw:       "{repo}/raw/{commit}/{file}",
 	}
 )
