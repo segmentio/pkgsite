@@ -11,6 +11,14 @@ COPY . /build
 RUN cd /build && go build ./cmd/frontend
 
 FROM ubuntu
+
+# this is necessary to prevent tzdata from prompting for geographic area
+ENV DEBIAN_FRONTEND=noninteractive
+RUN ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime && \
+    apt-get update && \
+    apt-get install -y tzdata && \
+    dpkg-reconfigure --frontend noninteractive tzdata
+
 RUN apt-get update && apt-get install -y ca-certificates curl gnupg lsb-core
 # golang-migrate/migrate is used to mange migrations, probably useful to have
 # it on the image.
