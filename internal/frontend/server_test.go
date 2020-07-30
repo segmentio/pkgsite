@@ -204,7 +204,7 @@ func serverTestCases() []serverTestCase {
 	)
 
 	pkgV100 := &pagecheck.Page{
-		Title:            "package foo",
+		Title:            "Package foo",
 		ModulePath:       sample.ModulePath,
 		Version:          "v1.0.0",
 		Suffix:           "foo",
@@ -227,7 +227,7 @@ func serverTestCases() []serverTestCase {
 	pkgPseudo := &pp
 
 	pkgInc := &pagecheck.Page{
-		Title:            "package inc",
+		Title:            "Package inc",
 		ModulePath:       "github.com/incompatible",
 		Version:          "v1.0.0+incompatible",
 		Suffix:           "dir/inc",
@@ -240,7 +240,7 @@ func serverTestCases() []serverTestCase {
 	}
 
 	pkgNonRedist := &pagecheck.Page{
-		Title:            "package bar",
+		Title:            "Package bar",
 		ModulePath:       "github.com/non_redistributable",
 		Version:          "v1.0.0",
 		Suffix:           "bar",
@@ -251,7 +251,7 @@ func serverTestCases() []serverTestCase {
 		ModuleURL:        "/mod/github.com/non_redistributable",
 	}
 	cmdGo := &pagecheck.Page{
-		Title:            "command go",
+		Title:            "Command go",
 		ModulePath:       "std",
 		Suffix:           "cmd/go",
 		Version:          "go1.13",
@@ -264,7 +264,7 @@ func serverTestCases() []serverTestCase {
 	}
 	mod := &pagecheck.Page{
 		ModulePath:      sample.ModulePath,
-		Title:           "module " + sample.ModulePath,
+		Title:           "Module " + sample.ModulePath,
 		ModuleURL:       "/mod/" + sample.ModulePath,
 		Version:         "v1.0.0",
 		LicenseType:     "MIT",
@@ -280,7 +280,7 @@ func serverTestCases() []serverTestCase {
 
 	mod2 := &pagecheck.Page{
 		ModulePath:       "github.com/pseudo",
-		Title:            "module github.com/pseudo",
+		Title:            "Module github.com/pseudo",
 		ModuleURL:        "/mod/github.com/pseudo",
 		LatestLink:       "/mod/github.com/pseudo@" + pseudoVersion,
 		Version:          pseudoVersion,
@@ -291,7 +291,7 @@ func serverTestCases() []serverTestCase {
 	}
 	dirPseudo := &pagecheck.Page{
 		ModulePath:       "github.com/pseudo",
-		Title:            "directory github.com/pseudo/dir",
+		Title:            "Directory github.com/pseudo/dir",
 		ModuleURL:        "/mod/github.com/pseudo",
 		LatestLink:       "/mod/github.com/pseudo@" + pseudoVersion + "/dir",
 		Suffix:           "dir",
@@ -315,7 +315,7 @@ func serverTestCases() []serverTestCase {
 	}
 
 	netHttp := &pagecheck.Page{
-		Title:           "package http",
+		Title:           "Package http",
 		ModulePath:      "http",
 		Version:         "go1.13",
 		LicenseType:     "MIT",
@@ -326,7 +326,7 @@ func serverTestCases() []serverTestCase {
 	}
 
 	dir := &pagecheck.Page{
-		Title:            "directory " + sample.ModulePath + "/foo/directory",
+		Title:            "Directory " + sample.ModulePath + "/foo/directory",
 		ModulePath:       sample.ModulePath,
 		Version:          "v1.0.0",
 		Suffix:           "foo/directory",
@@ -337,7 +337,7 @@ func serverTestCases() []serverTestCase {
 	}
 
 	dirCmd := &pagecheck.Page{
-		Title:            "directory cmd",
+		Title:            "Directory cmd",
 		ModulePath:       "std",
 		Version:          "go1.13",
 		Suffix:           "cmd",
@@ -511,7 +511,7 @@ func serverTestCases() []serverTestCase {
 			wantStatusCode: http.StatusOK,
 			want: in("",
 				pagecheck.PackageHeader(pkgV100, versioned),
-				in("li.selected", text(`Imports`)),
+				in("[role='tab'][aria-selected='true']", text(`Imports`)),
 				in(".Imports-heading", text(`Standard Library Imports`)),
 				in(".Imports-list",
 					in("li:nth-child(1) a", href("/fmt"), text("fmt")),
@@ -753,7 +753,7 @@ func serverTestCases() []serverTestCase {
 			wantStatusCode: http.StatusOK,
 			want: in("",
 				pagecheck.ModuleHeader(mod, versioned),
-				in("li.selected", text(`Versions`)),
+				in("[role='tab'][aria-selected='true']", text(`Versions`)),
 				in("div.Versions", text("v1")),
 				in("li.Versions-item",
 					in("a",
@@ -870,7 +870,7 @@ func frontendFetchTestCases() []serverTestCase {
 			urlPath:        fmt.Sprintf("/%s@%s/%s", sample.ModulePath, "v99.99.0", sample.Suffix),
 			wantStatusCode: http.StatusNotFound,
 			want: in("",
-				in("h3.Fetch-message.js-fetchMessage", text("Oops! "+sample.ModulePath+"/foo@v99.99.0 does not exist."))),
+				in("h3.Fetch-message.js-fetchMessage", text(sample.ModulePath+"/foo@v99.99.0"))),
 			requiredExperiments: experiment.NewSet(internal.ExperimentFrontendFetch),
 		},
 		{
@@ -878,7 +878,7 @@ func frontendFetchTestCases() []serverTestCase {
 			urlPath:        "/example.com/unknown",
 			wantStatusCode: http.StatusNotFound,
 			want: in("",
-				in("h3.Fetch-message.js-fetchMessage", text("Oops! example.com/unknown does not exist."))),
+				in("h3.Fetch-message.js-fetchMessage", text("example.com/unknown"))),
 			requiredExperiments: experiment.NewSet(internal.ExperimentFrontendFetch),
 		},
 	}

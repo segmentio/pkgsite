@@ -25,18 +25,41 @@ import (
 // DetailsPage contains data for a package of module details template.
 type DetailsPage struct {
 	basePage
-	Title          string
-	CanShowDetails bool
-	Settings       TabSettings
-	Details        interface{}
-	Header         interface{}
-	Breadcrumb     breadcrumb
-	Tabs           []TabSettings
 
-	// PageType is either "mod", "dir", or "pkg" depending on the details
-	// handler.
+	// Name is the name of the package or command name, or the full
+	// directory or module path.
+	Name string
+
+	// PageType is the type of page (pkg, cmd, dir, etc.).
 	PageType string
+
+	// CanShowDetails indicates whether details can be shown or must be
+	// hidden due to issues like license restrictions.
+	CanShowDetails bool
+
+	// Settings contains tab-specific metadata.
+	Settings TabSettings
+
+	// Details contains data specific to the type of page being rendered.
+	Details interface{}
+
+	// Header contains data to be rendered in the heading of all details pages.
+	Header interface{}
+
+	// Breadcrumb contains data used to render breadcrumb UI elements.
+	Breadcrumb breadcrumb
+
+	// Tabs contains data to render the varioius tabs on each details page.
+	Tabs []TabSettings
 }
+
+const (
+	pageTypeModule    = "mod"
+	pageTypeDirectory = "dir"
+	pageTypePackage   = "pkg"
+	pageTypeCommand   = "cmd"
+	pageTypeStdLib    = stdlib.ModulePath
+)
 
 // serveDetails handles requests for package/directory/module details pages. It
 // expects paths of the form "[/mod]/<module-path>[@<version>?tab=<tab>]".
@@ -432,12 +455,12 @@ func (s *Server) servePathNotFoundPage(w http.ResponseWriter, r *http.Request, d
 		return
 	}
 
-	if isActiveFrontendFetch(ctx) {
+	if isActiveFrontendFetch(ctx) && !stdlib.Contains(fullPath) {
 		db, ok := ds.(*postgres.DB)
 		if !ok {
 			return pathNotFoundError(ctx, pathType, fullPath, requestedVersion)
 		}
-		modulePaths, err := modulePathsToFetch(ctx, db, fullPath, modulePath)
+		modulePaths, err := candidateModulePaths(fullPath)
 		if err != nil {
 			return pathNotFoundError(ctx, pathType, fullPath, requestedVersion)
 		}
