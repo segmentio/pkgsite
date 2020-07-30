@@ -21,6 +21,8 @@ RUN echo "$(lsb_release -sc)"
 RUN echo "deb https://packagecloud.io/golang-migrate/migrate/ubuntu/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/migrate.list
 RUN apt-get update && apt-get install -y migrate
 
+COPY LICENSE /LICENSE
+COPY PATENTS /PATENTS
 COPY ./content/static/ /var/lib/pkgsite/content/static/
 COPY ./devtools/ /var/lib/pkgsite/devtools/
 COPY ./migrations /var/lib/pkgsite/migrations/

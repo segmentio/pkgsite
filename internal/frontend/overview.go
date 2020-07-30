@@ -52,7 +52,7 @@ func constructOverviewDetails(ctx context.Context, mi *internal.ModuleInfo, read
 		ModulePath:      mi.ModulePath,
 		ModuleURL:       constructModuleURL(mi.ModulePath, lv),
 		RepositoryURL:   mi.SourceInfo.RepoURL(),
-		Redistributable: isRedistributable,
+		Redistributable: true, //isRedistributable,
 	}
 	if overview.Redistributable && readme != nil {
 		overview.ReadMeSource = fileSource(mi.ModulePath, mi.Version, readme.Filepath)
@@ -92,7 +92,7 @@ func fetchPackageOverviewDetails(ctx context.Context, vdir *internal.VersionedDi
 		ModulePath:       vdir.ModulePath,
 		ModuleURL:        constructModuleURL(vdir.ModulePath, lv),
 		RepositoryURL:    vdir.SourceInfo.RepoURL(),
-		Redistributable:  vdir.Directory.IsRedistributable,
+		Redistributable:  true, // vdir.Directory.IsRedistributable,
 		PackageSourceURL: vdir.SourceInfo.DirectoryURL(packageSubdir(vdir.Path, vdir.ModulePath)),
 	}
 	if overview.Redistributable && vdir.Readme != nil {

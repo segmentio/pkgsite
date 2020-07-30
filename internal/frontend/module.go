@@ -62,7 +62,7 @@ func (s *Server) serveModulePage(ctx context.Context, w http.ResponseWriter, r *
 		tab = "overview"
 		settings = moduleTabLookup["overview"]
 	}
-	canShowDetails := modHeader.IsRedistributable || settings.AlwaysShowDetails
+	canShowDetails := true // modHeader.IsRedistributable || settings.AlwaysShowDetails
 	var details interface{}
 	if canShowDetails {
 		var err error

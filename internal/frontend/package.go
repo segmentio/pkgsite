@@ -108,7 +108,7 @@ func (s *Server) legacyServePackagePageWithPackage(w http.ResponseWriter, r *htt
 		http.Redirect(w, r, fmt.Sprintf(r.URL.Path+"?tab=%s", tab), http.StatusFound)
 		return nil
 	}
-	canShowDetails := pkg.LegacyPackage.IsRedistributable || settings.AlwaysShowDetails
+	canShowDetails := true //pkg.LegacyPackage.IsRedistributable || settings.AlwaysShowDetails
 
 	var details interface{}
 	if canShowDetails {
