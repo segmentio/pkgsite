@@ -9,12 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/safehtml"
 	"golang.org/x/mod/module"
 	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/source"
 	"golang.org/x/pkgsite/internal/stdlib"
-	"golang.org/x/pkgsite/internal/version"
 )
 
 const (
@@ -22,7 +20,10 @@ const (
 	// proxy client.
 	LatestVersion = "latest"
 
-	// MasterVersion signifies the version at master.
+	// MainVersion represents the main branch.
+	MainVersion = "main"
+
+	// MasterVersion represents the master branch.
 	MasterVersion = "master"
 
 	// UnknownModulePath signifies that the module path for a given package
@@ -32,22 +33,30 @@ const (
 	UnknownModulePath = "unknownModulePath"
 )
 
+// DefaultBranches are default branches that are supported by pkgsite.
+var DefaultBranches = map[string]bool{
+	MainVersion:   true,
+	MasterVersion: true,
+}
+
 // ModuleInfo holds metadata associated with a module.
 type ModuleInfo struct {
 	ModulePath        string
 	Version           string
 	CommitTime        time.Time
-	VersionType       version.Type
 	IsRedistributable bool
-	HasGoMod          bool // whether the module zip has a go.mod file
-	SourceInfo        *source.Info
-}
+	// HasGoMod describes whether the module zip has a go.mod file.
+	HasGoMod   bool
+	SourceInfo *source.Info
 
-// LegacyModuleInfo holds metadata associated with a module.
-type LegacyModuleInfo struct {
-	ModuleInfo
-	LegacyReadmeFilePath string
-	LegacyReadmeContents string
+	// Deprecated describes whether the module is deprecated.
+	Deprecated bool
+	// DeprecationComment is the comment describing the deprecation, if any.
+	DeprecationComment string
+	// Retracted describes whether the module version is retracted.
+	Retracted bool
+	// RetractionRationale is the reason for the retraction, if any.
+	RetractionRationale string
 }
 
 // VersionMap holds metadata associated with module queries for a version.
@@ -92,97 +101,34 @@ func Suffix(fullPath, basePath string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(fullPath, basePath), "/")
 }
 
-// V1Path returns the path for version 1 of the package whose path
-// is modulePath + "/" + suffix. If modulePath is the standard
-// library, then V1Path returns suffix.
-func V1Path(modulePath, suffix string) string {
+// V1Path returns the path for version 1 of the package whose import path
+// is fullPath. If modulePath is the standard library, then V1Path returns
+// fullPath.
+func V1Path(fullPath, modulePath string) string {
 	if modulePath == stdlib.ModulePath {
-		return suffix
+		return fullPath
 	}
-	return path.Join(SeriesPathForModule(modulePath), suffix)
+	return path.Join(SeriesPathForModule(modulePath), Suffix(fullPath, modulePath))
 }
 
 // A Module is a specific, reproducible build of a module.
 type Module struct {
-	LegacyModuleInfo
+	ModuleInfo
 	// Licenses holds all licenses within this module version, including those
 	// that may be contained in nested subdirectories.
-	Licenses    []*licenses.License
-	Directories []*Directory
-
-	LegacyPackages []*LegacyPackage
+	Licenses []*licenses.License
+	Units    []*Unit
 }
 
-// VersionedDirectory is a Directory along with its corresponding module
-// information.
-type VersionedDirectory struct {
-	Directory
-	ModuleInfo
-}
-
-// DirectoryMeta represents the metadata of a directory in a module version.
-type DirectoryMeta struct {
-	Path              string
-	V1Path            string
-	IsRedistributable bool
-	Licenses          []*licenses.Metadata // metadata of applicable licenses
-}
-
-// Directory represents a directory in a module version, and the contents of that directory.
-// It will replace LegacyDirectory once everything has been migrated.
-type Directory struct {
-	DirectoryMeta
-	Readme  *Readme
-	Package *Package
-}
-
-// PackageMeta represents the metadata of a package in a module version.
-type PackageMeta struct {
-	DirectoryMeta
-	Name     string
-	Synopsis string
-}
-
-// PackageMetaFromLegacyPackage returns a PackageMeta based on data from a
-// LegacyPackage.
-func PackageMetaFromLegacyPackage(pkg *LegacyPackage) *PackageMeta {
-	return &PackageMeta{
-		DirectoryMeta: DirectoryMeta{
-			Path:              pkg.Path,
-			V1Path:            pkg.V1Path,
-			Licenses:          pkg.Licenses,
-			IsRedistributable: pkg.IsRedistributable,
-		},
-		Name:     pkg.Name,
-		Synopsis: pkg.Synopsis,
+// Packages returns all of the units for a module that are packages.
+func (m *Module) Packages() []*Unit {
+	var pkgs []*Unit
+	for _, u := range m.Units {
+		if u.IsPackage() {
+			pkgs = append(pkgs, u)
+		}
 	}
-}
-
-// Package is a group of one or more Go source files with the same package
-// header. A Package is part of a directory.
-// It will replace LegacyPackage once everything has been migrated.
-type Package struct {
-	Name          string
-	Path          string
-	Documentation *Documentation
-	Imports       []string
-}
-
-// Documentation is the rendered documentation for a given package
-// for a specific GOOS and GOARCH.
-type Documentation struct {
-	// The values of the GOOS and GOARCH environment variables used to parse the
-	// package.
-	GOOS     string
-	GOARCH   string
-	Synopsis string
-	HTML     safehtml.HTML
-}
-
-// Readme is a README at a given directory.
-type Readme struct {
-	Filepath string
-	Contents string
+	return pkgs
 }
 
 // IndexVersion holds the version information returned by the module index.
@@ -228,7 +174,10 @@ type ModuleVersionState struct {
 	// deployment time for the above timestamp might be Jul 9, 2019, 11:29:59 AM.
 	AppVersion string
 
-	// GoModPath is the path declared in the go.mod file.
+	// HasGoMod says whether the zip file has a go.mod file.
+	HasGoMod bool
+
+	// GoModPath is the path declared in the go.mod file fetched from the proxy.
 	GoModPath string
 
 	// NumPackages it the number of packages that were processed as part of the
@@ -269,71 +218,4 @@ type SearchResult struct {
 	// can be approximate if search scanned only a subset of documents, and
 	// result count is estimated using the hyperloglog algorithm.
 	Approximate bool
-}
-
-// A FieldSet is a bit set of struct fields. It is used to avoid reading large
-// struct fields from the data store. FieldSet is also the type of the
-// individual bit values. (Think of them as singleton sets.)
-//
-// NoFields (the zero value) is the empty set. AllFields is the set containing
-// every field.
-//
-// FieldSet bits are unique across the entire project, because some types are
-// concatenations (via embedding) of others. For example, a
-// LegacyVersionedPackage contains the fields of both a LegacyModuleInfo and a
-// LegacyPackage, so we can't use the
-// same bits for both LegacyModuleInfo's LegacyReadmeContents field and
-// LegacyPackage's DocumentationHTML field.
-type FieldSet int64
-
-// MinimalFields is the empty FieldSet.
-const MinimalFields FieldSet = 0
-
-// AllFields is the FieldSet that contains all fields.
-const AllFields FieldSet = -1
-
-// StringFieldMissing is the value for string fields that are not present
-// in a struct. We use it to distinguish a (possibly valid) empty string
-// from a field that was never populated.
-const StringFieldMissing = "!MISSING"
-
-// FieldSet bits for fields that can be conditionally read from the data store.
-const (
-	WithReadmeContents FieldSet = 1 << iota
-	WithDocumentationHTML
-)
-
-// LegacyDirectory represents a directory in a module version, and all of the
-// packages inside that directory.
-type LegacyDirectory struct {
-	LegacyModuleInfo
-	Path     string
-	Packages []*LegacyPackage
-}
-
-// A LegacyPackage is a group of one or more Go source files with the same
-// package header. LegacyPackages are part of a module.
-type LegacyPackage struct {
-	Path              string
-	Name              string
-	Synopsis          string
-	IsRedistributable bool
-	Licenses          []*licenses.Metadata // metadata of applicable licenses
-	Imports           []string
-	DocumentationHTML safehtml.HTML
-	// The values of the GOOS and GOARCH environment variables used to parse the
-	// package.
-	GOOS   string
-	GOARCH string
-
-	// V1Path is the package path of a package with major version 1 in a given
-	// series.
-	V1Path string
-}
-
-// LegacyVersionedPackage is a LegacyPackage along with its corresponding module
-// information.
-type LegacyVersionedPackage struct {
-	LegacyPackage
-	LegacyModuleInfo
 }

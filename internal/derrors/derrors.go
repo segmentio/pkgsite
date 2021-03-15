@@ -10,6 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
+
+	"cloud.google.com/go/errorreporting"
 )
 
 //lint:file-ignore ST1012 prefixing error values with Err would stutter
@@ -21,6 +24,12 @@ var (
 
 	// NotFound indicates that a requested entity was not found (HTTP 404).
 	NotFound = errors.New("not found")
+
+	// NotFetched means that the proxy returned "not found" with the
+	// Disable-Module-Fetch header set. We don't know if the module really
+	// doesn't exist, or the proxy just didn't fetch it.
+	NotFetched = errors.New("not fetched by proxy")
+
 	// InvalidArgument indicates that the input into the request is invalid in
 	// some way (HTTP 400).
 	InvalidArgument = errors.New("invalid argument")
@@ -33,8 +42,20 @@ var (
 	// from the path specified in the go.mod file.
 	AlternativeModule = errors.New("alternative module")
 
+	// ModuleTooLarge indicates that the module is too large for us to process.
+	// This should be temporary: we should obtain sufficient resources to process
+	// any module, up to the max size allowed by the proxy.
+	ModuleTooLarge = errors.New("module too large")
+
+	// SheddingLoad indicates that the server is overloaded and cannot process the
+	// module at this time.
+	SheddingLoad = errors.New("shedding load")
+
 	// Unknown indicates that the error has unknown semantics.
 	Unknown = errors.New("unknown")
+
+	// ProxyTimedOut indicates that a request timed out when fetching from the Module Mirror.
+	ProxyTimedOut = errors.New("proxy timed out")
 
 	// PackageBuildContextNotSupported indicates that the build context for the
 	// package is not supported.
@@ -90,13 +111,17 @@ var codes = []struct {
 	{NotFound, http.StatusNotFound},
 	{InvalidArgument, http.StatusBadRequest},
 	{Excluded, http.StatusForbidden},
+	{SheddingLoad, http.StatusServiceUnavailable},
 
 	// Since the following aren't HTTP statuses, pick unused codes.
 	{HasIncompletePackages, 290},
 	{DBModuleInsertInvalid, 480},
+	{NotFetched, 481},
 	{BadModule, 490},
 	{AlternativeModule, 491},
+	{ModuleTooLarge, 492},
 
+	{ProxyTimedOut, 550}, // not a real code
 	// 52x and 54x errors represents modules that need to be reprocessed, and the
 	// previous status code the module had. Note that the status code
 	// matters for determining reprocessing order.
@@ -199,5 +224,63 @@ func Add(errp *error, format string, args ...interface{}) {
 func Wrap(errp *error, format string, args ...interface{}) {
 	if *errp != nil {
 		*errp = fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), *errp)
+	}
+}
+
+// WrapStack is like Wrap, but adds a stack trace if there isn't one already.
+func WrapStack(errp *error, format string, args ...interface{}) {
+	if *errp != nil {
+		if se := (*StackError)(nil); !errors.As(*errp, &se) {
+			*errp = NewStackError(*errp)
+		}
+		Wrap(errp, format, args...)
+	}
+}
+
+// StackError wraps an error and adds a stack trace.
+type StackError struct {
+	Stack []byte
+	err   error
+}
+
+// NewStackError returns a StackError, capturing a stack trace.
+func NewStackError(err error) *StackError {
+	// Limit the stack trace to 16K. Same value used in the errorreporting client,
+	// cloud.google.com/go@v0.66.0/errorreporting/errors.go.
+	var buf [16 * 1024]byte
+	n := runtime.Stack(buf[:], false)
+	return &StackError{
+		err:   err,
+		Stack: buf[:n],
+	}
+}
+
+func (e *StackError) Error() string {
+	return e.err.Error() // ignore the stack
+}
+
+func (e *StackError) Unwrap() error {
+	return e.err
+}
+
+// WrapAndReport calls Wrap followed by Report.
+func WrapAndReport(errp *error, format string, args ...interface{}) {
+	Wrap(errp, format, args...)
+	if *errp != nil {
+		Report(*errp)
+	}
+}
+
+var repClient *errorreporting.Client
+
+// SetReportingClient sets an errorreporting client, for use by Report.
+func SetReportingClient(c *errorreporting.Client) {
+	repClient = c
+}
+
+// Report uses the errorreporting API to report an error.
+func Report(err error) {
+	if repClient != nil {
+		repClient.Report(errorreporting.Entry{Error: err})
 	}
 }

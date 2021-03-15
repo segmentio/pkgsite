@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
+	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/database"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/testing/dbtest"
@@ -89,7 +90,11 @@ func SetupTestDB(dbName string) (_ *DB, err error) {
 			return nil, fmt.Errorf("unfixable error migrating database: %v.\nConsider running ./devtools/drop_test_dbs.sh", err)
 		}
 	}
-	db, err := database.Open("postgres", dbtest.DBConnURI(dbName), "test")
+	driver := os.Getenv("GO_DISCOVERY_DATABASE_DRIVER")
+	if driver == "" {
+		driver = "postgres"
+	}
+	db, err := database.Open(driver, dbtest.DBConnURI(dbName), "test")
 	if err != nil {
 		return nil, err
 	}
@@ -104,9 +109,12 @@ func ResetTestDB(db *DB, t *testing.T) {
 	if err := db.db.Transact(ctx, sql.LevelDefault, func(tx *database.DB) error {
 		if _, err := tx.Exec(ctx, `
 			TRUNCATE modules CASCADE;
+			TRUNCATE search_documents;
 			TRUNCATE version_map;
+			TRUNCATE paths CASCADE;
+			TRUNCATE symbol_names CASCADE;
 			TRUNCATE imports_unique;
-			TRUNCATE experiments;`); err != nil {
+			TRUNCATE raw_latest_versions;`); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `TRUNCATE module_version_states CASCADE;`); err != nil {
@@ -115,11 +123,11 @@ func ResetTestDB(db *DB, t *testing.T) {
 		if _, err := tx.Exec(ctx, `TRUNCATE excluded_prefixes;`); err != nil {
 			return err
 		}
-		setExcludedPrefixesLastFetched(time.Time{})
 		return nil
 	}); err != nil {
 		t.Fatalf("error resetting test DB: %v", err)
 	}
+	db.expoller.Poll(ctx) // clear excluded prefixes
 }
 
 // RunDBTests is a wrapper that runs the given testing suite in a test database
@@ -143,8 +151,63 @@ func RunDBTests(dbName string, m *testing.M, testDB **DB) {
 	os.Exit(code)
 }
 
+// RunDBTestsInParallel sets up numDBs databases, then runs the tests. Before it runs them,
+// it sets acquirep to a function that tests should use to acquire a database. The second
+// return value of the function should be called in a defer statement to release the database.
+// For example:
+//
+//    func Test(t *testing.T) {
+//        db, release := acquire(t)
+//        defer release()
+func RunDBTestsInParallel(dbBaseName string, numDBs int, m *testing.M, acquirep *func(*testing.T) (*DB, func())) {
+	start := time.Now()
+	database.QueryLoggingDisabled = true
+	dbs := make(chan *DB, numDBs)
+	for i := 0; i < numDBs; i++ {
+		db, err := SetupTestDB(fmt.Sprintf("%s-%d", dbBaseName, i))
+		if err != nil {
+			if errors.Is(err, derrors.NotFound) && os.Getenv("GO_DISCOVERY_TESTDB") != "true" {
+				log.Printf("SKIPPING: could not connect to DB (see doc/postgres.md to set up): %v", err)
+				return
+			}
+			log.Fatal(err)
+		}
+		dbs <- db
+	}
+
+	*acquirep = func(t *testing.T) (*DB, func()) {
+		db := <-dbs
+		release := func() {
+			ResetTestDB(db, t)
+			dbs <- db
+		}
+		return db, release
+	}
+
+	log.Printf("parallel test setup for %d DBs took %s", numDBs, time.Since(start))
+	code := m.Run()
+	if len(dbs) != cap(dbs) {
+		log.Fatal("not all DBs were released")
+	}
+	for i := 0; i < numDBs; i++ {
+		db := <-dbs
+		if err := db.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}
+	os.Exit(code)
+}
+
+// MustInsertModule inserts m into db, calling t.Fatal on error.
+func MustInsertModule(ctx context.Context, t *testing.T, db *DB, m *internal.Module) {
+	t.Helper()
+	if _, err := db.InsertModule(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // InsertSampleDirectory tree inserts a set of packages for testing
-// GetDirectory and frontend.FetchDirectoryDetails.
+// GetUnit and frontend.FetchDirectoryDetails.
 func InsertSampleDirectoryTree(ctx context.Context, t *testing.T, testDB *DB) {
 	t.Helper()
 
@@ -214,12 +277,7 @@ func InsertSampleDirectoryTree(ctx context.Context, t *testing.T, testDB *DB) {
 		},
 	} {
 		m := sample.Module(data.modulePath, data.version, data.suffixes...)
-		for _, p := range m.LegacyPackages {
-			p.Imports = nil
-		}
-		if err := testDB.InsertModule(ctx, m); err != nil {
-			t.Fatal(err)
-		}
+		MustInsertModule(ctx, t, testDB, m)
 	}
 
 }

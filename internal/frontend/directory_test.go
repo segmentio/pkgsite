@@ -1,4 +1,4 @@
-// Copyright 2019 The Go Authors. All rights reserved.
+// Copyright 2020 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,220 +6,175 @@ package frontend
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/safehtml"
 	"golang.org/x/pkgsite/internal"
-	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/postgres"
-	"golang.org/x/pkgsite/internal/stdlib"
 	"golang.org/x/pkgsite/internal/testing/sample"
 )
 
-func TestFetchDirectoryDetails(t *testing.T) {
+func TestGetNestedModules(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-
 	defer postgres.ResetTestDB(testDB, t)
-	postgres.InsertSampleDirectoryTree(ctx, t, testDB)
 
-	checkDirectory := func(got *Directory, dirPath, modulePath, version string, suffixes []string) {
-		t.Helper()
-
-		mi := sample.ModuleInfo(modulePath, version)
-		var wantPkgs []*Package
-		for _, suffix := range suffixes {
-			sp := sample.LegacyPackage(modulePath, suffix)
-			pm := internal.PackageMetaFromLegacyPackage(sp)
-			pkg, err := createPackage(pm, mi, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			pkg.PathAfterDirectory = internal.Suffix(pm.Path, dirPath)
-			if pkg.PathAfterDirectory == "" {
-				pkg.PathAfterDirectory = effectiveName(pm.Path, pm.Name) + " (root)"
-			}
-			pkg.Synopsis = sp.Synopsis
-			pkg.PathAfterDirectory = internal.Suffix(sp.Path, dirPath)
-			if pkg.PathAfterDirectory == "" {
-				pkg.PathAfterDirectory = fmt.Sprintf("%s (root)", effectiveName(sp.Path, sp.Name))
-			}
-			wantPkgs = append(wantPkgs, pkg)
-		}
-
-		mod := createModule(mi, sample.LicenseMetadata, false)
-		want := &Directory{
-			DirectoryHeader: DirectoryHeader{
-				Module: *mod,
-				Path:   dirPath,
-				URL:    constructDirectoryURL(dirPath, mi.ModulePath, linkVersion(mi.Version, mi.ModulePath)),
-			},
-			Packages: wantPkgs,
-		}
-		if diff := cmp.Diff(want, got, cmp.AllowUnexported(safehtml.Identifier{})); diff != "" {
-			t.Errorf("fetchDirectoryDetails(ctx, %q, %q, %q) mismatch (-want +got):\n%s", dirPath, modulePath, version, diff)
-		}
+	for _, m := range []*internal.Module{
+		sample.Module("cloud.google.com/go", "v0.46.2", "storage", "spanner", "pubsub"),
+		sample.Module("cloud.google.com/go/pubsub", "v1.6.1", sample.Suffix),
+		sample.Module("cloud.google.com/go/spanner", "v1.9.0", sample.Suffix),
+		sample.Module("cloud.google.com/go/storage", "v1.10.0", sample.Suffix),
+		sample.Module("cloud.google.com/go/storage/v11", "v11.0.0", sample.Suffix),
+		sample.Module("cloud.google.com/go/storage/v9", "v9.0.0", sample.Suffix),
+		sample.Module("cloud.google.com/go/storage/module", "v1.10.0", sample.Suffix),
+		sample.Module("cloud.google.com/go/storage/v9/module", "v9.0.0", sample.Suffix),
+		sample.Module("cloud.google.com/go/v2", "v2.0.0", "storage", "spanner", "pubsub"),
+	} {
+		postgres.MustInsertModule(ctx, t, testDB, m)
 	}
 
-	for _, tc := range []struct {
-		name, dirPath, modulePath, version, wantModulePath, wantVersion string
-		wantPkgSuffixes                                                 []string
-		includeDirPath, wantInvalidArgumentErr                          bool
+	for _, test := range []struct {
+		modulePath     string
+		subdirectories []*DirectoryInfo
+		want           []*DirectoryInfo
 	}{
 		{
-			name:            "dirPath is modulePath, includeDirPath = true, want longest module path",
-			includeDirPath:  true,
-			dirPath:         "github.com/hashicorp/vault/api",
-			modulePath:      "github.com/hashicorp/vault/api",
-			version:         internal.LatestVersion,
-			wantModulePath:  "github.com/hashicorp/vault/api",
-			wantVersion:     "v1.1.2",
-			wantPkgSuffixes: []string{""},
-		},
-		{
-			name:            "only dirPath provided, includeDirPath = false, want longest module path",
-			dirPath:         "github.com/hashicorp/vault/api",
-			modulePath:      internal.UnknownModulePath,
-			version:         internal.LatestVersion,
-			wantModulePath:  "github.com/hashicorp/vault/api",
-			wantVersion:     "v1.1.2",
-			wantPkgSuffixes: nil,
-		},
-		{
-			name:            "dirPath@version, includeDirPath = false, want longest module path",
-			dirPath:         "github.com/hashicorp/vault/api",
-			modulePath:      internal.UnknownModulePath,
-			version:         "v1.1.2",
-			wantModulePath:  "github.com/hashicorp/vault/api",
-			wantVersion:     "v1.1.2",
-			wantPkgSuffixes: nil,
-		},
-		{
-			name:            "dirPath@version,  includeDirPath = false, version only exists for shorter module path",
-			dirPath:         "github.com/hashicorp/vault/api",
-			modulePath:      internal.UnknownModulePath,
-			version:         "v1.0.3",
-			wantModulePath:  "github.com/hashicorp/vault",
-			wantVersion:     "v1.0.3",
-			wantPkgSuffixes: nil,
-		},
-		{
-			name:           "valid directory for modulePath@version/suffix, includeDirPath = false",
-			dirPath:        "github.com/hashicorp/vault/builtin",
-			modulePath:     "github.com/hashicorp/vault",
-			version:        "v1.0.3",
-			wantModulePath: "github.com/hashicorp/vault",
-			wantVersion:    "v1.0.3",
-			wantPkgSuffixes: []string{
-				"builtin/audit/file",
-				"builtin/audit/socket",
+			modulePath: "cloud.google.com/go",
+			want: []*DirectoryInfo{
+				{
+					Suffix: "pubsub",
+					URL:    "/cloud.google.com/go/pubsub",
+				},
+				{
+					Suffix: "spanner",
+					URL:    "/cloud.google.com/go/spanner",
+				},
+				{
+					Suffix: "storage",
+					URL:    "/cloud.google.com/go/storage/v11",
+				},
+				{
+					Suffix: "storage/module",
+					URL:    "/cloud.google.com/go/storage/module",
+				},
+				{
+					Suffix: "storage/v9/module",
+					URL:    "/cloud.google.com/go/storage/v9/module",
+				},
 			},
 		},
 		{
-			name:           "standard library",
-			dirPath:        stdlib.ModulePath,
-			modulePath:     stdlib.ModulePath,
-			version:        "v1.13.4",
-			wantModulePath: stdlib.ModulePath,
-			wantVersion:    "v1.13.4",
-			wantPkgSuffixes: []string{
-				"archive/tar",
-				"archive/zip",
-				"cmd/go",
-				"cmd/internal/obj",
-				"cmd/internal/obj/arm",
-				"cmd/internal/obj/arm64",
+			modulePath: "cloud.google.com/go/spanner",
+		},
+		{
+			modulePath: "cloud.google.com/go/storage",
+			want: []*DirectoryInfo{
+				{
+					Suffix: "module",
+					URL:    "/cloud.google.com/go/storage/module",
+				},
+				{
+					Suffix: "v9/module",
+					URL:    "/cloud.google.com/go/storage/v9/module",
+				},
 			},
 		},
 		{
-			name:           "cmd",
-			dirPath:        "cmd",
-			modulePath:     stdlib.ModulePath,
-			version:        "v1.13.4",
-			wantModulePath: stdlib.ModulePath,
-			wantVersion:    "v1.13.4",
-			wantPkgSuffixes: []string{
-				"cmd/go",
-				"cmd/internal/obj",
-				"cmd/internal/obj/arm",
-				"cmd/internal/obj/arm64",
+			modulePath: "cloud.google.com/go/storage",
+			subdirectories: []*DirectoryInfo{
+				{
+					Suffix: "module",
+					URL:    "/cloud.google.com/go/storage/module",
+				},
+				{
+					Suffix: "v9/module",
+					URL:    "/cloud.google.com/go/storage/v9/module",
+				},
+			},
+		},
+		{
+			modulePath: "cloud.google.com/go/storage/v9",
+			subdirectories: []*DirectoryInfo{
+				{
+					Suffix: "module",
+					URL:    "/cloud.google.com/go/storage/v9/module",
+				},
 			},
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mi := sample.ModuleInfoReleaseType(tc.modulePath, tc.version)
-			var (
-				got *Directory
-				err error
-			)
-			t.Run("use-directories", func(t *testing.T) {
-				d := sample.DirectoryEmpty(tc.dirPath)
-				vdir := &internal.VersionedDirectory{
-					ModuleInfo: *mi,
-					Directory:  *d,
-				}
-				got, err = fetchDirectoryDetails(ctx, testDB, vdir, tc.includeDirPath)
-			})
-			t.Run("legacy", func(t *testing.T) {
-				got, err = legacyFetchDirectoryDetails(ctx, testDB,
-					tc.dirPath, mi, sample.LicenseMetadata, tc.includeDirPath)
-			})
+		t.Run(test.modulePath, func(t *testing.T) {
+			got, err := getNestedModules(ctx, testDB, &internal.UnitMeta{
+				Path:       test.modulePath,
+				ModuleInfo: internal.ModuleInfo{ModulePath: test.modulePath},
+			}, test.subdirectories)
 			if err != nil {
 				t.Fatal(err)
 			}
-			checkDirectory(got, tc.dirPath, tc.wantModulePath, tc.wantVersion, tc.wantPkgSuffixes)
+			for _, w := range test.want {
+				w.IsModule = true
+			}
+			if diff := cmp.Diff(test.want, got); diff != "" {
+				t.Errorf("mismatch (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
 
-func TestFetchDirectoryDetailsInvalidArguments(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
+func TestUnitDirectories(t *testing.T) {
+	subdirectories := []*DirectoryInfo{
+		{Suffix: "accessapproval"},
+		{Suffix: "accessapproval/internal"},
+		{Suffix: "accessapproval/cgi"},
+		{Suffix: "accessapproval/cookiejar"},
+		{Suffix: "accessapproval/cookiejar/internal"},
+		{Suffix: "fgci"},
+		{Suffix: "httptrace"},
+		{Suffix: "internal/bytesconv"},
+		{Suffix: "internal/json"},
+		{Suffix: "zoltan"},
+	}
+	nestedModules := []*DirectoryInfo{
+		{Suffix: "httptest", IsModule: true},
+		{Suffix: "pubsub/internal", IsModule: true},
+	}
+	got := unitDirectories(append(subdirectories, nestedModules...))
+	want := &Directories{
+		External: []*Directory{
+			{
+				Prefix: "accessapproval",
+				Root:   &DirectoryInfo{Suffix: "accessapproval"},
+				Subdirectories: []*DirectoryInfo{
+					{Suffix: "cgi"},
+					{Suffix: "cookiejar"},
+				},
+			},
+			{
+				Prefix: "fgci",
+				Root:   &DirectoryInfo{Suffix: "fgci"},
+			},
+			{
+				Prefix: "httptest",
+				Root:   &DirectoryInfo{Suffix: "httptest", IsModule: true},
+			},
+			{
+				Prefix: "httptrace",
+				Root:   &DirectoryInfo{Suffix: "httptrace"},
+			},
+			{
+				Prefix: "zoltan",
+				Root:   &DirectoryInfo{Suffix: "zoltan"},
+			},
+		},
+		Internal: &Directory{
+			Prefix: "internal",
+			Subdirectories: []*DirectoryInfo{
+				{Suffix: "bytesconv"},
+				{Suffix: "json"},
+			},
+		},
+	}
 
-	defer postgres.ResetTestDB(testDB, t)
-	postgres.InsertSampleDirectoryTree(ctx, t, testDB)
-
-	for _, tc := range []struct {
-		name, dirPath, modulePath, version, wantModulePath, wantVersion string
-		includeDirPath                                                  bool
-		wantPkgPaths                                                    []string
-	}{
-		{
-			name:       "dirPath is empty",
-			dirPath:    "github.com/hashicorp/vault/api",
-			modulePath: "",
-			version:    internal.LatestVersion,
-		},
-		{
-			name:       "modulePath is empty",
-			dirPath:    "github.com/hashicorp/vault/api",
-			modulePath: "",
-			version:    internal.LatestVersion,
-		},
-		{
-			name:       "version is empty",
-			dirPath:    "github.com/hashicorp/vault/api",
-			modulePath: internal.UnknownModulePath,
-			version:    "",
-		},
-		{
-			name:           "dirPath is not modulePath, includeDirPath = true",
-			dirPath:        "github.com/hashicorp/vault/api",
-			modulePath:     "github.com/hashicorp/vault",
-			version:        internal.LatestVersion,
-			includeDirPath: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mi := sample.ModuleInfoReleaseType(tc.modulePath, tc.version)
-			got, err := legacyFetchDirectoryDetails(ctx, testDB,
-				tc.dirPath, mi, sample.LicenseMetadata, tc.includeDirPath)
-			if !errors.Is(err, derrors.InvalidArgument) {
-				t.Fatalf("expected err; got = \n%+v, %v", got, err)
-			}
-		})
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("unitDirectories mismatch (-want +got):\n%s", diff)
 	}
 }

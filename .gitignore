@@ -27,6 +27,7 @@ crash.log
 private
 internal/**/go.sum
 cmd/*/*.yaml
+experiment.yaml
 
 #### GKE
 go-discovery*.json
@@ -34,10 +35,21 @@ go-discovery*.json
 #### App Engine
 *credentials.json
 *credentials.yaml
-*.gcloudignore
 
 #### Loadtest Related Files ####
 results.bin
 
+<<<<<<< HEAD
 # Emacs
 *~
+=======
+#### VS Code Debugger Files ####
+.vscode
+__debug_bin
+
+#### NPM ####
+node_modules
+
+#### E2E Test Output ####
+e2e/__image_snapshots__/__diff_output__
+>>>>>>> upstream/master

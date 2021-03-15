@@ -8,14 +8,17 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/experiment"
 	"golang.org/x/pkgsite/internal/log"
 	"golang.org/x/pkgsite/internal/postgres"
 	"golang.org/x/pkgsite/internal/stdlib"
+	"golang.org/x/pkgsite/internal/symbol"
 	"golang.org/x/pkgsite/internal/version"
 )
 
@@ -27,9 +30,13 @@ type VersionsDetails struct {
 	// current package.
 	ThisModule []*VersionList
 
+	// IncompatibleModules is the slice of the VersionsLists with the same
+	// module path as the current package, but with incompatible versions.
+	IncompatibleModules []*VersionList
+
 	// OtherModules is the slice of VersionLists with a different module path
 	// from the current package.
-	OtherModules []*VersionList
+	OtherModules []string
 }
 
 // VersionListKey identifies a version list on the versions tab. We have a
@@ -39,8 +46,18 @@ type VersionsDetails struct {
 type VersionListKey struct {
 	// ModulePath is the module path of this major version.
 	ModulePath string
+
 	// Major is the major version string (e.g. v1, v2)
 	Major string
+
+	// Incompatible indicates whether the VersionListKey represents an
+	// incompatible module version.
+	Incompatible bool
+
+	// Deprecated indicates whether the major version is deprecated.
+	Deprecated bool
+	// DeprecationComment holds the reason for deprecation, if any.
+	DeprecationComment string
 }
 
 // VersionList holds all versions corresponding to a unique (module path,
@@ -57,11 +74,14 @@ type VersionList struct {
 type VersionSummary struct {
 	CommitTime string
 	// Link to this version, for use in the anchor href.
-	Link    string
-	Version string
+	Link                string
+	Version             string
+	Retracted           bool
+	RetractionRationale string
+	Symbols             []*Symbol
 }
 
-func fetchVersionsDetails(ctx context.Context, ds internal.DataSource, fullPath, v1Path, modulePath string) (*VersionsDetails, error) {
+func fetchVersionsDetails(ctx context.Context, ds internal.DataSource, fullPath, modulePath string) (*VersionsDetails, error) {
 	db, ok := ds.(*postgres.DB)
 	if !ok {
 		// The proxydatasource does not support the imported by page.
@@ -71,6 +91,15 @@ func fetchVersionsDetails(ctx context.Context, ds internal.DataSource, fullPath,
 	if err != nil {
 		return nil, err
 	}
+
+	outVersionToNameToUnitSymbol := map[string]map[string]*internal.UnitSymbol{}
+	if experiment.IsActive(ctx, internal.ExperimentSymbolHistoryVersionsPage) {
+		versionToNameToUnitSymbols, err := db.GetPackageSymbols(ctx, fullPath, modulePath)
+		if err != nil {
+			return nil, err
+		}
+		outVersionToNameToUnitSymbol = symbol.IntroducedHistory(versionToNameToUnitSymbols)
+	}
 	linkify := func(mi *internal.ModuleInfo) string {
 		// Here we have only version information, but need to construct the full
 		// import path of the package corresponding to this version.
@@ -78,78 +107,11 @@ func fetchVersionsDetails(ctx context.Context, ds internal.DataSource, fullPath,
 		if mi.ModulePath == stdlib.ModulePath {
 			versionPath = fullPath
 		} else {
-			versionPath = pathInVersion(v1Path, mi)
+			versionPath = pathInVersion(internal.V1Path(fullPath, modulePath), mi)
 		}
-		return constructPackageURL(versionPath, mi.ModulePath, linkVersion(mi.Version, mi.ModulePath))
+		return constructUnitURL(versionPath, mi.ModulePath, linkVersion(mi.Version, mi.ModulePath))
 	}
-	return buildVersionDetails(modulePath, versions, linkify), nil
-}
-
-func fetchModuleVersionsDetails(ctx context.Context, ds internal.DataSource, modulePath string) (*VersionsDetails, error) {
-	db, ok := ds.(*postgres.DB)
-	if !ok {
-		// The proxydatasource does not support the imported by page.
-		return nil, proxydatasourceNotSupportedErr()
-	}
-	versions, err := db.GetVersionsForPath(ctx, modulePath)
-	if err != nil {
-		return nil, err
-	}
-	linkify := func(m *internal.ModuleInfo) string {
-		return constructModuleURL(m.ModulePath, linkVersion(m.Version, m.ModulePath))
-	}
-	return buildVersionDetails(modulePath, versions, linkify), nil
-}
-
-// legacyFetchModuleVersionsDetails builds a version hierarchy for module versions
-// with the same series path as the given version.
-func legacyFetchModuleVersionsDetails(ctx context.Context, ds internal.DataSource, mi *internal.ModuleInfo) (*VersionsDetails, error) {
-	versions, err := ds.LegacyGetTaggedVersionsForModule(ctx, mi.ModulePath)
-	if err != nil {
-		return nil, err
-	}
-	// If no tagged versions of the module are found, fetch pseudo-versions
-	// instead.
-	if len(versions) == 0 {
-		versions, err = ds.LegacyGetPsuedoVersionsForModule(ctx, mi.ModulePath)
-		if err != nil {
-			return nil, err
-		}
-	}
-	linkify := func(m *internal.ModuleInfo) string {
-		return constructModuleURL(m.ModulePath, linkVersion(m.Version, m.ModulePath))
-	}
-	return buildVersionDetails(mi.ModulePath, versions, linkify), nil
-}
-
-// legacyFetchPackageVersionsDetails builds a version hierarchy for all module
-// versions containing a package path with v1 import path matching the given v1 path.
-func legacyFetchPackageVersionsDetails(ctx context.Context, ds internal.DataSource, pkgPath, v1Path, modulePath string) (*VersionsDetails, error) {
-	versions, err := ds.LegacyGetTaggedVersionsForPackageSeries(ctx, pkgPath)
-	if err != nil {
-		return nil, err
-	}
-	// If no tagged versions for the package series are found, fetch the
-	// pseudo-versions instead.
-	if len(versions) == 0 {
-		versions, err = ds.LegacyGetPsuedoVersionsForPackageSeries(ctx, pkgPath)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	linkify := func(mi *internal.ModuleInfo) string {
-		// Here we have only version information, but need to construct the full
-		// import path of the package corresponding to this version.
-		var versionPath string
-		if mi.ModulePath == stdlib.ModulePath {
-			versionPath = pkgPath
-		} else {
-			versionPath = pathInVersion(v1Path, mi)
-		}
-		return constructPackageURL(versionPath, mi.ModulePath, linkVersion(mi.Version, mi.ModulePath))
-	}
-	return buildVersionDetails(modulePath, versions, linkify), nil
+	return buildVersionDetails(ctx, modulePath, versions, outVersionToNameToUnitSymbol, linkify), nil
 }
 
 // pathInVersion constructs the full import path of the package corresponding
@@ -176,8 +138,11 @@ func pathInVersion(v1Path string, mi *internal.ModuleInfo) string {
 // versions tab, organizing major versions into those that have the same module
 // path as the package version under consideration, and those that don't.  The
 // given versions MUST be sorted first by module path and then by semver.
-func buildVersionDetails(currentModulePath string, modInfos []*internal.ModuleInfo, linkify func(v *internal.ModuleInfo) string) *VersionsDetails {
-
+func buildVersionDetails(ctx context.Context,
+	currentModulePath string,
+	modInfos []*internal.ModuleInfo,
+	versionToNameToSymbol map[string]map[string]*internal.UnitSymbol,
+	linkify func(v *internal.ModuleInfo) string) *VersionsDetails {
 	// lists organizes versions by VersionListKey. Note that major version isn't
 	// sufficient as a key: there are packages contained in the same major
 	// version of different modules, for example github.com/hashicorp/vault/api,
@@ -207,15 +172,30 @@ func buildVersionDetails(currentModulePath string, modInfos []*internal.ModuleIn
 				// Trim both '/' and '.' from the path major version to account for
 				// standard and gopkg.in module paths.
 				major = strings.TrimLeft(pathMajor, "/.")
+			} else if version.IsIncompatible(mi.Version) {
+				major = semver.Major(mi.Version)
 			} else if major != "v0" && !strings.HasPrefix(major, "go") {
 				major = "v1"
 			}
 		}
-		key := VersionListKey{ModulePath: mi.ModulePath, Major: major}
+		key := VersionListKey{
+			ModulePath:   mi.ModulePath,
+			Major:        major,
+			Incompatible: version.IsIncompatible(mi.Version),
+		}
 		vs := &VersionSummary{
 			Link:       linkify(mi),
-			CommitTime: elapsedTime(mi.CommitTime),
+			CommitTime: absoluteTime(mi.CommitTime),
 			Version:    linkVersion(mi.Version, mi.ModulePath),
+		}
+		if experiment.IsActive(ctx, internal.ExperimentRetractions) {
+			key.Deprecated = mi.Deprecated
+			key.DeprecationComment = mi.DeprecationComment
+			vs.Retracted = mi.Retracted
+			vs.RetractionRationale = mi.RetractionRationale
+		}
+		if nts, ok := versionToNameToSymbol[mi.Version]; ok {
+			vs.Symbols = symbolsForVersion(linkify(mi), nts)
 		}
 		if _, ok := lists[key]; !ok {
 			seenLists = append(seenLists, key)
@@ -224,56 +204,101 @@ func buildVersionDetails(currentModulePath string, modInfos []*internal.ModuleIn
 	}
 
 	var details VersionsDetails
+	other := map[string]bool{}
 	for _, key := range seenLists {
 		vl := &VersionList{
 			VersionListKey: key,
 			Versions:       lists[key],
 		}
 		if key.ModulePath == currentModulePath {
-			details.ThisModule = append(details.ThisModule, vl)
+			if key.Incompatible {
+				details.IncompatibleModules = append(details.IncompatibleModules, vl)
+			} else {
+				details.ThisModule = append(details.ThisModule, vl)
+			}
 		} else {
-			details.OtherModules = append(details.OtherModules, vl)
+			other[key.ModulePath] = true
 		}
 	}
+	for m := range other {
+		details.OtherModules = append(details.OtherModules, m)
+	}
+	// Sort for testing.
+	sort.Strings(details.OtherModules)
 	return &details
 }
 
 // formatVersion formats a more readable representation of the given version
 // string. On any parsing error, it simply returns the input unmodified.
 //
-// For prerelease versions, formatVersion separates the prerelease portion of
-// the version string into a parenthetical. i.e.
-//   formatVersion("v1.2.3-alpha") = "v1.2.3 (alpha)"
+// For pseudo versions, the version string will use a shorten commit hash of 7
+// characters to identify the version, and hide timestamp using ellipses.
 //
-// For pseudo versions, formatVersion uses a short commit hash to identify the
-// version. i.e.
-//   formatVersion("v1.2.3-20190311183353-d8887717615a") = "v.1.2.3 (d888771)"
+// For any version string longer than 25 characters, the pre-release string will be
+// truncated, such that the string displayed is exactly 25 characters, including the ellipses.
+//
+// See TestFormatVersion for examples.
 func formatVersion(v string) string {
+	const maxLen = 25
+	if len(v) <= maxLen {
+		return v
+	}
 	vType, err := version.ParseType(v)
 	if err != nil {
-		log.Errorf(context.TODO(), "Error parsing version %q: %v", v, err)
+		log.Errorf(context.TODO(), "formatVersion(%q): error parsing version: %v", v, err)
 		return v
 	}
-	pre := semver.Prerelease(v)
-	base := strings.TrimSuffix(v, pre)
-	pre = strings.TrimPrefix(pre, "-")
-	switch vType {
-	case version.TypePrerelease:
-		return fmt.Sprintf("%s (%s)", base, pre)
-	case version.TypePseudo:
-		rev := pseudoVersionRev(v)
-		commitLen := 7
-		if len(rev) < commitLen {
-			commitLen = len(rev)
-		}
-		return fmt.Sprintf("%s (%s)", base, rev[0:commitLen])
-	default:
-		return v
+	if vType != version.TypePseudo {
+		// If the version is release or prerelease, return a version string of
+		// maxLen by truncating the end of the string. maxLen is inclusive of
+		// the "..." characters.
+		return v[:maxLen-3] + "..."
 	}
+
+	// The version string will have a max length of 25:
+	// base: "vX.Y.Z-prerelease.0" = up to 15
+	// ellipse: "..." = 3
+	// commit: "-abcdefa" = 7
+	commit := shorten(pseudoVersionRev(v), 7)
+	base := shorten(pseudoVersionBase(v), 15)
+	return fmt.Sprintf("%s...-%s", base, commit)
 }
 
-// pseudoVersionRev extracts the commit identifier from a pseudo version
-// string. It assumes the pseudo version is correctly formatted.
+// shorten shortens the string s to maxLen by removing the trailing characters.
+func shorten(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen]
+	}
+	return s
+}
+
+// pseudoVersionRev extracts the pseudo version base, excluding the timestamp.
+// It assumes the pseudo version is correctly formatted.
+//
+// See TestPseudoVersionBase for examples.
+func pseudoVersionBase(v string) string {
+	parts := strings.Split(v, "-")
+	if len(parts) != 3 {
+		mid := strings.Join(parts[1:len(parts)-1], "-")
+		parts = []string{parts[0], mid, parts[2]}
+	}
+	// The version string will always be split into one
+	// of these 3 parts:
+	// 1. [vX.0.0, yyyymmddhhmmss, abcdefabcdef]
+	// 2. [vX.Y.Z, pre.0.yyyymmddhhmmss, abcdefabcdef]
+	// 3. [vX.Y.Z, 0.yyyymmddhhmmss, abcdefabcdef]
+	p := strings.Split(parts[1], ".")
+	var suffix string
+	if len(p) > 0 {
+		// There is a "pre.0" or "0" prefix in the second element.
+		suffix = strings.Join(p[0:len(p)-1], ".")
+	}
+	return fmt.Sprintf("%s-%s", parts[0], suffix)
+}
+
+// pseudoVersionRev extracts the first 7 characters of the commit identifier
+// from a pseudo version string. It assumes the pseudo version is correctly
+// formatted.
 func pseudoVersionRev(v string) string {
 	v = strings.TrimSuffix(v, "+incompatible")
 	j := strings.LastIndex(v, "-")
@@ -283,6 +308,9 @@ func pseudoVersionRev(v string) string {
 // displayVersion returns the version string, formatted for display.
 func displayVersion(v string, modulePath string) string {
 	if modulePath == stdlib.ModulePath {
+		if strings.HasPrefix(v, "v0.0.0") {
+			return strings.Split(v, "-")[2]
+		}
 		return goTagForVersion(v)
 	}
 	return formatVersion(v)
@@ -290,8 +318,13 @@ func displayVersion(v string, modulePath string) string {
 
 // linkVersion returns the version string, suitable for use in
 // a link to this site.
+// TODO(golang/go#41855): Clarify definition / use case for linkVersion and
+// other version strings.
 func linkVersion(v string, modulePath string) string {
 	if modulePath == stdlib.ModulePath {
+		if strings.HasPrefix(v, "go") {
+			return v
+		}
 		return goTagForVersion(v)
 	}
 	return v

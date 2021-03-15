@@ -4,65 +4,54 @@
 
 package internal
 
-import (
-	"context"
-
-	"golang.org/x/pkgsite/internal/licenses"
-)
+import "context"
 
 // DataSource is the interface used by the frontend to interact with module data.
 type DataSource interface {
 	// See the internal/postgres package for further documentation of these
 	// methods, particularly as they pertain to the main postgres implementation.
 
-	// GetDirectory returns information about a directory, which may also be a module and/or package.
-	// The module and version must both be known.
-	GetDirectory(ctx context.Context, dirPath, modulePath, version string) (_ *VersionedDirectory, err error)
-	// GetImports returns a slice of import paths imported by the package
-	// specified by path and version.
-	GetImports(ctx context.Context, pkgPath, modulePath, version string) ([]string, error)
-	// GetLicenses returns licenses at the given path for given modulePath and version.
-	GetLicenses(ctx context.Context, fullPath, modulePath, resolvedVersion string) ([]*licenses.License, error)
-	// GetModuleInfo returns the ModuleInfo corresponding to modulePath and
-	// version.
-	GetModuleInfo(ctx context.Context, modulePath, version string) (*ModuleInfo, error)
-	// GetPathInfo returns information about a path.
-	GetPathInfo(ctx context.Context, path, inModulePath, inVersion string) (outModulePath, outVersion string, isPackage bool, err error)
+	// GetNestedModules returns the latest major version of all nested modules
+	// given a modulePath path prefix.
+	GetNestedModules(ctx context.Context, modulePath string) ([]*ModuleInfo, error)
+	// GetUnit returns information about a directory, which may also be a
+	// module and/or package. The module and version must both be known.
+	GetUnit(ctx context.Context, pathInfo *UnitMeta, fields FieldSet) (_ *Unit, err error)
+	// GetUnitMeta returns information about a path.
+	GetUnitMeta(ctx context.Context, path, requestedModulePath, requestedVersion string) (_ *UnitMeta, err error)
+	// GetModuleReadme gets the readme for the module.
+	GetModuleReadme(ctx context.Context, modulePath, resolvedVersion string) (*Readme, error)
 
-	// TODO(golang/go#39629): Deprecate these methods.
-	//
-	// LegacyGetDirectory returns packages whose import path is in a (possibly
-	// nested) subdirectory of the given directory path. When multiple
-	// package paths satisfy this query, it should prefer the module with
-	// the longest path.
-	LegacyGetDirectory(ctx context.Context, dirPath, modulePath, version string, fields FieldSet) (_ *LegacyDirectory, err error)
-	// LegacyGetModuleInfo returns the LegacyModuleInfo corresponding to modulePath and
-	// version.
-	LegacyGetModuleInfo(ctx context.Context, modulePath, version string) (*LegacyModuleInfo, error)
-	// LegacyGetModuleLicenses returns all top-level Licenses for the given modulePath
-	// and version. (i.e., Licenses contained in the module root directory)
-	LegacyGetModuleLicenses(ctx context.Context, modulePath, version string) ([]*licenses.License, error)
-	// LegacyGetPackage returns the LegacyVersionedPackage corresponding to the given package
-	// pkgPath, modulePath, and version. When multiple package paths satisfy this query, it
-	// should prefer the module with the longest path.
-	LegacyGetPackage(ctx context.Context, pkgPath, modulePath, version string) (*LegacyVersionedPackage, error)
-	// LegacyGetPackagesInModule returns LegacyPackages contained in the module version
-	// specified by modulePath and version.
-	LegacyGetPackagesInModule(ctx context.Context, modulePath, version string) ([]*LegacyPackage, error)
-	// LegacyGetPackageLicenses returns all Licenses that apply to pkgPath, within the
-	// module version specified by modulePath and version.
-	LegacyGetPackageLicenses(ctx context.Context, pkgPath, modulePath, version string) ([]*licenses.License, error)
-	// LegacyGetPsuedoVersionsForModule returns ModuleInfo for all known
-	// pseudo-versions for the module corresponding to modulePath.
-	LegacyGetPsuedoVersionsForModule(ctx context.Context, modulePath string) ([]*ModuleInfo, error)
-	// LegacyGetPsuedoVersionsForModule returns ModuleInfo for all known
-	// pseudo-versions for any module containing a package with the given import
-	// path.
-	LegacyGetPsuedoVersionsForPackageSeries(ctx context.Context, pkgPath string) ([]*ModuleInfo, error)
-	// LegacyGetTaggedVersionsForModule returns ModuleInfo for all known tagged
-	// versions for the module corresponding to modulePath.
-	LegacyGetTaggedVersionsForModule(ctx context.Context, modulePath string) ([]*ModuleInfo, error)
-	// LegacyGetTaggedVersionsForModule returns ModuleInfo for all known tagged
-	// versions for any module containing a package with the given import path.
-	LegacyGetTaggedVersionsForPackageSeries(ctx context.Context, pkgPath string) ([]*ModuleInfo, error)
+	// GetLatestInfo gets information about the latest versions of a unit and module.
+	// See LatestInfo for documentation.
+	GetLatestInfo(ctx context.Context, unitPath, modulePath string) (LatestInfo, error)
+}
+
+// LatestInfo holds information about the latest versions and paths.
+// The information is relative to a unit in a module.
+type LatestInfo struct {
+	// MinorVersion is the latest minor version for the unit, regardless of
+	// module.
+	MinorVersion string
+
+	// MinorModulePath is the module path for MinorVersion.
+	MinorModulePath string
+
+	// UnitExistsAtMinor is whether the unit exists at the latest minor version
+	// of the module
+	UnitExistsAtMinor bool
+
+	// MajorModulePath is the path of the latest module path in the series.
+	// For example, in the module path "github.com/casbin/casbin", there
+	// is another module path with a greater major version
+	// "github.com/casbin/casbin/v3". This field will be
+	// "github.com/casbin/casbin/v3" or the input module path if no later module
+	// path was found.
+	MajorModulePath string
+
+	// MajorUnitPath is the path of the unit in the latest major version of the
+	// module, if it exists. For example, if the module is M, the unit is M/U,
+	// and the latest major version is 3, then is field is "M/v3/U". If the module version
+	// at MajorModulePath does not contain this unit, then it is the module path."
+	MajorUnitPath string
 }

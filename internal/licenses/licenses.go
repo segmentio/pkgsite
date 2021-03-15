@@ -20,25 +20,27 @@ package licenses
 
 import (
 	"archive/zip"
+	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/google/licensecheck"
+	oldlicensecheck "github.com/google/licensecheck/old"
 	"golang.org/x/mod/module"
+	modzip "golang.org/x/mod/zip"
+	"golang.org/x/pkgsite/internal/log"
 )
 
 //go:generate rm -f exceptions.gen.go
 //go:generate go run gen_exceptions.go
 
 const (
-	// classifyThreshold is the minimum confidence percentage/threshold to
-	// classify a license
-	classifyThreshold = 90
-
 	// coverageThreshold is the minimum percentage of the file that must contain
 	// license text.
 	coverageThreshold = 75
@@ -51,7 +53,7 @@ const (
 // There are some license files larger than 1 million bytes: https://github.com/vmware/vic/LICENSE
 // and github.com/goharbor/harbor/LICENSE, for example.
 // var for testing
-var maxLicenseSize uint64 = 1e7
+var maxLicenseSize uint64 = modzip.MaxLICENSE
 
 // Metadata holds information extracted from a license file.
 type Metadata struct {
@@ -60,14 +62,23 @@ type Metadata struct {
 	// FilePath is the '/'-separated path to the license file in the module zip,
 	// relative to the contents directory.
 	FilePath string
-	// The output of licensecheck.Cover.
-	Coverage licensecheck.Coverage
+	// The output of oldlicensecheck.Cover.
+	OldCoverage oldlicensecheck.Coverage
+	Coverage    licensecheck.Coverage
 }
 
 // A License is a classified license file path and its contents.
 type License struct {
 	*Metadata
 	Contents []byte
+}
+
+// RemoveNonRedistributableData methods removes the license contents
+// if the license is non-redistributable.
+func (l *License) RemoveNonRedistributableData() {
+	if !Redistributable(l.Types) {
+		l.Contents = nil
+	}
 }
 
 var (
@@ -114,40 +125,63 @@ var (
 		"UNLICENCE",
 	}
 
-	// redistributableLicenseTypes is the list of license types, as reported by
-	// licensecheck, that allow redistribution.
-	redistributableLicenseTypes = map[string]bool{
+	// standardRedistributableLicenseTypes is the list of license types, as reported by
+	// licensecheck, that allow redistribution, and also have a name that is an OSI or SPDX
+	// identifier.
+	standardRedistributableLicenseTypes = []string{
 		// Licenses acceptable by OSI.
-		"AGPL-3.0":             true,
-		"Apache-2.0":           true,
-		"Artistic-2.0":         true,
-		"BlueOak-1.0":          true,
-		"BSD-0-Clause":         true,
-		"BSD-2-Clause":         true,
-		"BSD-2-Clause-FreeBSD": true,
-		"BSD-3-Clause":         true,
-		"BSL-1.0":              true,
-		"CC-BY-3.0":            true,
-		"CC-BY-4.0":            true,
-		"CC-BY-SA-3.0":         true,
-		"CC-BY-SA-4.0":         true,
-		"CC0-1.0":              true,
-		"EPL-1.0":              true,
-		"EPL-2.0":              true,
-		"GPL2":                 true,
-		"GPL3":                 true,
-		"ISC":                  true,
-		"JSON":                 true,
-		"LGPL-2.1":             true,
-		"LGPL-3.0":             true,
-		"MIT":                  true,
-		"MIT-0":                true,
-		"MPL-2.0":              true,
-		"NCSA":                 true,
-		"OpenSSL":              true,
-		"OSL-3.0":              true,
-		"Unlicense":            true,
-		"Zlib":                 true,
+		"AFL-3.0",
+		"AGPL-3.0",
+		"AGPL-3.0-only",
+		"AGPL-3.0-or-later",
+		"Apache-1.1",
+		"Apache-2.0",
+		"Artistic-2.0",
+		"BlueOak-1.0.0",
+		"0BSD",
+		"BSD-1-Clause",
+		"BSD-2-Clause",
+		"BSD-2-Clause-Views",
+		"BSD-3-Clause",
+		"BSD-3-Clause-Clear",
+		"BSD-3-Clause-Open-MPI",
+		"BSD-4-Clause",
+		"BSD-4-Clause-UC",
+		"BSL-1.0",
+		"CC-BY-3.0",
+		"CC-BY-4.0",
+		"CC-BY-SA-3.0",
+		"CC-BY-SA-4.0",
+		"CC0-1.0",
+		"EPL-1.0",
+		"EPL-2.0",
+		"EUPL-1.2",
+		"GPL-2.0",
+		"GPL-2.0-only",
+		"GPL-2.0-or-later",
+		"GPL-3.0",
+		"GPL-3.0-only",
+		"GPL-3.0-or-later",
+		"HPND",
+		"ISC",
+		"JSON",
+		"LGPL-2.1",
+		"LGPL-2.1-or-later",
+		"LGPL-3.0",
+		"LGPL-3.0-or-later",
+		"MIT",
+		"MIT-0",
+		"MPL-2.0",
+		"MPL-2.0-no-copyleft-exception",
+		"NIST-PD",
+		"NIST-PD-fallback",
+		"NCSA",
+		"OpenSSL",
+		"OSL-3.0",
+		"PostgreSQL", // TODO: ask legal
+		"Unlicense",
+		"UPL-1.0",
+		"Zlib",
 	}
 
 	// These aren't technically licenses, but they are recognized by
@@ -155,30 +189,48 @@ var (
 	ignorableLicenseTypes = map[string]bool{
 		"CC-Notice":          true,
 		"GooglePatentClause": true,
+		"GooglePatentsFile":  true,
+		"blessing":           true,
+		"OFL-1.1":            true, // concerns fonts only
 	}
+
+	// redistributableLicenseTypes is the set of license types, as reported by
+	// licensecheck, that allow redistribution. It consists of the standard
+	// types along with some exception types.
+	redistributableLicenseTypes = map[string]bool{}
 )
 
-// osiNameOverrides maps a licensecheck license type to the corresponding OSI
-// name, if they differ.
-var osiNameOverrides = map[string]string{
-	"GPL2": "GPL-2.0",
-	"GPL3": "GPL-3.0",
+func init() {
+	for _, t := range standardRedistributableLicenseTypes {
+		redistributableLicenseTypes[t] = true
+	}
+	// Add here all other types defined in the exceptions.
+	redistributableLicenseTypes["Freetype"] = true
+
+	// exceptionTypes is a map from License IDs from LREs in the exception
+	// directory to license types. Any type mentioned in an exception should
+	// be redistributable. If not, there's a problem.
+	for _, types := range exceptionTypes {
+		for _, t := range types {
+			if !redistributableLicenseTypes[t] {
+				log.Fatalf(context.Background(), "%s is an exception type that is not redistributable.", t)
+			}
+		}
+	}
 }
 
 // nonOSILicenses lists licenses that are not approved by OSI.
 var nonOSILicenses = map[string]bool{
-	"BlueOak-1.0":          true,
-	"BSD-0-Clause":         true,
-	"BSD-2-Clause-FreeBSD": true,
-	"CC-BY-3.0":            true,
-	"CC-BY-4.0":            true,
-	"CC-BY-SA-3.0":         true,
-	"CC-BY-SA-4.0":         true,
-	"CC0-1.0":              true,
-	"JSON":                 true,
-	"MIT-0":                true,
-	"OpenSSL":              true,
-	"Unlicense":            true,
+	"BlueOak-1.0.0":      true,
+	"BSD-2-Clause-Views": true,
+	"CC-BY-3.0":          true,
+	"CC-BY-4.0":          true,
+	"CC-BY-SA-3.0":       true,
+	"CC-BY-SA-4.0":       true,
+	"CC0-1.0":            true,
+	"JSON":               true,
+	"NIST":               true,
+	"OpenSSL":            true,
 }
 
 // fileNamesLowercase has all the entries of FileNames, downcased and made a set
@@ -201,22 +253,42 @@ type AcceptedLicenseInfo struct {
 // redistributable. Its result is intended to be displayed to users.
 func AcceptedLicenses() []AcceptedLicenseInfo {
 	var lics []AcceptedLicenseInfo
-	for l := range redistributableLicenseTypes {
-		osiName := osiNameOverrides[l]
-		if osiName == "" {
-			osiName = l
-		}
+	for _, identifier := range standardRedistributableLicenseTypes {
 		var link string
-		if !nonOSILicenses[l] {
-			link = fmt.Sprintf("https://opensource.org/licenses/%s", osiName)
+		if nonOSILicenses[identifier] {
+			link = fmt.Sprintf("https://spdx.org/licenses/%s.html", identifier)
+		} else {
+			link = fmt.Sprintf("https://opensource.org/licenses/%s", identifier)
 		}
-		lics = append(lics, AcceptedLicenseInfo{osiName, link})
+		lics = append(lics, AcceptedLicenseInfo{identifier, link})
 	}
 	sort.Slice(lics, func(i, j int) bool { return lics[i].Name < lics[j].Name })
 	return lics
 }
 
-var checker *licensecheck.Checker = licensecheck.New(licensecheck.BuiltinLicenses())
+var (
+	// OmitExceptions causes the list of exceptions to be omitted from license detection.
+	// It is intended only to speed up testing, and must be set before the first use
+	// of this package.
+	OmitExceptions bool
+
+	_scanner    *licensecheck.Scanner
+	scannerOnce sync.Once
+)
+
+func scanner() *licensecheck.Scanner {
+	scannerOnce.Do(func() {
+		if OmitExceptions {
+			exceptionLicenses = nil
+		}
+		var err error
+		_scanner, err = licensecheck.NewScanner(append(exceptionLicenses, licensecheck.BuiltinLicenses()...))
+		if err != nil {
+			log.Fatalf(context.Background(), "licensecheck.NewScanner: %v", err)
+		}
+	})
+	return _scanner
+}
 
 // A Detector detects licenses in a module and its packages.
 type Detector struct {
@@ -427,23 +499,19 @@ func DetectFile(contents []byte, filename string, logf func(string, ...interface
 	if logf == nil {
 		logf = func(string, ...interface{}) {}
 	}
-	if types := exceptionFileTypes(contents); types != nil {
-		logf("%s is an exception", filename)
-		return types, licensecheck.Coverage{}
-	}
-	cov, ok := checker.Cover(contents, licensecheck.Options{})
-	if !ok {
-		logf("%s checker.Cover failed, skipping", filename)
-		return []string{unknownLicenseType}, licensecheck.Coverage{}
-	}
+	cov := scanner().Scan(contents)
 	if cov.Percent < float64(coverageThreshold) {
 		logf("%s license coverage too low (%+v), skipping", filename, cov)
 		return []string{unknownLicenseType}, cov
 	}
 	types := make(map[string]bool)
 	for _, m := range cov.Match {
-		if m.Percent >= classifyThreshold {
-			types[canonicalizeName(m.Name)] = true
+		ts := exceptionTypes[m.ID]
+		if ts == nil {
+			ts = []string{m.ID}
+		}
+		for _, t := range ts {
+			types[t] = true
 		}
 	}
 	if len(types) == 0 {
@@ -455,32 +523,20 @@ func DetectFile(contents []byte, filename string, logf func(string, ...interface
 
 // Redistributable reports whether the set of license types establishes that a
 // module or package is redistributable.
+// All the licenses we see that are relevant must be redistributable, and
+// we must see at least one such license.
 func Redistributable(licenseTypes []string) bool {
-	if len(licenseTypes) == 0 {
-		return false
-	}
+	sawRedist := false
 	for _, t := range licenseTypes {
-		if !redistributableLicenseTypes[t] && !ignorableLicenseTypes[t] {
+		if ignorableLicenseTypes[t] {
+			continue
+		}
+		if !redistributableLicenseTypes[t] {
 			return false
 		}
+		sawRedist = true
 	}
-	return true
-}
-
-var canonicalNames = map[string]string{
-	"AGPL-Header":         "AGPL-3.0",
-	"GPL-Header":          "GPL2",
-	"GPL-NotLater-Header": "GPL3",
-	"LGPL-Header":         "LGPL-2.1",
-}
-
-// canonicalizeName puts a license name in a standard form.
-func canonicalizeName(name string) string {
-	if c := canonicalNames[name]; c != "" {
-		return c
-	}
-	name = strings.TrimSuffix(name, "-Short")
-	return strings.TrimSuffix(name, "-Header")
+	return sawRedist
 }
 
 func types(lics []*License) []string {
@@ -509,7 +565,7 @@ func readZipFile(f *zip.File) ([]byte, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	return ioutil.ReadAll(rc)
+	return ioutil.ReadAll(io.LimitReader(rc, int64(maxLicenseSize)))
 }
 
 func contentsDir(modulePath, version string) string {

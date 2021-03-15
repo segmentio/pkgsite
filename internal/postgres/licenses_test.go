@@ -12,13 +12,14 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/stdlib"
 	"golang.org/x/pkgsite/internal/testing/sample"
 )
 
 func TestGetLicenses(t *testing.T) {
+	t.Parallel()
 	testModule := sample.Module(sample.ModulePath, "v1.2.3", "A/B")
 	stdlibModule := sample.Module(stdlib.ModulePath, "v1.13.0", "cmd/go")
 	mit := &licenses.Metadata{Types: []string{"MIT"}, FilePath: "LICENSE"}
@@ -27,35 +28,29 @@ func TestGetLicenses(t *testing.T) {
 	mitLicense := &licenses.License{Metadata: mit}
 	bsdLicense := &licenses.License{Metadata: bsd}
 	testModule.Licenses = []*licenses.License{bsdLicense, mitLicense}
-	sort.Slice(testModule.Directories, func(i, j int) bool {
-		return testModule.Directories[i].Path < testModule.Directories[j].Path
+	sort.Slice(testModule.Units, func(i, j int) bool {
+		return testModule.Units[i].Path < testModule.Units[j].Path
 	})
 
 	// github.com/valid/module_name
-	testModule.Directories[0].Licenses = []*licenses.Metadata{mit}
+	testModule.Units[0].Licenses = []*licenses.Metadata{mit}
 	// github.com/valid/module_name/A
-	testModule.Directories[1].Licenses = []*licenses.Metadata{mit}
+	testModule.Units[1].Licenses = []*licenses.Metadata{mit}
 	// github.com/valid/module_name/A/B
-	testModule.Directories[2].Licenses = []*licenses.Metadata{mit, bsd}
+	testModule.Units[2].Licenses = []*licenses.Metadata{mit, bsd}
 
-	defer ResetTestDB(testDB, t)
+	testDB, release := acquire(t)
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout*5)
 	defer cancel()
-	if err := testDB.InsertModule(ctx, testModule); err != nil {
-		t.Fatal(err)
-	}
-	if err := testDB.InsertModule(ctx, stdlibModule); err != nil {
-		t.Fatal(err)
-	}
+	MustInsertModule(ctx, t, testDB, testModule)
+	MustInsertModule(ctx, t, testDB, stdlibModule)
 	for _, test := range []struct {
 		err                                 error
 		name, fullPath, modulePath, version string
 		want                                []*licenses.License
 	}{
-		{
-			name: "empty path",
-			err:  derrors.InvalidArgument,
-		},
 		{
 			name:       "module root",
 			fullPath:   sample.ModulePath,
@@ -100,10 +95,11 @@ func TestGetLicenses(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := testDB.GetLicenses(ctx, test.fullPath, test.modulePath, test.version)
+			u, err := testDB.GetUnit(ctx, newUnitMeta(test.fullPath, test.modulePath, test.version), internal.WithLicenses)
 			if !errors.Is(err, test.err) {
 				t.Fatal(err)
 			}
+			got := u.LicenseContents
 			sort.Slice(got, func(i, j int) bool {
 				return got[i].FilePath < got[j].FilePath
 			})
@@ -124,78 +120,115 @@ func TestGetLicenses(t *testing.T) {
 	}
 }
 
-func TestLegacyGetModuleLicenses(t *testing.T) {
+func TestGetModuleLicenses(t *testing.T) {
+	t.Parallel()
 	modulePath := "test.module"
 	testModule := sample.Module(modulePath, "v1.2.3", "", "foo", "bar")
-	testModule.LegacyPackages[0].Licenses = []*licenses.Metadata{{Types: []string{"ISC"}, FilePath: "LICENSE"}}
-	testModule.LegacyPackages[1].Licenses = []*licenses.Metadata{{Types: []string{"MIT"}, FilePath: "foo/LICENSE"}}
-	testModule.LegacyPackages[2].Licenses = []*licenses.Metadata{{Types: []string{"GPL2"}, FilePath: "bar/LICENSE.txt"}}
+	testModule.Packages()[0].Licenses = []*licenses.Metadata{{Types: []string{"ISC"}, FilePath: "LICENSE"}}
+	testModule.Packages()[1].Licenses = []*licenses.Metadata{{Types: []string{"MIT"}, FilePath: "foo/LICENSE"}}
+	testModule.Packages()[2].Licenses = []*licenses.Metadata{{Types: []string{"GPL2"}, FilePath: "bar/LICENSE.txt"}}
 
-	defer ResetTestDB(testDB, t)
+	testDB, release := acquire(t)
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
 	testModule.Licenses = nil
-	for _, p := range testModule.LegacyPackages {
+	for _, p := range testModule.Packages() {
 		testModule.Licenses = append(testModule.Licenses, &licenses.License{
 			Metadata: p.Licenses[0],
 			Contents: []byte(`Lorem Ipsum`),
 		})
 	}
 
-	if err := testDB.InsertModule(ctx, testModule); err != nil {
+	MustInsertModule(ctx, t, testDB, testModule)
+
+	var moduleID int
+	query := `
+		SELECT m.id
+		FROM modules m
+		WHERE
+		    m.module_path = $1
+		    AND m.version = $2;`
+	if err := testDB.db.QueryRow(ctx, query, modulePath, testModule.Version).Scan(&moduleID); err != nil {
 		t.Fatal(err)
 	}
-
-	got, err := testDB.LegacyGetModuleLicenses(ctx, modulePath, testModule.Version)
+	got, err := testDB.getModuleLicenses(ctx, moduleID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// We only want the top-level license.
 	wantLicenses := []*licenses.License{testModule.Licenses[0]}
 	if diff := cmp.Diff(wantLicenses, got); diff != "" {
-		t.Errorf("testDB.LegacyGetModuleLicenses(ctx, %q, %q) mismatch (-want +got):\n%s", modulePath, testModule.Version, diff)
+		t.Errorf("testDB.getModuleLicenses(ctx, %q, %q) mismatch (-want +got):\n%s", modulePath, testModule.Version, diff)
 	}
 }
 
-func TestLegacyGetPackageLicenses(t *testing.T) {
-	modulePath := "test.module"
-	testModule := sample.Module(modulePath, "v1.2.3", "", "foo")
-	testModule.LegacyPackages[0].Licenses = nil
-	testModule.LegacyPackages[1].Licenses = sample.LicenseMetadata
-
-	tests := []struct {
-		label, pkgPath string
-		wantLicenses   []*licenses.License
-	}{
-		{
-			label:        "package with licenses",
-			pkgPath:      "test.module/foo",
-			wantLicenses: sample.Licenses,
-		}, {
-			label:        "package with no licenses",
-			pkgPath:      "test.module",
-			wantLicenses: nil,
-		},
-	}
-
-	defer ResetTestDB(testDB, t)
+func TestGetLicensesBypass(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	if err := testDB.InsertModule(ctx, testModule); err != nil {
-		t.Fatal(err)
+	bypassDB := NewBypassingLicenseCheck(testDB.db)
+
+	// Insert with non-redistributable license contents.
+	m := nonRedistributableModule()
+	MustInsertModule(ctx, t, bypassDB, m)
+
+	// check reads and the second license in the module and compares it with want.
+	check := func(bypass bool, want *licenses.License) {
+		t.Helper()
+		db := testDB
+		if bypass {
+			db = bypassDB
+		}
+		u, err := db.GetUnit(ctx, newUnitMeta(sample.ModulePath, sample.ModulePath, m.Version), internal.WithLicenses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lics := u.LicenseContents
+		if len(lics) != 2 {
+			t.Fatal("did not read two licenses")
+		}
+		if diff := cmp.Diff(want, lics[1]); diff != "" {
+			t.Errorf("mismatch (-want, +got):\n%s", diff)
+		}
 	}
 
-	for _, test := range tests {
-		t.Run(test.label, func(t *testing.T) {
-			got, err := testDB.LegacyGetPackageLicenses(ctx, test.pkgPath, modulePath, testModule.Version)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(test.wantLicenses, got); diff != "" {
-				t.Errorf("testDB.GetLicenses(ctx, %q, %q) mismatch (-want +got):\n%s", test.pkgPath, testModule.Version, diff)
-			}
-		})
+	// Read with license bypass includes non-redistributable license contents.
+	check(true, sample.NonRedistributableLicense)
+
+	// Read without license bypass does not include non-redistributable license contents.
+	nonRedist := *sample.NonRedistributableLicense
+	nonRedist.Contents = nil
+	check(false, &nonRedist)
+}
+
+func nonRedistributableModule() *internal.Module {
+	m := sample.Module(sample.ModulePath, "v1.2.3", "")
+	sample.AddLicense(m, sample.NonRedistributableLicense)
+	m.IsRedistributable = false
+	m.Packages()[0].IsRedistributable = false
+	m.Units[0].IsRedistributable = false
+	return m
+}
+
+// makeModuleNonRedistributable mutates the passed-in module by marking it
+// non-redistributable along with each of its packages and units. It allows
+// us to re-use existing test data without defining a non-redistributable
+// counterpart to each.
+func makeModuleNonRedistributable(m *internal.Module) {
+	sample.AddLicense(m, sample.NonRedistributableLicense)
+	m.IsRedistributable = false
+
+	for _, p := range m.Packages() {
+		p.IsRedistributable = false
+	}
+
+	for i := range m.Units {
+		m.Units[i].IsRedistributable = false
 	}
 }

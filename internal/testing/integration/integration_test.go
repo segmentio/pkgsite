@@ -9,153 +9,130 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v7"
+	"github.com/go-redis/redis/v8"
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/safehtml/template"
 	"golang.org/x/pkgsite/internal"
-	"golang.org/x/pkgsite/internal/config"
-	"golang.org/x/pkgsite/internal/frontend"
+	"golang.org/x/pkgsite/internal/experiment"
+	"golang.org/x/pkgsite/internal/godoc/dochtml"
 	"golang.org/x/pkgsite/internal/index"
+	"golang.org/x/pkgsite/internal/middleware"
 	"golang.org/x/pkgsite/internal/postgres"
 	"golang.org/x/pkgsite/internal/proxy"
-	"golang.org/x/pkgsite/internal/queue"
-	"golang.org/x/pkgsite/internal/source"
-	"golang.org/x/pkgsite/internal/testing/testhelper"
-	"golang.org/x/pkgsite/internal/worker"
 )
 
-var testDB *postgres.DB
+var (
+	testDB      *postgres.DB
+	testModules []*proxy.Module
+)
 
 func TestMain(m *testing.M) {
+	dochtml.LoadTemplates(template.TrustedSourceFromConstant("../../../content/static/html/doc"))
+	testModules = proxy.LoadTestModules("../../proxy/testdata")
 	postgres.RunDBTests("discovery_integration_test", m, &testDB)
 }
 
 func TestEndToEndProcessing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ctx = experiment.NewContext(ctx, internal.ExperimentRetractions)
 
 	defer postgres.ResetTestDB(testDB, t)
 
-	var (
-		modulePath = "github.com/my/module"
-		version    = "v1.0.0"
-		moduleData = map[string]string{
-			"go.mod":     "module " + modulePath,
-			"foo/foo.go": "package foo\n\nconst Foo = 525600",
-			"README.md":  "This is a readme",
-			"LICENSE":    testhelper.MITLicense,
-		}
-	)
-	testModules := []*proxy.Module{
-		{
-			ModulePath: modulePath,
-			Version:    version,
-			Files:      moduleData,
-		},
-	}
-	proxyClient, indexClient, teardownClients := setupProxyAndIndex(t, testModules...)
+	middleware.TestMode = true
+
+	proxyClient, proxyServer, indexClient, teardownClients := setupProxyAndIndex(t)
 	defer teardownClients()
 
-	redisCache, err := miniredis.Run()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer redisCache.Close()
-	redisCacheClient := redis.NewClient(&redis.Options{Addr: redisCache.Addr()})
+	redisCacheClient, td := newRedisClient(t)
+	defer td()
 
-	redisHA, err := miniredis.Run()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer redisHA.Close()
-	redisHAClient := redis.NewClient(&redis.Options{Addr: redisHA.Addr()})
+	redisHAClient, td := newRedisClient(t)
+	defer td()
 
-	// TODO: it would be better if InMemory made http requests
-	// back to worker, rather than calling fetch itself.
-	sourceClient := source.NewClient(1 * time.Second)
-	queue := queue.NewInMemory(ctx, 10, nil, func(ctx context.Context, mpath, version string) (int, error) {
-		return worker.FetchAndUpdateState(ctx, mpath, version, proxyClient, sourceClient, testDB, "test")
-	})
-	workerServer, err := worker.NewServer(&config.Config{}, worker.ServerConfig{
-		DB:                   testDB,
-		IndexClient:          indexClient,
-		ProxyClient:          proxyClient,
-		SourceClient:         source.NewClient(1 * time.Second),
-		RedisHAClient:        redisHAClient,
-		RedisCacheClient:     redisCacheClient,
-		Queue:                queue,
-		TaskIDChangeInterval: 10 * time.Minute,
-		StaticPath:           template.TrustedSourceFromConstant("../../../content/static"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	workerMux := http.NewServeMux()
-	workerServer.Install(workerMux.Handle)
-	workerHTTP := httptest.NewServer(workerMux)
-
-	frontendServer, err := frontend.NewServer(frontend.ServerConfig{
-		DataSourceGetter:     func(context.Context) internal.DataSource { return testDB },
-		Queue:                queue,
-		CompletionClient:     redisHAClient,
-		TaskIDChangeInterval: 10 * time.Minute,
-		StaticPath:           template.TrustedSourceFromConstant("../../../content/static"),
-		ThirdPartyPath:       "../../../third_party",
-		AppVersionLabel:      "",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	frontendMux := http.NewServeMux()
-	frontendServer.Install(frontendMux.Handle, redisCacheClient)
-	frontendHTTP := httptest.NewServer(frontendMux)
-
-	if _, err := doGet(workerHTTP.URL + "/poll"); err != nil {
+	workerHTTP, fetcher, queue := setupWorker(ctx, t, proxyClient, indexClient, redisCacheClient, redisHAClient)
+	frontendHTTP := setupFrontend(ctx, t, queue, redisCacheClient)
+	if _, err := doGet(workerHTTP.URL + "/poll?limit=1000"); err != nil {
 		t.Fatal(err)
 	}
 	// TODO: This should really be made deterministic.
 	time.Sleep(100 * time.Millisecond)
-	if _, err := doGet(workerHTTP.URL + "/enqueue"); err != nil {
+	if _, err := doGet(workerHTTP.URL + "/enqueue?limit=1000"); err != nil {
 		t.Fatal(err)
 	}
 	// TODO: This should really be made deterministic.
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	queue.WaitForTesting(ctx)
 
-	body, err := doGet(frontendHTTP.URL + "/github.com/my/module/foo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if idx := strings.Index(string(body), "525600"); idx < 0 {
-		t.Error("Documentation constant 525600 not found in body")
+	var wantKeys []string
+	for _, test := range []struct {
+		url, want string
+	}{
+		{"example.com/basic", "v1.1.0"},
+		{"example.com/basic@v1.0.0", "v1.0.0"},
+		{"example.com/single", "This is the README"},
+		{"example.com/single/pkg", "hello"},
+		{"example.com/single@v1.0.0/pkg", "hello"},
+		{"example.com/deprecated", "UnitHeader-deprecatedBanner"},
+		{"example.com/retractions@v1.1.0", "UnitHeader-retractedBanner"},
+		{"example.com/deprecated?tab=versions", "Deprecated: use something else"},
+		{"example.com/retractions?tab=versions", "Retracted: bad"},
+	} {
+		t.Run(strings.ReplaceAll(test.url, "/", "_"), func(t *testing.T) {
+			wantKeys = append(wantKeys, "/"+test.url)
+			body, err := doGet(frontendHTTP.URL + "/" + test.url)
+			if err != nil {
+				t.Fatalf("%s: %v", test.url, err)
+			}
+			if !strings.Contains(string(body), test.want) {
+				t.Errorf("%q not found in body", test.want)
+				t.Logf("%s", body)
+			}
+		})
 	}
 
-	// Populate the auto-completion indexes from the search documents that should
-	// have been inserted above.
-	if _, err := doGet(workerHTTP.URL + "/update-redis-indexes"); err != nil {
-		t.Fatal(err)
+	// Test cache invalidation.
+	keys := cacheKeys(t, redisCacheClient)
+	sort.Strings(wantKeys)
+	if !cmp.Equal(keys, wantKeys) {
+		t.Errorf("cache keys: got %v, want %v", keys, wantKeys)
 	}
-	completionBody, err := doGet(frontendHTTP.URL + "/autocomplete?q=foo")
+
+	// Process a newer version of a module, and verify that the cache has been invalidated.
+	modulePath := "example.com/single"
+	version := "v1.2.3"
+	proxyServer.AddModule(proxy.FindModule(testModules, modulePath, "v1.0.0").ChangeVersion(version))
+	_, _, err := fetcher.FetchAndUpdateState(ctx, modulePath, version, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	completion := "github.com/my/module/foo"
-	if idx := strings.Index(string(completionBody), completion); idx < 0 {
-		t.Errorf("Auto-completion %q not found in JSON response", completion)
+
+	// All the keys with modulePath should be gone, but the others should remain.
+	wantKeys = nil
+	// Remove modulePath from the previous keys.
+	for _, k := range keys {
+		if !strings.Contains(k, modulePath) {
+			wantKeys = append(wantKeys, k)
+		}
 	}
-	emptyCompletion, err := doGet(frontendHTTP.URL + "/autocomplete?q=frog")
+	keys = cacheKeys(t, redisCacheClient)
+	if !cmp.Equal(keys, wantKeys) {
+		t.Errorf("cache keys: got %v, want %v", keys, wantKeys)
+	}
+}
+
+func cacheKeys(t *testing.T, client *redis.Client) []string {
+	keys, err := client.Keys(context.Background(), "*").Result()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// This could be made more robust by actually parsing the JSON.
-	if got := string(emptyCompletion); got != "[]" {
-		t.Errorf("GET /autocomplete?q=frog: expected empty results, got %q", got)
-	}
+	sort.Strings(keys)
+	return keys
 }
 
 // doGet executes an HTTP GET request for url and returns the response body, or
@@ -176,11 +153,16 @@ func doGet(url string) ([]byte, error) {
 	return body, nil
 }
 
-func setupProxyAndIndex(t *testing.T, modules ...*proxy.Module) (*proxy.Client, *index.Client, func()) {
+func setupProxyAndIndex(t *testing.T) (*proxy.Client, *proxy.Server, *index.Client, func()) {
 	t.Helper()
-	proxyClient, teardownProxy := proxy.SetupTestProxy(t, modules)
+	proxyServer := proxy.NewServer(testModules)
+	proxyClient, teardownProxy, err := proxy.NewClientForServer(proxyServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var indexVersions []*internal.IndexVersion
-	for _, m := range modules {
+	for _, m := range testModules {
 		indexVersions = append(indexVersions, &internal.IndexVersion{
 			Path:      m.ModulePath,
 			Version:   m.Version,
@@ -192,5 +174,5 @@ func setupProxyAndIndex(t *testing.T, modules ...*proxy.Module) (*proxy.Client, 
 		teardownProxy()
 		teardownIndex()
 	}
-	return proxyClient, indexClient, teardown
+	return proxyClient, proxyServer, indexClient, teardown
 }

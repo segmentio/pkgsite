@@ -24,119 +24,9 @@ import (
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/source"
-	"golang.org/x/pkgsite/internal/stdlib"
 )
 
-// OverviewDetails contains all of the data that the readme template
-// needs to populate.
-type OverviewDetails struct {
-	ModulePath       string
-	ModuleURL        string
-	PackageSourceURL string
-	ReadMe           safehtml.HTML
-	ReadMeSource     string
-	Redistributable  bool
-	RepositoryURL    string
-}
-
-// versionedLinks says whether the constructed URLs should have versions.
-// constructOverviewDetails uses the given version to construct an OverviewDetails.
-func constructOverviewDetails(ctx context.Context, mi *internal.ModuleInfo, readme *internal.Readme, isRedistributable bool, versionedLinks bool) (*OverviewDetails, error) {
-	var lv string
-	if versionedLinks {
-		lv = linkVersion(mi.Version, mi.ModulePath)
-	} else {
-		lv = internal.LatestVersion
-	}
-	overview := &OverviewDetails{
-		ModulePath:      mi.ModulePath,
-		ModuleURL:       constructModuleURL(mi.ModulePath, lv),
-		RepositoryURL:   mi.SourceInfo.RepoURL(),
-		Redistributable: true, //isRedistributable,
-	}
-	if overview.Redistributable && readme != nil {
-		overview.ReadMeSource = fileSource(mi.ModulePath, mi.Version, readme.Filepath)
-		r, err := ReadmeHTML(ctx, mi, readme)
-		if err != nil {
-			return nil, err
-		}
-		overview.ReadMe = r
-	}
-	return overview, nil
-}
-
-// legacyFetchPackageOverviewDetails uses data for the given package to return
-// an OverviewDetails.
-func legacyFetchPackageOverviewDetails(ctx context.Context, pkg *internal.LegacyVersionedPackage, versionedLinks bool) (*OverviewDetails, error) {
-	od, err := constructOverviewDetails(ctx, &pkg.ModuleInfo, &internal.Readme{Filepath: pkg.LegacyReadmeFilePath, Contents: pkg.LegacyReadmeContents},
-		pkg.LegacyPackage.IsRedistributable, versionedLinks)
-	if err != nil {
-		return nil, err
-	}
-	od.PackageSourceURL = pkg.SourceInfo.DirectoryURL(packageSubdir(pkg.Path, pkg.ModulePath))
-	if !pkg.LegacyPackage.IsRedistributable {
-		od.Redistributable = false
-	}
-	return od, nil
-}
-
-// fetchPackageOverviewDetailsNew uses data for the given versioned directory to return an OverviewDetails.
-func fetchPackageOverviewDetails(ctx context.Context, vdir *internal.VersionedDirectory, versionedLinks bool) (*OverviewDetails, error) {
-	var lv string
-	if versionedLinks {
-		lv = linkVersion(vdir.Version, vdir.ModulePath)
-	} else {
-		lv = internal.LatestVersion
-	}
-	overview := &OverviewDetails{
-		ModulePath:       vdir.ModulePath,
-		ModuleURL:        constructModuleURL(vdir.ModulePath, lv),
-		RepositoryURL:    vdir.SourceInfo.RepoURL(),
-		Redistributable:  true, // vdir.Directory.IsRedistributable,
-		PackageSourceURL: vdir.SourceInfo.DirectoryURL(packageSubdir(vdir.Path, vdir.ModulePath)),
-	}
-	if overview.Redistributable && vdir.Readme != nil {
-		overview.ReadMeSource = fileSource(vdir.ModulePath, vdir.Version, vdir.Readme.Filepath)
-		r, err := ReadmeHTML(ctx, &vdir.ModuleInfo, vdir.Readme)
-		if err != nil {
-			return nil, err
-		}
-		overview.ReadMe = r
-	}
-	return overview, nil
-}
-
-// packageSubdir returns the subdirectory of the package relative to its module.
-func packageSubdir(pkgPath, modulePath string) string {
-	switch {
-	case pkgPath == modulePath:
-		return ""
-	case modulePath == stdlib.ModulePath:
-		return pkgPath
-	default:
-		return strings.TrimPrefix(pkgPath, modulePath+"/")
-	}
-}
-
-// ReadmeHTML sanitizes readmeContents based on bluemondy.UGCPolicy and returns
-// a safehtml.HTML. If readmeFilePath indicates that this is a markdown file,
-// it will also render the markdown contents using blackfriday.
-//
-// It is exported to support external testing.
-func ReadmeHTML(ctx context.Context, mi *internal.ModuleInfo, readme *internal.Readme) (_ safehtml.HTML, err error) {
-	defer derrors.Wrap(&err, "readmeHTML(%s@%s)", mi.ModulePath, mi.Version)
-	if readme == nil {
-		return safehtml.HTML{}, nil
-	}
-	if !isMarkdown(readme.Filepath) {
-		t := template.Must(template.New("").Parse(`<pre class="readme">{{.}}</pre>`))
-		h, err := t.ExecuteToHTML(readme.Contents)
-		if err != nil {
-			return safehtml.HTML{}, err
-		}
-		return h, nil
-	}
-
+func blackfridayReadmeHTML(readme *internal.Readme, mi *internal.ModuleInfo) (safehtml.HTML, error) {
 	// blackfriday.Run() uses CommonHTMLFlags and CommonExtensions by default.
 	renderer := blackfriday.NewHTMLRenderer(blackfriday.HTMLRendererParameters{Flags: blackfriday.CommonHTMLFlags})
 	parser := blackfriday.New(blackfriday.WithExtensions(blackfriday.CommonExtensions | blackfriday.AutoHeadingIDs))
@@ -149,6 +39,12 @@ func ReadmeHTML(ctx context.Context, mi *internal.ModuleInfo, readme *internal.R
 	var walkErr error
 	rootNode.Walk(func(node *blackfriday.Node, entering bool) blackfriday.WalkStatus {
 		switch node.Type {
+		case blackfriday.Heading:
+			if node.HeadingID != "" {
+				// Prefix HeadingID with "readme-" on the unit page to prevent
+				// a namespace clash with the documentation section.
+				node.HeadingID = "readme-" + node.HeadingID
+			}
 		case blackfriday.Image, blackfriday.Link:
 			useRaw := node.Type == blackfriday.Image
 			if d := translateRelativeLink(string(node.LinkData.Destination), mi.SourceInfo, useRaw, readme); d != "" {
@@ -167,11 +63,34 @@ func ReadmeHTML(ctx context.Context, mi *internal.ModuleInfo, readme *internal.R
 	if walkErr != nil {
 		return safehtml.HTML{}, walkErr
 	}
-	return sanitizeHTML(b), nil
+	return legacySanitizeHTML(b), nil
 }
 
-// sanitizeHTML reads HTML from r and sanitizes it to ensure it is safe.
-func sanitizeHTML(r io.Reader) safehtml.HTML {
+// LegacyReadmeHTML sanitizes readmeContents based on bluemondy.UGCPolicy and returns
+// a safehtml.HTML. If readmeFilePath indicates that this is a markdown file,
+// it will also render the markdown contents using blackfriday.
+//
+// This function is exported for use in an external tool that uses this package to
+// compare readme files to see how changes in processing will affect them.
+func LegacyReadmeHTML(ctx context.Context, mi *internal.ModuleInfo, readme *internal.Readme) (_ safehtml.HTML, err error) {
+	defer derrors.Wrap(&err, "LegacyReadmeHTML(%s@%s)", mi.ModulePath, mi.Version)
+	if readme == nil || readme.Contents == "" {
+		return safehtml.HTML{}, nil
+	}
+	if !isMarkdown(readme.Filepath) {
+		t := template.Must(template.New("").Parse(`<pre class="readme">{{.}}</pre>`))
+		h, err := t.ExecuteToHTML(readme.Contents)
+		if err != nil {
+			return safehtml.HTML{}, err
+		}
+		return h, nil
+	}
+
+	return blackfridayReadmeHTML(readme, mi)
+}
+
+// legacySanitizeHTML reads HTML from r and sanitizes it to ensure it is safe.
+func legacySanitizeHTML(r io.Reader) safehtml.HTML {
 	// bluemonday.UGCPolicy allows a broad selection of HTML elements and
 	// attributes that are safe for user generated content. This policy does
 	// not allow iframes, object, embed, styles, script, etc.
@@ -209,7 +128,7 @@ func translateRelativeLink(dest string, info *source.Info, useRaw bool, readme *
 	}
 	if destURL.Path == "" {
 		// This is a fragment; leave it.
-		return ""
+		return "#readme-" + destURL.Fragment
 	}
 	// Paths are relative to the README location.
 	destPath := path.Join(path.Dir(readme.Filepath), path.Clean(trimmedEscapedPath(destURL)))

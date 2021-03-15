@@ -6,7 +6,9 @@ package frontend
 
 import (
 	"context"
+	"fmt"
 	"path"
+	"strconv"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -16,7 +18,7 @@ import (
 )
 
 func TestFetchImportsDetails(t *testing.T) {
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		name        string
 		imports     []string
 		wantDetails *ImportsDetails
@@ -43,41 +45,30 @@ func TestFetchImportsDetails(t *testing.T) {
 			},
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			defer postgres.ResetTestDB(testDB, t)
 
 			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 			defer cancel()
 
 			module := sample.Module(sample.ModulePath, sample.VersionString, sample.Suffix)
-			module.LegacyPackages[0].Imports = tc.imports
+			// The first unit is the module and the second one is the package.
+			pkg := module.Units[1]
+			pkg.Imports = test.imports
 
-			if err := testDB.InsertModule(ctx, module); err != nil {
-				t.Fatal(err)
-			}
+			postgres.MustInsertModule(ctx, t, testDB, module)
 
-			pkg := firstVersionedPackage(module)
 			got, err := fetchImportsDetails(ctx, testDB, pkg.Path, pkg.ModulePath, pkg.Version)
 			if err != nil {
 				t.Fatalf("fetchImportsDetails(ctx, db, %q, %q) = %v err = %v, want %v",
-					module.LegacyPackages[0].Path, module.Version, got, err, tc.wantDetails)
+					module.Units[1].Path, module.Version, got, err, test.wantDetails)
 			}
 
-			tc.wantDetails.ModulePath = module.LegacyModuleInfo.ModulePath
-			if diff := cmp.Diff(tc.wantDetails, got); diff != "" {
-				t.Errorf("fetchImportsDetails(ctx, %q, %q) mismatch (-want +got):\n%s", module.LegacyPackages[0].Path, module.Version, diff)
+			test.wantDetails.ModulePath = module.ModulePath
+			if diff := cmp.Diff(test.wantDetails, got); diff != "" {
+				t.Errorf("fetchImportsDetails(ctx, %q, %q) mismatch (-want +got):\n%s", module.Units[1].Path, module.Version, diff)
 			}
 		})
-	}
-}
-
-// firstVersionedPackage is a helper function that returns an
-// *internal.LegacyVersionedPackage corresponding to the first package in the
-// version.
-func firstVersionedPackage(m *internal.Module) *internal.LegacyVersionedPackage {
-	return &internal.LegacyVersionedPackage{
-		LegacyPackage:    *m.LegacyPackages[0],
-		LegacyModuleInfo: m.LegacyModuleInfo,
 	}
 }
 
@@ -87,19 +78,19 @@ func TestFetchImportedByDetails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	newModule := func(modPath string, pkgs ...*internal.LegacyPackage) *internal.Module {
+	newModule := func(modPath string, pkgs ...*internal.Unit) *internal.Module {
 		m := sample.Module(modPath, sample.VersionString)
 		for _, p := range pkgs {
-			sample.AddPackage(m, p)
+			sample.AddUnit(m, p)
 		}
 		return m
 	}
 
-	pkg1 := sample.LegacyPackage("path.to/foo", "bar")
-	pkg2 := sample.LegacyPackage("path2.to/foo", "bar2")
+	pkg1 := sample.UnitForPackage("path.to/foo/bar", "path.to/foo", sample.VersionString, "bar", true)
+	pkg2 := sample.UnitForPackage("path2.to/foo/bar2", "path2.to/foo", sample.VersionString, "bar2", true)
 	pkg2.Imports = []string{pkg1.Path}
 
-	pkg3 := sample.LegacyPackage("path3.to/foo", "bar3")
+	pkg3 := sample.UnitForPackage("path3.to/foo/bar3", "path3.to/foor", sample.VersionString, "bar3", true)
 	pkg3.Imports = []string{pkg2.Path, pkg1.Path}
 
 	testModules := []*internal.Module{
@@ -109,25 +100,24 @@ func TestFetchImportedByDetails(t *testing.T) {
 	}
 
 	for _, m := range testModules {
-		if err := testDB.InsertModule(ctx, m); err != nil {
-			t.Fatal(err)
-		}
+		postgres.MustInsertModule(ctx, t, testDB, m)
 	}
 
-	for _, tc := range []struct {
-		pkg         *internal.LegacyPackage
+	tests := []struct {
+		pkg         *internal.Unit
 		wantDetails *ImportedByDetails
 	}{
 		{
-			pkg:         pkg3,
-			wantDetails: &ImportedByDetails{TotalIsExact: true},
+			pkg: pkg3,
+			wantDetails: &ImportedByDetails{
+				NumImportedByDisplay: "0",
+			},
 		},
 		{
 			pkg: pkg2,
 			wantDetails: &ImportedByDetails{
-				ImportedBy:   []*Section{{Prefix: pkg3.Path, NumLines: 0}},
-				Total:        1,
-				TotalIsExact: true,
+				ImportedBy:           []*Section{{Prefix: pkg3.Path, NumLines: 0}},
+				NumImportedByDisplay: "0",
 			},
 		},
 		{
@@ -137,25 +127,56 @@ func TestFetchImportedByDetails(t *testing.T) {
 					{Prefix: pkg2.Path, NumLines: 0},
 					{Prefix: pkg3.Path, NumLines: 0},
 				},
-				Total:        2,
-				TotalIsExact: true,
+				NumImportedByDisplay: "0",
 			},
 		},
-	} {
-		t.Run(tc.pkg.Path, func(t *testing.T) {
-			otherVersion := newModule(path.Dir(tc.pkg.Path), tc.pkg)
+	}
+
+	for _, test := range tests {
+		t.Run(test.pkg.Path, func(t *testing.T) {
+			otherVersion := newModule(path.Dir(test.pkg.Path), test.pkg)
 			otherVersion.Version = "v1.0.5"
-			vp := firstVersionedPackage(otherVersion)
-			got, err := fetchImportedByDetails(ctx, testDB, vp.Path, vp.ModulePath)
-			if err != nil {
-				t.Fatalf("fetchImportedByDetails(ctx, db, %q) = %v err = %v, want %v",
-					tc.pkg.Path, got, err, tc.wantDetails)
+			pkg := otherVersion.Units[1]
+			checkFetchImportedByDetails(ctx, t, pkg, test.wantDetails)
+		})
+	}
+}
+
+func TestFetchImportedByDetails_ExceedsTabLimit(t *testing.T) {
+	defer postgres.ResetTestDB(testDB, t)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	for _, count := range []int{tabImportedByLimit, 30000} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			args := postgres.UpsertSearchDocumentArgs{
+				PackagePath: sample.PackagePath,
+				ModulePath:  sample.ModulePath,
+			}
+			postgres.MustInsertModule(ctx, t, testDB, sample.Module(sample.ModulePath, sample.VersionString, sample.PackageName))
+			if err := testDB.UpsertSearchDocumentWithImportedByCount(ctx, args, count); err != nil {
+				t.Fatal(err)
 			}
 
-			tc.wantDetails.ModulePath = vp.LegacyModuleInfo.ModulePath
-			if diff := cmp.Diff(tc.wantDetails, got); diff != "" {
-				t.Errorf("fetchImportedByDetails(ctx, db, %q) mismatch (-want +got):\n%s", tc.pkg.Path, diff)
+			pkg := sample.UnitForPackage(sample.PackagePath, sample.ModulePath, sample.VersionString, sample.PackageName, true)
+			wantDetails := &ImportedByDetails{
+				ModulePath:           sample.ModulePath,
+				NumImportedByDisplay: fmt.Sprintf("%d (displaying 20000 packages)", count),
+				Total:                count,
 			}
+			checkFetchImportedByDetails(ctx, t, pkg, wantDetails)
 		})
+	}
+}
+
+func checkFetchImportedByDetails(ctx context.Context, t *testing.T, pkg *internal.Unit, wantDetails *ImportedByDetails) {
+	got, err := fetchImportedByDetails(ctx, testDB, pkg.Path, pkg.ModulePath)
+	if err != nil {
+		t.Fatalf("fetchImportedByDetails(ctx, db, %q) = %v err = %v, want %v",
+			pkg.Path, got, err, wantDetails)
+	}
+	wantDetails.ModulePath = pkg.ModulePath
+	if diff := cmp.Diff(wantDetails, got); diff != "" {
+		t.Errorf("fetchImportedByDetails(ctx, db, %q) mismatch (-want +got):\n%s", pkg.Path, diff)
 	}
 }

@@ -11,160 +11,23 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/safehtml"
-	"github.com/google/safehtml/testconversions"
 	"golang.org/x/pkgsite/internal"
-	"golang.org/x/pkgsite/internal/postgres"
 	"golang.org/x/pkgsite/internal/source"
 	"golang.org/x/pkgsite/internal/stdlib"
-	"golang.org/x/pkgsite/internal/testing/sample"
-	"golang.org/x/pkgsite/internal/version"
 )
 
-func TestFetchOverviewDetails(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	tc := struct {
-		name        string
-		module      *internal.Module
-		wantDetails *OverviewDetails
-	}{
-		name:   "want expected overview details",
-		module: sample.DefaultModule(),
-		wantDetails: &OverviewDetails{
-			ModulePath:      sample.ModulePath,
-			RepositoryURL:   sample.RepositoryURL,
-			ReadMe:          testconversions.MakeHTMLForTest("<p>readme</p>\n"),
-			ReadMeSource:    sample.ModulePath + "@v1.0.0/README.md",
-			ModuleURL:       "/mod/" + sample.ModulePath + "@v1.0.0",
-			Redistributable: true,
-		},
-	}
-
-	defer postgres.ResetTestDB(testDB, t)
-
-	if err := testDB.InsertModule(ctx, tc.module); err != nil {
-		t.Fatal(err)
-	}
-
-	readme := &internal.Readme{Filepath: tc.module.LegacyReadmeFilePath, Contents: tc.module.LegacyReadmeContents}
-	got, err := constructOverviewDetails(ctx, &tc.module.ModuleInfo, readme, true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := cmp.Diff(tc.wantDetails, got, cmp.AllowUnexported(safehtml.HTML{})); diff != "" {
-		t.Errorf("constructOverviewDetails(%q, %q) mismatch (-want +got):\n%s",
-			tc.module.LegacyPackages[0].Path, tc.module.Version, diff)
-	}
-}
-
-func TestConstructPackageOverviewDetailsNew(t *testing.T) {
-	for _, test := range []struct {
-		name           string
-		vdir           *internal.VersionedDirectory
-		versionedLinks bool
-		want           *OverviewDetails
-	}{
-		{
-			name: "redistributable",
-			vdir: &internal.VersionedDirectory{
-				Directory: internal.Directory{
-					DirectoryMeta: internal.DirectoryMeta{
-						Path:              "github.com/u/m/p",
-						IsRedistributable: true,
-					},
-					Readme: &internal.Readme{
-						Filepath: "README.md",
-						Contents: "readme",
-					},
-				},
-				ModuleInfo: *sample.ModuleInfo("github.com/u/m", "v1.2.3"),
-			},
-			versionedLinks: true,
-			want: &OverviewDetails{
-				ModulePath:       "github.com/u/m",
-				ModuleURL:        "/mod/github.com/u/m@v1.2.3",
-				RepositoryURL:    "https://github.com/u/m",
-				PackageSourceURL: "https://github.com/u/m/tree/v1.2.3/p",
-				ReadMe:           testconversions.MakeHTMLForTest("<p>readme</p>\n"),
-				ReadMeSource:     "github.com/u/m@v1.2.3/README.md",
-				Redistributable:  true,
-			},
-		},
-		{
-			name: "unversioned",
-			vdir: &internal.VersionedDirectory{
-				Directory: internal.Directory{
-					DirectoryMeta: internal.DirectoryMeta{
-						Path:              "github.com/u/m/p",
-						IsRedistributable: true,
-					},
-					Readme: &internal.Readme{
-						Filepath: "README.md",
-						Contents: "readme",
-					},
-				},
-				ModuleInfo: *sample.ModuleInfo("github.com/u/m", "v1.2.3"),
-			},
-			versionedLinks: false,
-			want: &OverviewDetails{
-				ModulePath:       "github.com/u/m",
-				ModuleURL:        "/mod/github.com/u/m",
-				RepositoryURL:    "https://github.com/u/m",
-				PackageSourceURL: "https://github.com/u/m/tree/v1.2.3/p",
-				ReadMe:           testconversions.MakeHTMLForTest("<p>readme</p>\n"),
-				ReadMeSource:     "github.com/u/m@v1.2.3/README.md",
-				Redistributable:  true,
-			},
-		},
-		{
-			name: "non-redistributable",
-			vdir: &internal.VersionedDirectory{
-				Directory: internal.Directory{
-					DirectoryMeta: internal.DirectoryMeta{
-						Path:              "github.com/u/m/p",
-						IsRedistributable: false,
-					},
-				},
-				ModuleInfo: *sample.ModuleInfo("github.com/u/m", "v1.2.3"),
-			},
-			versionedLinks: true,
-			want: &OverviewDetails{
-				ModulePath:       "github.com/u/m",
-				ModuleURL:        "/mod/github.com/u/m@v1.2.3",
-				RepositoryURL:    "https://github.com/u/m",
-				PackageSourceURL: "https://github.com/u/m/tree/v1.2.3/p",
-				ReadMe:           safehtml.HTML{},
-				ReadMeSource:     "",
-				Redistributable:  false,
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := fetchPackageOverviewDetails(context.Background(), test.vdir, test.versionedLinks)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(test.want, got, cmp.AllowUnexported(safehtml.HTML{})); diff != "" {
-				t.Errorf("mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestReadmeHTML(t *testing.T) {
+func TestBlackfridayReadmeHTML(t *testing.T) {
 	ctx := context.Background()
 	aModule := &internal.ModuleInfo{
-		Version:     "v1.2.3",
-		VersionType: version.TypeRelease,
-		SourceInfo:  source.NewGitHubInfo("https://github.com/some/repo", "", "v1.2.3"),
+		Version:    "v1.2.3",
+		SourceInfo: source.NewGitHubInfo("https://github.com/some/repo", "", "v1.2.3"),
 	}
-	for _, tc := range []struct {
-		name   string
-		mi     *internal.ModuleInfo
-		readme *internal.Readme
-		want   string
+	tests := []struct {
+		name         string
+		mi           *internal.ModuleInfo
+		readme       *internal.Readme
+		want         string
+		wantUnitPage string
 	}{
 		{
 			name: "valid markdown readme",
@@ -286,7 +149,8 @@ func TestReadmeHTML(t *testing.T) {
 				Filepath: "README.md",
 				Contents: "<img src=\"resources/logoSmall.png\" />\n\n# Heading\n",
 			},
-			want: `<p><img src="https://github.com/some/repo/raw/v1.2.3/resources/logoSmall.png"/></p>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			want:         `<p><img src="https://github.com/some/repo/raw/v1.2.3/resources/logoSmall.png"/></p>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			wantUnitPage: `<p><img src="https://github.com/some/repo/raw/v1.2.3/resources/logoSmall.png"/></p>` + "\n\n" + `<h1 id="readme-heading">Heading</h1>`,
 		},
 		{
 			name: "image link in embedded HTML with surrounding p tag",
@@ -295,7 +159,8 @@ func TestReadmeHTML(t *testing.T) {
 				Filepath: "README.md",
 				Contents: "<p align=\"center\"><img src=\"foo.png\" /></p>\n\n# Heading",
 			},
-			want: `<p align="center"><img src="https://github.com/some/repo/raw/v1.2.3/foo.png"/></p>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			want:         `<p align="center"><img src="https://github.com/some/repo/raw/v1.2.3/foo.png"/></p>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			wantUnitPage: `<p align="center"><img src="https://github.com/some/repo/raw/v1.2.3/foo.png"/></p>` + "\n\n" + `<h1 id="readme-heading">Heading</h1>`,
 		},
 		{
 			name: "image link in embedded HTML with surrounding div",
@@ -304,20 +169,21 @@ func TestReadmeHTML(t *testing.T) {
 				Filepath: "README.md",
 				Contents: "<div align=\"center\"><img src=\"foo.png\" /></div>\n\n# Heading",
 			},
-			want: `<div align="center"><img src="https://github.com/some/repo/raw/v1.2.3/foo.png"/></div>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			want:         `<div align="center"><img src="https://github.com/some/repo/raw/v1.2.3/foo.png"/></div>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			wantUnitPage: `<div align="center"><img src="https://github.com/some/repo/raw/v1.2.3/foo.png"/></div>` + "\n\n" + `<h1 id="readme-heading">Heading</h1>`,
 		},
 		{
 			name: "image link with bad URL",
 			mi: &internal.ModuleInfo{
-				Version:     "v1.2.3",
-				VersionType: version.TypeRelease,
-				SourceInfo:  source.NewGitHubInfo("https://github.com/some/<script>", "", "v1.2.3"),
+				Version:    "v1.2.3",
+				SourceInfo: source.NewGitHubInfo("https://github.com/some/<script>", "", "v1.2.3"),
 			},
 			readme: &internal.Readme{
 				Filepath: "README.md",
 				Contents: "<div align=\"center\"><img src=\"foo.png\" /></div>\n\n# Heading",
 			},
-			want: `<div align="center"><img src="https://github.com/some/%3Cscript%3E/raw/v1.2.3/foo.png"/></div>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			want:         `<div align="center"><img src="https://github.com/some/%3Cscript%3E/raw/v1.2.3/foo.png"/></div>` + "\n\n" + `<h1 id="heading">Heading</h1>`,
+			wantUnitPage: `<div align="center"><img src="https://github.com/some/%3Cscript%3E/raw/v1.2.3/foo.png"/></div>` + "\n\n" + `<h1 id="readme-heading">Heading</h1>`,
 		},
 		{
 			name: "body has more than one child",
@@ -338,17 +204,31 @@ func TestReadmeHTML(t *testing.T) {
 			},
 			want: `<p><img src="https://github.com/some/repo/raw/v1.2.3/images/Jupyter%20Notebook_sparkline.svg"/></p>`,
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			hgot, err := ReadmeHTML(ctx, tc.mi, tc.readme)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got := strings.TrimSpace(hgot.String())
-			if diff := cmp.Diff(tc.want, got); diff != "" {
-				t.Errorf("readmeHTML(%v) mismatch (-want +got):\n%s", tc.mi, diff)
-			}
-		})
+		{
+			name: "relative link to local heading is prefixed with readme-",
+			mi:   aModule,
+			readme: &internal.Readme{
+				Filepath: "README.md",
+				Contents: `[Local Heading](#heading-id)`,
+			},
+			want: `<p><a href="#readme-heading-id" rel="nofollow">Local Heading</a></p>`,
+		},
+	}
+	checkReadme := func(ctx context.Context, t *testing.T, mi *internal.ModuleInfo, readme *internal.Readme, want string) {
+		hgot, err := LegacyReadmeHTML(ctx, mi, readme)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := strings.TrimSpace(hgot.String())
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("LegacyReadmeHTML(%v) mismatch (-want +got):\n%s", mi, diff)
+		}
+	}
+	for _, test := range tests {
+		if test.wantUnitPage == "" {
+			test.wantUnitPage = test.want
+		}
+		checkReadme(ctx, t, test.mi, test.readme, test.wantUnitPage)
 	}
 }
 
@@ -385,9 +265,9 @@ func TestPackageSubdir(t *testing.T) {
 		// stdlib package
 		{"context", stdlib.ModulePath, "context"},
 	} {
-		got := packageSubdir(test.pkgPath, test.modulePath)
+		got := internal.Suffix(test.pkgPath, test.modulePath)
 		if got != test.want {
-			t.Errorf("packageSubdir(%q, %q) = %q, want %q", test.pkgPath, test.modulePath, got, test.want)
+			t.Errorf("internal.Suffix(%q, %q) = %q, want %q", test.pkgPath, test.modulePath, got, test.want)
 		}
 	}
 }

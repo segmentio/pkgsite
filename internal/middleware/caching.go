@@ -14,10 +14,14 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-redis/redis/v7"
+	"github.com/go-redis/redis/v8"
+	"go.opencensus.io/plugin/ochttp"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+	icache "golang.org/x/pkgsite/internal/cache"
+	"golang.org/x/pkgsite/internal/config"
+	"golang.org/x/pkgsite/internal/cookie"
 	"golang.org/x/pkgsite/internal/log"
 )
 
@@ -30,13 +34,17 @@ var (
 		"The result of a cache request.",
 		stats.UnitDimensionless,
 	)
+	cacheLatency = stats.Float64(
+		"go-discovery/cache/result_latency",
+		"Cache serving latency latency",
+		stats.UnitMilliseconds,
+	)
 	cacheErrors = stats.Int64(
 		"go-discovery/cache/errors",
 		"Errors retrieving from cache.",
 		stats.UnitDimensionless,
 	)
 
-	// CacheResultCount is a counter of cache results, by cache name and hit success.
 	CacheResultCount = &view.View{
 		Name:        "go-discovery/cache/result_count",
 		Measure:     cacheResults,
@@ -44,7 +52,13 @@ var (
 		Description: "cache results, by cache name and whether it was a hit",
 		TagKeys:     []tag.Key{keyCacheName, keyCacheHit},
 	}
-	// CacheErrorCount is a counter of cache errors, by cache name.
+	CacheLatency = &view.View{
+		Name:        "go-discovery/cache/result_latency",
+		Measure:     cacheLatency,
+		Description: "cache result latency, by cache name and whether it was a hit",
+		Aggregation: ochttp.DefaultLatencyDistribution,
+		TagKeys:     []tag.Key{keyCacheName, keyCacheHit},
+	}
 	CacheErrorCount = &view.View{
 		Name:        "go-discovery/cache/errors",
 		Measure:     cacheErrors,
@@ -53,16 +67,17 @@ var (
 		TagKeys:     []tag.Key{keyCacheName, keyCacheOperation},
 	}
 
-	// To avoid test flakiness, when testMode is true, cache writes are
+	// To avoid test flakiness, when TestMode is true, cache writes are
 	// synchronous.
-	testMode = false
+	TestMode = false
 )
 
-func recordCacheResult(ctx context.Context, name string, hit bool) {
+func recordCacheResult(ctx context.Context, name string, hit bool, latency time.Duration) {
+	ms := float64(latency) / float64(time.Millisecond)
 	stats.RecordWithTags(ctx, []tag.Mutator{
 		tag.Upsert(keyCacheName, name),
 		tag.Upsert(keyCacheHit, strconv.FormatBool(hit)),
-	}, cacheResults.M(1))
+	}, cacheResults.M(1), cacheLatency.M(ms))
 }
 
 func recordCacheError(ctx context.Context, name, operation string) {
@@ -73,10 +88,11 @@ func recordCacheError(ctx context.Context, name, operation string) {
 }
 
 type cache struct {
-	name     string
-	client   *redis.Client
-	delegate http.Handler
-	expirer  Expirer
+	name       string
+	authValues []string
+	cache      *icache.Cache
+	delegate   http.Handler
+	expirer    Expirer
 }
 
 // An Expirer computes the TTL that should be used when caching a page.
@@ -92,33 +108,52 @@ func TTL(ttl time.Duration) Expirer {
 // Cache returns a new Middleware that caches every request.
 // The name of the cache is used only for metrics.
 // The expirer is a func that is used to map a new request to its TTL.
-func Cache(name string, client *redis.Client, expirer Expirer) Middleware {
+// authHeader is the header key used by the cache to know that a
+// request should bypass the cache.
+// authValues is the set of values that could be set on the authHeader in
+// order to bypass the cache.
+func Cache(name string, client *redis.Client, expirer Expirer, authValues []string) Middleware {
 	return func(h http.Handler) http.Handler {
 		return &cache{
-			name:     name,
-			client:   client,
-			delegate: h,
-			expirer:  expirer,
+			name:       name,
+			authValues: authValues,
+			cache:      icache.New(client),
+			delegate:   h,
+			expirer:    expirer,
 		}
 	}
 }
 
 func (c *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Check auth header to see if request should bypass cache.
+	authVal := r.Header.Get(config.BypassCacheAuthHeader)
+	for _, wantVal := range c.authValues {
+		if authVal == wantVal {
+			c.delegate.ServeHTTP(w, r)
+			return
+		}
+	}
+	// If the flash cookie is set, bypass the cache.
+	if _, err := r.Cookie(cookie.AlternativeModuleFlash); err == nil {
+		c.delegate.ServeHTTP(w, r)
+		return
+	}
 	ctx := r.Context()
 	key := r.URL.String()
-	if reader, ok := c.get(ctx, key); ok {
-		recordCacheResult(ctx, c.name, true)
+	start := time.Now()
+	reader, hit := c.get(ctx, key)
+	recordCacheResult(ctx, c.name, hit, time.Since(start))
+	if hit {
 		if _, err := io.Copy(w, reader); err != nil {
 			log.Errorf(ctx, "error copying zip bytes: %v", err)
 		}
 		return
 	}
-	recordCacheResult(ctx, c.name, false)
 	rec := newRecorder(w)
 	c.delegate.ServeHTTP(rec, r)
 	if rec.bufErr == nil && (rec.statusCode == 0 || rec.statusCode == http.StatusOK) {
 		ttl := c.expirer(r)
-		if testMode {
+		if TestMode {
 			c.put(ctx, key, rec, ttl)
 		} else {
 			go c.put(ctx, key, rec, ttl)
@@ -129,12 +164,9 @@ func (c *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (c *cache) get(ctx context.Context, key string) (io.Reader, bool) {
 	// Set a short timeout for redis requests, so that we can quickly
 	// fall back to un-cached serving if redis is unavailable.
-	getCtx, cancelGet := context.WithTimeout(ctx, 50*time.Millisecond)
+	getCtx, cancelGet := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancelGet()
-	val, err := c.client.WithContext(getCtx).Get(key).Bytes()
-	if err == redis.Nil {
-		return nil, false
-	}
+	val, err := c.cache.Get(getCtx, key)
 	if err != nil {
 		select {
 		case <-getCtx.Done():
@@ -143,6 +175,9 @@ func (c *cache) get(ctx context.Context, key string) (io.Reader, bool) {
 			log.Infof(ctx, "cache get(%q): %v", key, err)
 		}
 		recordCacheError(ctx, c.name, "GET")
+		return nil, false
+	}
+	if val == nil {
 		return nil, false
 	}
 	zr, err := gzip.NewReader(bytes.NewReader(val))
@@ -162,10 +197,9 @@ func (c *cache) put(ctx context.Context, key string, rec *cacheRecorder, ttl tim
 	log.Infof(ctx, "caching response of length %d for %s", rec.buf.Len(), key)
 	setCtx, cancelSet := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancelSet()
-	_, err := c.client.WithContext(setCtx).Set(key, rec.buf.Bytes(), ttl).Result()
-	if err != nil {
+	if err := c.cache.Put(setCtx, key, rec.buf.Bytes(), ttl); err != nil {
 		recordCacheError(ctx, c.name, "SET")
-		log.Errorf(ctx, "cache set %q: %v", key, err)
+		log.Warningf(ctx, "cache set %q: %v", key, err)
 	}
 }
 

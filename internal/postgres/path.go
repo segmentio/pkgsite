@@ -1,4 +1,4 @@
-// Copyright 2020 The Go Authors. All rights reserved.
+// Copyright 2021 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -7,155 +7,149 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/lib/pq"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/database"
 	"golang.org/x/pkgsite/internal/derrors"
-	"golang.org/x/pkgsite/internal/stdlib"
 )
 
-// GetPathInfo returns information about the "best" entity (module, path or directory) with
-// the given path. The module and version arguments provide additional constraints.
-// If the module is unknown, pass internal.UnknownModulePath; if the version is unknown, pass
-// internal.LatestVersion.
-//
-// The rules for picking the best are:
-// 1. Match the module path and or version, if they are provided;
-// 2. Prefer newer module versions to older, and release to pre-release;
-// 3. In the unlikely event of two paths at the same version, pick the longer module path.
-func (db *DB) GetPathInfo(ctx context.Context, path, inModulePath, inVersion string) (outModulePath, outVersion string, isPackage bool, err error) {
-	defer derrors.Wrap(&err, "DB.GetPathInfo(ctx, %q, %q, %q)", path, inModulePath, inVersion)
-
-	var (
-		constraints []string
-		joinStmt    string
-	)
-	args := []interface{}{path}
-	if inModulePath != internal.UnknownModulePath {
-		constraints = append(constraints, fmt.Sprintf("AND m.module_path = $%d", len(args)+1))
-		args = append(args, inModulePath)
-	}
-	switch inVersion {
-	case internal.LatestVersion:
-	case internal.MasterVersion:
-		joinStmt = "INNER JOIN version_map vm ON (vm.module_id = m.id)"
-		constraints = append(constraints, "AND vm.requested_version = 'master'")
-	default:
-		constraints = append(constraints, fmt.Sprintf("AND m.version = $%d", len(args)+1))
-		args = append(args, inVersion)
-	}
-	query := fmt.Sprintf(`
-		SELECT m.module_path, m.version, p.name != ''
-		FROM paths p
-		INNER JOIN modules m ON (p.module_id = m.id)
-		%s
-		WHERE p.path = $1
-		%s
-		ORDER BY
-			m.version_type = 'release' DESC,
-			m.sort_version DESC,
-			m.module_path DESC
-		LIMIT 1
-	`, joinStmt, strings.Join(constraints, " "))
-	err = db.db.QueryRow(ctx, query, args...).Scan(&outModulePath, &outVersion, &isPackage)
-	switch err {
-	case sql.ErrNoRows:
-		return "", "", false, derrors.NotFound
-	case nil:
-		return outModulePath, outVersion, isPackage, nil
-	default:
-		return "", "", false, err
-	}
-}
-
-type dbPath struct {
-	id              int64
-	path            string
-	moduleID        int64
-	v1Path          string
-	name            string
-	licenseTypes    []string
-	licensePaths    []string
-	redistributable bool
-}
-
-func (db *DB) getPathsInModule(ctx context.Context, modulePath, version string) (_ []*dbPath, err error) {
-	defer derrors.Wrap(&err, "DB.getPathsInModule(ctx, %q, %q)", modulePath, version)
-	query := `
-	SELECT
-		p.id,
-		p.path,
-		p.module_id,
-		p.v1_path,
-		p.name,
-		p.license_types,
-		p.license_paths,
-		p.redistributable
-	FROM
-		paths p
-	INNER JOIN
-		modules m
-	ON
-		p.module_id = m.id
-	WHERE
-		m.module_path = $1
-		AND m.version = $2
-	ORDER BY path;`
-
-	var paths []*dbPath
-	collect := func(rows *sql.Rows) error {
-		var p dbPath
-		if err := rows.Scan(&p.id, &p.path, &p.moduleID, &p.v1Path, &p.name, pq.Array(&p.licenseTypes),
-			pq.Array(&p.licensePaths), &p.redistributable); err != nil {
-			return fmt.Errorf("row.Scan(): %v", err)
-		}
-		paths = append(paths, &p)
-		return nil
-	}
-	if err := db.db.RunQuery(ctx, query, collect, modulePath, version); err != nil {
-		return nil, err
-	}
-	return paths, nil
-}
-
-// GetStdlibPathsWithSuffix returns information about all paths in the latest version of the standard
-// library whose last component is suffix. A path that exactly match suffix is not included;
-// the path must end with "/" + suffix.
-//
-// We are only interested in actual standard library packages: not commands, which we happen to include
-// in the stdlib module, and not directories (paths that do not contain a package).
-func (db *DB) GetStdlibPathsWithSuffix(ctx context.Context, suffix string) (paths []string, err error) {
-	defer derrors.Wrap(&err, "DB.GetStdlibPaths(ctx, %q)", suffix)
-
+// GetLatestMajorPathForV1Path reports the latest unit path in the series for
+// the given v1path.
+func (db *DB) GetLatestMajorPathForV1Path(ctx context.Context, v1path string) (_ string, _ int, err error) {
+	defer derrors.WrapStack(&err, "DB.GetLatestPathForV1Path(ctx, %q)", v1path)
 	q := `
-		SELECT path
-		FROM paths
-		WHERE module_id = (
-			-- latest release version of stdlib
-			SELECT id
-			FROM modules
-			WHERE module_path = $1
-			ORDER BY
-				version_type = 'release' DESC,
-				sort_version DESC
-			LIMIT 1)
-			AND name != ''
-			AND path NOT LIKE 'cmd/%'
-			AND path LIKE '%/' || $2
-		ORDER BY path
-	`
+		SELECT p.path, m.series_path
+		FROM paths p
+		INNER JOIN units u ON u.path_id = p.id
+		INNER JOIN modules m ON u.module_id = m.id
+		WHERE u.v1path_id = (
+			SELECT p.id
+			FROM paths p
+			INNER JOIN units u ON u.v1path_id = p.id
+			WHERE p.path = $1
+			ORDER BY p.path DESC
+			LIMIT 1
+		);`
+	paths := map[string]string{}
 	err = db.db.RunQuery(ctx, q, func(rows *sql.Rows) error {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		var p, sp string
+		if err := rows.Scan(&p, &sp); err != nil {
 			return err
 		}
-		paths = append(paths, p)
+		paths[p] = sp
 		return nil
-	}, stdlib.ModulePath, suffix)
+	}, v1path)
 	if err != nil {
+		return "", 0, err
+	}
+
+	var (
+		maj     int
+		majPath string
+	)
+	for p, sp := range paths {
+		// Trim the series path and suffix from the unit path.
+		// Keep only the N following vN.
+		suffix := internal.Suffix(v1path, sp)
+		v := strings.TrimSuffix(strings.TrimPrefix(
+			strings.TrimSuffix(strings.TrimPrefix(p, sp), suffix), "/v"), "/")
+		var i int
+		if v != "" {
+			i, err = strconv.Atoi(v)
+			if err != nil {
+				return "", 0, fmt.Errorf("strconv.Atoi(%q): %v", v, err)
+			}
+		}
+		if maj <= i {
+			maj = i
+			majPath = p
+		}
+	}
+	if maj == 0 {
+		// Return 1 as the major version for all v0 or v1 majPaths.
+		maj = 1
+	}
+	return majPath, maj, nil
+}
+
+// upsertPath adds path into the paths table if it does not exist, and returns
+// its ID either way.
+// It assumes it is running inside a transaction.
+func upsertPath(ctx context.Context, tx *database.DB, path string) (id int, err error) {
+	// Doing the select first and then the insert led to uniqueness constraint
+	// violations even with fully serializable transactions; see
+	// https://www.postgresql.org/message-id/CAOqyxwL4E_JmUScYrnwd0_sOtm3bt4c7G%2B%2BUiD2PnmdGJFiqyQ%40mail.gmail.com.
+	// If the upsert is done first and then the select, then everything works
+	// fine.
+	defer derrors.WrapStack(&err, "upsertPath(%q)", path)
+
+	if _, err := tx.Exec(ctx, `LOCK TABLE paths IN EXCLUSIVE MODE`); err != nil {
+		return 0, err
+	}
+	err = tx.QueryRow(ctx,
+		`INSERT INTO paths (path) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id`,
+		path).Scan(&id)
+	if err == sql.ErrNoRows {
+		err = tx.QueryRow(ctx,
+			`SELECT id FROM paths WHERE path = $1`,
+			path).Scan(&id)
+		if err == sql.ErrNoRows {
+			return 0, errors.New("got no rows; shouldn't happen")
+		}
+	}
+	if err != nil {
+		return 0, err
+	}
+	if id == 0 {
+		return 0, errors.New("zero ID")
+	}
+	return id, nil
+}
+
+// upsertPaths adds all the paths to the paths table if they aren't already
+// there, and returns their ID either way.
+// It assumes it is running inside a transaction.
+func upsertPaths(ctx context.Context, db *database.DB, paths []string) (pathToID map[string]int, err error) {
+	defer derrors.WrapStack(&err, "upsertPaths(%d paths)", len(paths))
+
+	pathToID = map[string]int{}
+	collect := func(rows *sql.Rows) error {
+		var (
+			pathID int
+			path   string
+		)
+		if err := rows.Scan(&pathID, &path); err != nil {
+			return err
+		}
+		pathToID[path] = pathID
+		return nil
+	}
+
+	if err := db.RunQuery(ctx, `SELECT id, path FROM paths WHERE path = ANY($1)`,
+		collect, pq.Array(paths)); err != nil {
 		return nil, err
 	}
-	return paths, nil
+
+	// Insert any unit paths that we don't already have.
+	var values []interface{}
+	for _, v := range paths {
+		if _, ok := pathToID[v]; !ok {
+			values = append(values, v)
+		}
+	}
+	if len(values) > 0 {
+		// Insert data into the paths table.
+		pathCols := []string{"path"}
+		returningPathCols := []string{"id", "path"}
+		if err := db.BulkInsertReturning(ctx, "paths", pathCols, values,
+			database.OnConflictDoNothing, returningPathCols, collect); err != nil {
+			return nil, err
+		}
+	}
+	return pathToID, nil
 }

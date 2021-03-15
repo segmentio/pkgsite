@@ -12,8 +12,8 @@
       <label class="Badge-formElement">
         Badge
         <div class="Badge-previewLink">
-          <a class="js-badgeExampleButton" href="{{.SiteURL}}/{{.Path}}">
-            <img class="Badge-badgeIcon" src="/static/img/badge.svg" alt="PkgGoDev">
+          <a class="js-badgeExampleButton" href="https://pkg.go.dev/{{.LinkPath}}">
+            <img class="Badge-badgeIcon" src="/static/img/badge.svg" alt="Go Reference">
           </a>
         </div>
       </label>
@@ -21,23 +21,23 @@
         <label class="Badge-formElement">
           URL
           <input name="path" class="js-toolsPathInput"
-              value="{{.Path}}" placeholder="e.g., https://pkg.go.dev/golang.org/x/pkgsite">
+              value="{{if .LinkPath}}https://pkg.go.dev/{{.LinkPath}}{{end}}" placeholder="e.g., https://pkg.go.dev/golang.org/x/pkgsite">
         </label>
         <label class="Badge-formElement">
-          <button type="submit" class="Badge-submitButton">Create</button>
+          <button type="submit" class="Badge-submitButton">{{if .LinkPath}}Update{{else}}Create{{end}}</button>
         </label>
       </form>
       <div class="Badge-snippetContainer">
-        {{if .Path}}
+        {{if .LinkPath}}
           <label class="Badge-formElement">
             HTML
             <input title="Click to copy HTML" name="html" class="Badge-clickToCopy js-toolsCopySnippet" type="text"
-                value='<a href="{{.SiteURL}}/{{.Path}}"><img src="{{.SiteURL}}/badge/{{.Path}}" alt="PkgGoDev"></a>' readonly>
+                value='<a href="https://pkg.go.dev/{{.LinkPath}}"><img src="https://pkg.go.dev/{{.BadgePath}}" alt="Go Reference"></a>' readonly>
           </label>
           <label class="Badge-formElement">
             Markdown
             <input title="Click to copy markdown" name="markdown" class="Badge-clickToCopy js-toolsCopySnippet" type="text"
-                value="[![PkgGoDev]({{.SiteURL}}/badge/{{.Path}})]({{.SiteURL}}/{{.Path}})" readonly>
+                value="[![Go Reference](https://pkg.go.dev/{{.BadgePath}})](https://pkg.go.dev/{{.LinkPath}})" readonly>
           </label>
         {{else}}
           <div class="Badge-gopherLanding">
@@ -52,6 +52,6 @@
 
 {{define "post_content"}}
 <script>
-  loadScript("/static/js/badge.min.js");
+  loadScript("/static/js/badge.js");
 </script>
 {{end}}

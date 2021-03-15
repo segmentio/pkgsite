@@ -6,22 +6,22 @@
 
 <!DOCTYPE html>
 <html lang="en">
+<!-- This will capture unhandled errors during page load for reporting later. -->
+<script>window.addEventListener('error', window.__err=function f(e){f.p=f.p||[];f.p.push(e)});</script>
 <meta charset="utf-8">
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="Description" content="Go is an open source programming language that makes it easy to build simple, reliable, and efficient software.">
+{{if .MetaDescription.String}}
+  {{.MetaDescription}}
+{{else}}
+  <meta name="Description" content="Go is an open source programming language that makes it easy to build simple, reliable, and efficient software.">
+{{end}}
 <meta class="js-gtmID" data-gtmid="{{.GoogleTagManagerID}}">
-<link href="https://fonts.googleapis.com/css?family=Work+Sans:600|Roboto:400,500,700|Source+Code+Pro" rel="stylesheet">
 <link href="/static/css/stylesheet.css?version={{.AppVersionLabel}}" rel="stylesheet">
-{{if (.Experiments.IsActive "sidenav")}}
-  <link href="/static/css/sidenav.css?version={{.AppVersionLabel}}" rel="stylesheet">
-{{end}}
-{{if (.Experiments.IsActive "new-homepage")}}
-  <link href="/static/css/homepage.css?version={{.AppVersionLabel}}" rel="stylesheet">
-{{end}}
 <link href="/third_party/dialog-polyfill/dialog-polyfill.css?version={{.AppVersionLabel}}" rel="stylesheet">
 <title>{{if .HTMLTitle}}{{.HTMLTitle}} · {{end}}pkg.go.dev</title>
-<body class="Site">
+{{block "pre_content" .}}{{end}}
+<body class="Site{{if .AllowWideContent}} Site--wide{{end}} Site--redesign">
 <header class="Site-header Site-header--dark">
   <div class="Banner">
     <div class="Banner-inner">
@@ -35,7 +35,7 @@
   <div class="Header">
     <nav class="Header-nav">
       <a href="https://go.dev/" class="Header-logoLink">
-        <img class="Header-logo" src="/static/img/go-logo-white.svg" alt="Go">
+        <img class="Header-logo" src="/static/img/go-logo-white.svg" alt="Link to Go homepage">
       </a>
       {{template "header_search" .}}
       <ul class="Header-menu">
@@ -87,7 +87,7 @@
 </aside>
 <div class="NavigationDrawer-scrim js-scrim" role="presentation">
 </div>
-<main class="Site-content">{{block "main_content" .}}{{end}}</main>
+<div class="Site-content">{{block "main_content" .}}{{end}}</div>
 <footer class="Site-footer">
   {{block "pre_footer" .}}{{end}}
   <div class="Footer">
@@ -164,7 +164,7 @@
   <div class="Footer">
     <div class="Container Container--fullBleed">
       <div class="Footer-bottom">
-        <img class="Footer-gopher" loading="lazy" src="/static/img/pilot-bust.svg" alt="The Go Gopher">
+        <img class="Footer-gopher" loading="lazy" src="/static/img/pilot-bust.svg" alt="Gopher in flight goggles">
         <ul class="Footer-listRow">
           <li class="Footer-listItem"><a href="https://go.dev/copyright">Copyright</a></li>
           <li class="Footer-listItem"><a href="https://go.dev/tos">Terms of Service</a></li>
@@ -186,18 +186,20 @@
 </footer>
 
 <script>
-  function loadScript(src) {
-      let s = document.createElement("script");
-      s.src = src;
-      document.head.appendChild(s);
+  function loadScript(src, props = {}) {
+    let s = document.createElement('script');
+    s.src = src;
+    for (const [k, v] of Object.entries(props)) {
+      s[k] = v
+    }
+    document.head.appendChild(s);
   }
-
-  loadScript("/static/js/base.min.js");
+  loadScript("/static/js/site.js");
 </script>
 
 {{block "post_content" .}}{{end}}
 
-{{if not .DevMode}}
+{{if .GoogleTagManagerID}}
 <script async>
   const gtmId = document.querySelector('.js-gtmID').dataset.gtmid; // this will throw if the querySelector can’t find the element
   if (!gtmId) {
@@ -205,11 +207,9 @@
   }
   loadScript(`https://www.googletagmanager.com/gtm.js?id=${gtmId}`);
 </script>
-{{end}}
-
-{{if (.Experiments.IsActive "autocomplete")}}
-<script>
-  loadScript("/third_party/autoComplete.js/autoComplete.min.js");
-  loadScript("/static/js/completion.min.js");
-</script>
+<noscript>
+  <iframe src="https://www.googletagmanager.com/ns.html?id={{.GoogleTagManagerID}}"
+          height="0" width="0" style="display:none;visibility:hidden">
+  </iframe>
+</noscript>
 {{end}}

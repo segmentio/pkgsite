@@ -12,7 +12,7 @@ import (
 )
 
 func TestValidateAppVersion(t *testing.T) {
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		in      string
 		wantErr bool
 	}{
@@ -23,9 +23,9 @@ func TestValidateAppVersion(t *testing.T) {
 		{"2019-09-12t13070400", true},
 		{"2019-09-11t22-14-0400-2f4680648b319545c55c6149536f0a74527901f6", false},
 	} {
-		err := ValidateAppVersion(tc.in)
-		if (err != nil) != tc.wantErr {
-			t.Errorf("ValidateAppVersion(%q) = %v, want error = %t", tc.in, err, tc.wantErr)
+		err := ValidateAppVersion(test.in)
+		if (err != nil) != test.wantErr {
+			t.Errorf("ValidateAppVersion(%q) = %v, want error = %t", test.in, err, test.wantErr)
 		}
 	}
 }
@@ -73,7 +73,7 @@ func TestProcessOverrides(t *testing.T) {
 		DBName: "origName",
 		Quota:  QuotaSettings{QPS: 1, Burst: 2, MaxEntries: 17, RecordOnly: &f},
 	}
-	if diff := cmp.Diff(want, got); diff != "" {
+	if diff := cmp.Diff(want, got, cmp.AllowUnexported(Config{})); diff != "" {
 		t.Errorf("mismatch (-want, +got):\n%s", diff)
 	}
 }
@@ -92,6 +92,29 @@ func TestParseCommaList(t *testing.T) {
 		got := parseCommaList(test.in)
 		if !cmp.Equal(got, test.want) {
 			t.Errorf("%q: got %#v, want %#v", test.in, got, test.want)
+		}
+	}
+}
+
+func TestEnvAndApp(t *testing.T) {
+	for _, test := range []struct {
+		serviceID string
+		wantEnv   string
+		wantApp   string
+	}{
+		{"default", "prod", "frontend"},
+		{"exp-worker", "exp", "worker"},
+		{"-foo-bar", "unknownEnv", "foo-bar"},
+		{"", "local", "unknownApp"},
+	} {
+		cfg := &Config{ServiceID: test.serviceID}
+		gotEnv := cfg.DeploymentEnvironment()
+		if gotEnv != test.wantEnv {
+			t.Errorf("%q: got %q, want %q", test.serviceID, gotEnv, test.wantEnv)
+		}
+		gotApp := cfg.Application()
+		if gotApp != test.wantApp {
+			t.Errorf("%q: got %q, want %q", test.serviceID, gotApp, test.wantApp)
 		}
 	}
 }

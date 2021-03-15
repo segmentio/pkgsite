@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
+	"unicode/utf8"
 
+	"github.com/google/safehtml/template"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
-	"golang.org/x/pkgsite/internal/experiment"
 	"golang.org/x/pkgsite/internal/log"
 	"golang.org/x/pkgsite/internal/postgres"
 )
@@ -39,14 +41,15 @@ type SearchResult struct {
 	DisplayVersion string
 	Licenses       []string
 	CommitTime     string
-	NumImportedBy  uint64
+	NumImportedBy  int
 	Approximate    bool
 }
 
 // fetchSearchPage fetches data matching the search query from the database and
 // returns a SearchPage.
 func fetchSearchPage(ctx context.Context, db *postgres.DB, query string, pageParams paginationParams) (*SearchPage, error) {
-	dbresults, err := db.Search(ctx, query, pageParams.limit, pageParams.offset())
+	maxResultCount := maxSearchOffset + pageParams.limit
+	dbresults, err := db.Search(ctx, query, pageParams.limit, pageParams.offset(), maxResultCount)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +64,7 @@ func fetchSearchPage(ctx context.Context, db *postgres.DB, query string, pagePar
 			DisplayVersion: displayVersion(r.Version, r.ModulePath),
 			Licenses:       r.Licenses,
 			CommitTime:     elapsedTime(r.CommitTime),
-			NumImportedBy:  r.NumImportedBy,
+			NumImportedBy:  int(r.NumImportedBy),
 		})
 	}
 
@@ -100,11 +103,27 @@ func approximateNumber(estimate int, sigma float64) int {
 	return int(unit * math.Round(float64(estimate)/unit))
 }
 
+// Search constraints.
+const (
+	// maxSearchQueryLength represents the max number of characters that a search
+	// query can be. For PostgreSQL 11, there is a max length of 2K bytes:
+	// https://www.postgresql.org/docs/11/textsearch-limitations.html. No valid
+	// searches on pkg.go.dev will need more than the maxSearchQueryLength.
+	maxSearchQueryLength = 500
+
+	// maxSearchOffset is the maximum allowed offset into the search results.
+	// This prevents some very CPU-intensive queries from running.
+	maxSearchOffset = 90
+
+	// maxSearchPageSize is the maximum allowed limit for search results.
+	maxSearchPageSize = 100
+)
+
 // serveSearch applies database data to the search template. Handles endpoint
 // /search?q=<query>. If <query> is an exact match for a package path, the user
 // will be redirected to the details page.
 func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request, ds internal.DataSource) error {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return &serverError{status: http.StatusMethodNotAllowed}
 	}
 	db, ok := ds.(*postgres.DB)
@@ -115,20 +134,51 @@ func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request, ds internal
 
 	ctx := r.Context()
 	query := searchQuery(r)
+	if !utf8.ValidString(query) {
+		return &serverError{status: http.StatusBadRequest}
+	}
+	if len(query) > maxSearchQueryLength {
+		return &serverError{
+			status: http.StatusBadRequest,
+			epage: &errorPage{
+				messageTemplate: template.MakeTrustedTemplate(
+					`<h3 class="Error-message">Search query too long.</h3>`),
+			},
+		}
+	}
 	if query == "" {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return nil
+	}
+	pageParams := newPaginationParams(r, defaultSearchLimit)
+	if pageParams.offset() > maxSearchOffset {
+		return &serverError{
+			status: http.StatusBadRequest,
+			epage: &errorPage{
+				messageTemplate: template.MakeTrustedTemplate(
+					`<h3 class="Error-message">Search page number too large.</h3>`),
+			},
+		}
+	}
+	if pageParams.limit > maxSearchPageSize {
+		return &serverError{
+			status: http.StatusBadRequest,
+			epage: &errorPage{
+				messageTemplate: template.MakeTrustedTemplate(
+					`<h3 class="Error-message">Search page size too large.</h3>`),
+			},
+		}
 	}
 
 	if path := searchRequestRedirectPath(ctx, ds, query); path != "" {
 		http.Redirect(w, r, path, http.StatusFound)
 		return nil
 	}
-	page, err := fetchSearchPage(ctx, db, query, newPaginationParams(r, defaultSearchLimit))
+	page, err := fetchSearchPage(ctx, db, query, pageParams)
 	if err != nil {
 		return fmt.Errorf("fetchSearchPage(ctx, db, %q): %v", query, err)
 	}
-	page.basePage = s.newBasePage(r, query)
+	page.basePage = s.newBasePage(r, fmt.Sprintf("%s - Search Results", query))
 	s.servePage(ctx, w, "search.tmpl", page)
 	return nil
 }
@@ -140,49 +190,51 @@ func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request, ds internal
 // element (such as fmt, errors, etc.) will not redirect, to allow users to
 // search by those terms.
 func searchRequestRedirectPath(ctx context.Context, ds internal.DataSource, query string) string {
+	urlSchemeIdx := strings.Index(query, "://")
+	if urlSchemeIdx > -1 {
+		query = query[urlSchemeIdx+3:]
+	}
 	requestedPath := path.Clean(query)
 	if !strings.Contains(requestedPath, "/") {
 		return ""
 	}
-	if experiment.IsActive(ctx, internal.ExperimentUsePathInfo) {
-		modulePath, _, isPackage, err := ds.GetPathInfo(ctx, requestedPath, internal.UnknownModulePath, internal.LatestVersion)
-		if err != nil {
-			if !errors.Is(err, derrors.NotFound) {
-				log.Errorf(ctx, "searchRequestRedirectPath(%q): %v", requestedPath, err)
-			}
-			return ""
+	_, err := ds.GetUnitMeta(ctx, requestedPath, internal.UnknownModulePath, internal.LatestVersion)
+	if err != nil {
+		if !errors.Is(err, derrors.NotFound) {
+			log.Errorf(ctx, "searchRequestRedirectPath(%q): %v", requestedPath, err)
 		}
-		if isPackage || modulePath != requestedPath {
-			return fmt.Sprintf("/%s", requestedPath)
-		}
-		return fmt.Sprintf("/mod/%s", requestedPath)
-	}
-
-	pkg, err := ds.LegacyGetPackage(ctx, requestedPath, internal.UnknownModulePath, internal.LatestVersion)
-	if err == nil {
-		return fmt.Sprintf("/%s", pkg.Path)
-	} else if !errors.Is(err, derrors.NotFound) {
-		log.Errorf(ctx, "error getting package for %s: %v", requestedPath, err)
 		return ""
 	}
-	mi, err := ds.LegacyGetModuleInfo(ctx, requestedPath, internal.LatestVersion)
-	if err == nil {
-		return fmt.Sprintf("/mod/%s", mi.ModulePath)
-	} else if !errors.Is(err, derrors.NotFound) {
-		log.Errorf(ctx, "error getting module for %s: %v", requestedPath, err)
-		return ""
-	}
-	dir, err := ds.LegacyGetDirectory(ctx, requestedPath, internal.UnknownModulePath, internal.LatestVersion, internal.AllFields)
-	if err == nil {
-		return fmt.Sprintf("/%s", dir.Path)
-	} else if !errors.Is(err, derrors.NotFound) {
-		log.Errorf(ctx, "error getting directory for %s: %v", requestedPath, err)
-		return ""
-	}
-	return ""
+	return fmt.Sprintf("/%s", requestedPath)
 }
 
 // searchQuery extracts a search query from the request.
 func searchQuery(r *http.Request) string {
 	return strings.TrimSpace(r.FormValue("q"))
+}
+
+// elapsedTime takes a date and returns returns human-readable,
+// relative timestamps based on the following rules:
+// (1) 'X hours ago' when X < 6
+// (2) 'today' between 6 hours and 1 day ago
+// (3) 'Y days ago' when Y < 6
+// (4) A date formatted like "Jan 2, 2006" for anything further back
+func elapsedTime(date time.Time) string {
+	elapsedHours := int(time.Since(date).Hours())
+	if elapsedHours == 1 {
+		return "1 hour ago"
+	} else if elapsedHours < 6 {
+		return fmt.Sprintf("%d hours ago", elapsedHours)
+	}
+
+	elapsedDays := elapsedHours / 24
+	if elapsedDays < 1 {
+		return "today"
+	} else if elapsedDays == 1 {
+		return "1 day ago"
+	} else if elapsedDays < 6 {
+		return fmt.Sprintf("%d days ago", elapsedDays)
+	}
+
+	return date.Format("Jan _2, 2006")
 }

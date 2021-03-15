@@ -12,6 +12,7 @@ import (
 	"strconv"
 
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/config"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/log"
 )
@@ -19,19 +20,52 @@ import (
 // UpdateModuleVersionStatesForReprocessing marks modules to be reprocessed
 // that were processed prior to the provided appVersion.
 func (db *DB) UpdateModuleVersionStatesForReprocessing(ctx context.Context, appVersion string) (err error) {
-	defer derrors.Wrap(&err, "UpdateModuleVersionStatesForReprocessing(ctx, %q)", appVersion)
+	defer derrors.WrapStack(&err, "UpdateModuleVersionStatesForReprocessing(ctx, %q)", appVersion)
 
 	for _, status := range []int{
 		http.StatusOK,
 		derrors.ToStatus(derrors.HasIncompletePackages),
-		derrors.ToStatus(derrors.BadModule),
-		derrors.ToStatus(derrors.AlternativeModule),
 		derrors.ToStatus(derrors.DBModuleInsertInvalid),
 	} {
 		if err := db.UpdateModuleVersionStatesWithStatus(ctx, status, appVersion); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// UpdateModuleVersionStatesForReprocessingLatestOnly marks modules to be
+// reprocessed that were processed prior to the provided appVersion.
+func (db *DB) UpdateModuleVersionStatesForReprocessingLatestOnly(ctx context.Context, appVersion string) (err error) {
+	query := `
+		UPDATE module_version_states mvs
+		SET
+			status = (
+				CASE WHEN status=200 THEN 520
+					 WHEN status=290 THEN 521
+					 END
+				),
+			next_processed_after = CURRENT_TIMESTAMP,
+			last_processed_at = NULL
+		FROM (
+			SELECT DISTINCT ON (module_path) module_path, version
+			FROM module_version_states
+			ORDER BY
+				module_path,
+				incompatible,
+				right(sort_version, 1) = '~' DESC, -- prefer release versions
+				sort_version DESC
+		) latest
+		WHERE
+			app_version < $1
+			AND (status = 200 OR status = 290)
+			AND latest.module_path = mvs.module_path
+			AND latest.version = mvs.version;`
+	affected, err := db.db.Exec(ctx, query, appVersion)
+	if err != nil {
+		return err
+	}
+	log.Infof(ctx, "Updated latest version of module_version_states with status=200 and status=290 and app_version < %q; %d affected", appVersion, affected)
 	return nil
 }
 
@@ -44,14 +78,9 @@ func (db *DB) UpdateModuleVersionStatesWithStatus(ctx context.Context, status in
 			WHERE
 				app_version < $1
 				AND status = $3;`
-	result, err := db.db.Exec(ctx, query, appVersion,
-		derrors.ToReprocessStatus(status), status)
+	affected, err := db.db.Exec(ctx, query, appVersion, derrors.ToReprocessStatus(status), status)
 	if err != nil {
 		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("result.RowsAffected(): %v", err)
 	}
 	log.Infof(ctx,
 		"Updated module_version_states with status=%d and app_version < %q to status=%d; %d affected",
@@ -68,7 +97,7 @@ const largeModulePackageThreshold = 1500
 // largeModulesLimit represents the number of large modules that we are
 // willing to enqueue at a given time.
 // var for testing.
-var largeModulesLimit = 100
+var largeModulesLimit = config.GetEnvInt("GO_DISCOVERY_LARGE_MODULES_LIMIT", 100)
 
 // GetNextModulesToFetch returns the next batch of modules that need to be
 // processed. We prioritize modules based on (1) whether it has status zero
@@ -78,16 +107,19 @@ var largeModulesLimit = 100
 // reduce database load and timeouts. We also want to leave alternative modules
 // towards the end, since these will incur unnecessary deletes otherwise.
 func (db *DB) GetNextModulesToFetch(ctx context.Context, limit int) (_ []*internal.ModuleVersionState, err error) {
-	defer derrors.Wrap(&err, "GetNextModulesToFetch(ctx, %d)", limit)
+	defer derrors.WrapStack(&err, "GetNextModulesToFetch(ctx, %d)", limit)
+	queryFmt := nextModulesToProcessQuery
 
 	var mvs []*internal.ModuleVersionState
-	query := fmt.Sprintf(nextModulesToProcessQuery, moduleVersionStateColumns)
+	query := fmt.Sprintf(queryFmt, moduleVersionStateColumns)
 
 	collect := func(rows *sql.Rows) error {
 		// Scan the last two columns separately; they are in the query only for sorting.
 		scan := func(dests ...interface{}) error {
-			var latest bool
-			var npkg int
+			var (
+				latest bool
+				npkg   int
+			)
 			return rows.Scan(append(dests, &latest, &npkg)...)
 		}
 		mv, err := scanModuleVersionState(scan)
@@ -97,7 +129,7 @@ func (db *DB) GetNextModulesToFetch(ctx context.Context, limit int) (_ []*intern
 		mvs = append(mvs, mv)
 		return nil
 	}
-	if err := db.db.RunQuery(ctx, query, collect, largeModulePackageThreshold, limit); err != nil {
+	if err := db.db.RunQuery(ctx, query, collect, limit); err != nil {
 		return nil, err
 	}
 	if len(mvs) == 0 {
@@ -132,13 +164,21 @@ func (db *DB) GetNextModulesToFetch(ctx context.Context, limit int) (_ []*intern
 	return mvs, nil
 }
 
+// This query prioritizes latest versions, but other than that, it tries
+// to avoid grouping modules in any way except by latest and status code:
+// processing is much smoother when they are enqueued in random order.
+//
+// To make the result deterministic for testing, we hash the module path and version
+// rather than actually choosing a random number. md5 is built in to postgres and
+// is an adequate hash for this purpose.
 const nextModulesToProcessQuery = `
-    -- Make a table of the latest versions of each module.
+	-- Make a table of the latest versions of each module.
 	WITH latest_versions AS (
 		SELECT DISTINCT ON (module_path) module_path, version
 		FROM module_version_states
 		ORDER BY
 			module_path,
+			incompatible,
 			right(sort_version, 1) = '~' DESC, -- prefer release versions
 			sort_version DESC
 	)
@@ -154,43 +194,21 @@ const nextModulesToProcessQuery = `
 		AND (status = 0 OR status >= 500)
 	ORDER BY
 		CASE
-			 -- new modules
-			 WHEN status = 0 THEN 0
-			 WHEN npkg < $1 THEN		-- non-large modules
+			-- new modules
+			WHEN status = 0 THEN 0
+			WHEN latest THEN
 				CASE
-					WHEN latest THEN	-- latest version
-						CASE
-							-- with ReprocessStatusOK or ReprocessHasIncompletePackages
-							WHEN status = 520 OR status = 521 THEN 1
-							-- with ReprocessBadModule or ReprocessAlternative or ReprocessDBModuleInsertInvalid
-							WHEN status = 540 OR status = 541 OR status = 542 THEN 2
-							ELSE 9
-						END
-					ELSE				-- non-latest version
-						CASE
-							WHEN status = 520 OR status = 521 THEN 3
-							WHEN status = 540 OR status = 541 OR status = 542 THEN 4
-							ELSE 9
-						END
+					-- with SheddingLoad or ReprocessStatusOK or ReprocessHasIncompletePackages
+					WHEN status = 503 or status = 520 OR status = 521 THEN 1
+					-- with ReprocessBadModule or ReprocessAlternative or ReprocessDBModuleInsertInvalid
+					WHEN status = 540 OR status = 541 OR status = 542 THEN 2
+					ELSE 5
 				END
-			ELSE						-- large modules
-				CASE
-					WHEN latest THEN	-- latest version
-						CASE
-							WHEN status = 520 OR status = 521 THEN 5
-							WHEN status = 540 OR status = 541 OR status = 542 THEN 6
-							ELSE 9
-						END
-					ELSE				-- non-latest version
-						CASE
-							WHEN status = 520 OR status = 521 THEN 7
-							WHEN status = 540 OR status = 541 OR status = 542 THEN 8
-							ELSE 9
-						END
-				END
+			-- non-latest
+			WHEN status = 503 or status = 520 OR status = 521 THEN 3
+			WHEN status = 540 OR status = 541 OR status = 542 THEN 4
+			ELSE 5
 		END,
-		npkg,  -- prefer fewer packages
-		module_path,
-		version -- for reproducibility
-	LIMIT $2
+		md5(module_path||version) -- deterministic but effectively random
+	LIMIT $1
 `

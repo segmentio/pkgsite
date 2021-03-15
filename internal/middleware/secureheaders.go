@@ -12,26 +12,27 @@ import (
 
 var scriptHashes = []string{
 	// From content/static/html/base.tmpl
-	"'sha256-d6W7MwuGWbguTHRzQhf5QN1jXmNo9Ao218saZkWLWZI='",
-	"'sha256-qPGTOKPn+niRiNKQIEX0Ktwuj+D+iPQWIxnlhPicw58='",
 	"'sha256-CgM7SjnSbDyuIteS+D1CQuSnzyKwL0qtXLU6ZW2hB+g='",
+	"'sha256-dwce5DnVX7uk6fdvvNxQyLTH/cJrTMDK6zzrdKwdwcg='",
+	"'sha256-M35cNZ8vPcaBGw5WTgh0Gn7DLsxkvPbdTFN1pELeevM='",
 	// From content/static/html/pages/badge.tmpl
-	"'sha256-T7xOt6cgLji3rhOWyKK7t5XKv8+LASQwOnHiHHy8Kwk='",
-	// From content/static/html/pages/details.tmpl
-	"'sha256-EWdCQW4XtY7zS2MZgs76+2EhMbqpaPtC+9EPGnbHBtM='",
+	"'sha256-v9+UvX+P27rKraeTl7uAfOWdLmmQU39RskIoqUrU4wo='",
 	// From content/static/html/pages/fetch.tmpl
-	"'sha256-1J6DWwTWs/QDZ2+ORDuUQCibmFnXXaNXYOtc0Jk6VU4='",
-	// From content/static/html/pages/pkg_doc.tmpl
-	"'sha256-91GG/273d2LdEV//lJMbTodGN501OuKZKYYphui+wDQ='",
-	"'sha256-Y1vZzPZ448awUtFwK5f2nES8NyyeM5dgiQ/E3klx4GM='",
-	"'sha256-gBtJYPzfgw/0FIACORDIAD08i5rxTQ5J0rhIU656A2U='",
+	"'sha256-4FhQmh9Hu76JzYm35KNNysU2Z7buJwg3cMSHsGwKSCE='",
 	// From content/static/html/worker/index.tmpl
-	"'sha256-5EpitFYSzGNQNUsqi5gAaLqnI3ZWfcRo/6gLTO0oCoE='",
+	"'sha256-y5EX2GR3tCwSK0/kmqZnsWVeBROA8tA75L+I+woljOE='",
+	// From content/static/html/pages/unit.tmpl
+	"'sha256-hsHIJwO1h0Vzwa75j0l07kUfQ7MEZGI/HlSPB/8leZ0='",
+	// From content/static/html/pages/unit_details.tmpl
+	"'sha256-mKoRSTy/ibLlGchw5uTQdCsNmqX/Lt9zNnBMtD8u5Us='",
+	"'sha256-/Mz1Pw/2FXZF9LLUgqsWFCN718K+/UPib6w8IBIf6Xk='",
+	"'sha256-L+G1K2BEWa+o2vPy1pwdabLjINBByPWi1NkRwvASUq8='",
+	"'sha256-hb8VdkRSeBmkNlbshYmBnkYWC/BYHCPiz5s7liRcZNM='",
 }
 
 // SecureHeaders adds a content-security-policy and other security-related
 // headers to all responses.
-func SecureHeaders() Middleware {
+func SecureHeaders(enableCSP bool) Middleware {
 	return func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			csp := []string{
@@ -44,7 +45,9 @@ func SecureHeaders() Middleware {
 				fmt.Sprintf("script-src 'unsafe-inline' 'strict-dynamic' https: http: %s",
 					strings.Join(scriptHashes, " ")),
 			}
-			w.Header().Set("Content-Security-Policy", strings.Join(csp, "; "))
+			if enableCSP {
+				w.Header().Set("Content-Security-Policy", strings.Join(csp, "; "))
+			}
 			// Don't allow frame embedding.
 			w.Header().Set("X-Frame-Options", "deny")
 			// Prevent MIME sniffing.

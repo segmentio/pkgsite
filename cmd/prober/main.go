@@ -28,7 +28,6 @@ import (
 	"golang.org/x/pkgsite/internal/config"
 	"golang.org/x/pkgsite/internal/dcensus"
 	"golang.org/x/pkgsite/internal/log"
-	"golang.org/x/pkgsite/internal/secrets"
 )
 
 var credsFile = flag.String("creds", "", "filename for credentials, when running locally")
@@ -68,15 +67,6 @@ var probes = []*Probe{
 	{
 		Name:        "pkg-firestore-nocache",
 		RelativeURL: "cloud.google.com/go/firestore",
-		BypassCache: true,
-	},
-	{
-		Name:        "pkg-firestore-readme",
-		RelativeURL: "cloud.google.com/go/firestore?tab=readme",
-	},
-	{
-		Name:        "pkg-firestore-readme-nocache",
-		RelativeURL: "cloud.google.com/go/firestore?tab=readme",
 		BypassCache: true,
 	},
 	{
@@ -135,18 +125,18 @@ var probes = []*Probe{
 		BypassCache: true,
 	},
 	{
-		Name:        "mod-xtools-nocache",
-		RelativeURL: "mod/golang.org/x/tools",
+		Name:        "xtools-nocache",
+		RelativeURL: "golang.org/x/tools",
 		BypassCache: true,
 	},
 	{
-		Name:        "mod-xtools-packages-nocache",
-		RelativeURL: "mod/golang.org/x/tools?tab=packages",
+		Name:        "xtools-versions-nocache",
+		RelativeURL: "golang.org/x/tools?tab=versions",
 		BypassCache: true,
 	},
 	{
-		Name:        "mod-xtools-versions-nocache",
-		RelativeURL: "mod/golang.org/x/tools?tab=versions",
+		Name:        "xtools-licenses-nocache",
+		RelativeURL: "golang.org/x/tools?tab=licenses",
 		BypassCache: true,
 	},
 	{
@@ -222,27 +212,24 @@ func main() {
 	}
 	cfg.Dump(os.Stderr)
 
-	if _, err := log.UseStackdriver(ctx, cfg, "prober-log"); err != nil {
-		log.Fatal(ctx, err)
+	log.SetLevel(cfg.LogLevel)
+	if cfg.OnGCP() {
+		if _, err := log.UseStackdriver(ctx, cfg, "prober-log"); err != nil {
+			log.Fatal(ctx, err)
+		}
 	}
 
 	var jsonCreds []byte
-
 	if *credsFile != "" {
 		jsonCreds, err = ioutil.ReadFile(*credsFile)
 		if err != nil {
 			log.Fatal(ctx, err)
 		}
-	} else {
-		const secretName = "load-test-agent-creds"
-		log.Infof(ctx, "getting secret %q", secretName)
-		s, err := secrets.Get(context.Background(), secretName)
-		if err != nil {
-			log.Fatalf(ctx, "secrets.Get: %v", err)
-		}
-		jsonCreds = []byte(s)
 	}
-	client, err = auth.NewClient(jsonCreds)
+	// If there is no creds file, use application default credentials. On
+	// AppEngine, this will use the AppEngine service account, which has the
+	// necessary IAP permission.
+	client, err = auth.NewClient(ctx, jsonCreds, os.Getenv("GO_DISCOVERY_USE_EXP_AUTH") == "true")
 	if err != nil {
 		log.Fatal(ctx, err)
 	}
@@ -262,6 +249,7 @@ func main() {
 		http.ServeFile(w, r, "content/static/img/favicon.ico")
 	})
 	http.HandleFunc("/", handleProbe)
+	http.HandleFunc("/check", handleCheck)
 
 	addr := cfg.HostAddr("localhost:8080")
 	log.Infof(ctx, "Listening on addr %s", addr)
@@ -271,10 +259,12 @@ func main() {
 // ProbeStatus records the result if a single probe attempt
 type ProbeStatus struct {
 	Probe   *Probe
+	Code    int    // status code of response
 	Text    string // describes what happened: "OK", or "FAILED" with a reason
 	Latency int    // in milliseconds
 }
 
+// handleProbe runs probes and displays their results. It always returns a 200.
 func handleProbe(w http.ResponseWriter, r *http.Request) {
 	statuses := runProbes(r.Context())
 	var data = struct {
@@ -295,6 +285,28 @@ func handleProbe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleCheck runs probes, and returns a 200 only if they all succeed.
+// Otherwise it returns the status code of the first failing response.
+func handleCheck(w http.ResponseWriter, r *http.Request) {
+	statuses := runProbes(r.Context())
+	var bads []*ProbeStatus
+	for _, s := range statuses {
+		if s.Code != http.StatusOK {
+			bads = append(bads, s)
+		}
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	if len(bads) == 0 {
+		fmt.Fprintf(w, "All probes succeeded.\n")
+	} else {
+		w.WriteHeader(bads[0].Code)
+		fmt.Fprintf(w, "SOME PROBES FAILED:\n")
+		for _, b := range bads {
+			fmt.Fprintf(w, "%3d /%s\n", b.Code, b.Probe.RelativeURL)
+		}
+	}
+}
+
 func runProbes(ctx context.Context) []*ProbeStatus {
 	var statuses []*ProbeStatus
 	for _, p := range probes {
@@ -308,7 +320,10 @@ func runProbes(ctx context.Context) []*ProbeStatus {
 }
 
 func runProbe(ctx context.Context, p *Probe) *ProbeStatus {
-	status := &ProbeStatus{Probe: p}
+	status := &ProbeStatus{
+		Probe: p,
+		Code:  499, // not a real code; means request never sent
+	}
 	url := baseURL + "/" + p.RelativeURL
 	log.Infof(ctx, "running %s = %s", p.Name, url)
 	defer func() {
@@ -343,6 +358,7 @@ func runProbe(ctx context.Context, p *Probe) *ProbeStatus {
 		return status
 	}
 	defer res.Body.Close()
+	status.Code = res.StatusCode
 	if res.StatusCode != http.StatusOK {
 		status.Text = fmt.Sprintf("FAILED with status %s", res.Status)
 		record(res.Status)

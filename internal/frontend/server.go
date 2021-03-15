@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Package frontend provides functionality for running the pkg.go.dev site.
 package frontend
 
 import (
@@ -15,15 +16,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v7"
+	"cloud.google.com/go/errorreporting"
+	"github.com/go-redis/redis/v8"
+	"github.com/google/safehtml"
 	"github.com/google/safehtml/template"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/config"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/experiment"
+	"golang.org/x/pkgsite/internal/godoc/dochtml"
 	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/log"
 	"golang.org/x/pkgsite/internal/middleware"
 	"golang.org/x/pkgsite/internal/queue"
+	"golang.org/x/pkgsite/internal/static"
 )
 
 // Server can be installed to serve the go discovery frontend.
@@ -42,6 +48,8 @@ type Server struct {
 	errorPage            []byte
 	appVersionLabel      string
 	googleTagManagerID   string
+	serveStats           bool
+	reportingClient      *errorreporting.Client
 
 	mu        sync.Mutex // Protects all fields below
 	templates map[string]*template.Template
@@ -60,6 +68,8 @@ type ServerConfig struct {
 	DevMode              bool
 	AppVersionLabel      string
 	GoogleTagManagerID   string
+	ServeStats           bool
+	ReportingClient      *errorreporting.Client
 }
 
 // NewServer creates a new Server for the given database and template directory.
@@ -70,6 +80,8 @@ func NewServer(scfg ServerConfig) (_ *Server, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("error parsing templates: %v", err)
 	}
+	docTemplateDir := template.TrustedSourceJoin(templateDir, template.TrustedSourceFromConstant("doc"))
+	dochtml.LoadTemplates(docTemplateDir)
 	s := &Server{
 		getDataSource:        scfg.DataSourceGetter,
 		queue:                scfg.Queue,
@@ -82,6 +94,8 @@ func NewServer(scfg ServerConfig) (_ *Server, err error) {
 		taskIDChangeInterval: scfg.TaskIDChangeInterval,
 		appVersionLabel:      scfg.AppVersionLabel,
 		googleTagManagerID:   scfg.GoogleTagManagerID,
+		serveStats:           scfg.ServeStats,
+		reportingClient:      scfg.ReportingClient,
 	}
 	errorPageBytes, err := s.renderErrorPage(context.Background(), http.StatusInternalServerError, "error.tmpl", nil)
 	if err != nil {
@@ -92,31 +106,57 @@ func NewServer(scfg ServerConfig) (_ *Server, err error) {
 }
 
 // Install registers server routes using the given handler registration func.
-func (s *Server) Install(handle func(string, http.Handler), redisClient *redis.Client) {
+// authValues is the set of values that can be set on authHeader to bypass the
+// cache.
+func (s *Server) Install(handle func(string, http.Handler), redisClient *redis.Client, authValues []string) {
 	var (
 		detailHandler http.Handler = s.errorHandler(s.serveDetails)
 		fetchHandler  http.Handler = s.errorHandler(s.serveFetch)
 		searchHandler http.Handler = s.errorHandler(s.serveSearch)
 	)
 	if redisClient != nil {
-		detailHandler = middleware.Cache("details", redisClient, detailsTTL)(detailHandler)
-		searchHandler = middleware.Cache("search", redisClient, middleware.TTL(defaultTTL))(searchHandler)
+		detailHandler = middleware.Cache("details", redisClient, detailsTTL, authValues)(detailHandler)
+		searchHandler = middleware.Cache("search", redisClient, middleware.TTL(defaultTTL), authValues)(searchHandler)
 	}
-	handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir(s.staticPath.String()))))
+	// Each AppEngine instance is created in response to a start request, which
+	// is an empty HTTP GET request to /_ah/start when scaling is set to manual
+	// or basic, and /_ah/warmup when scaling is automatic and min_instances is
+	// set. AppEngine sends this request to bring an instance into existence.
+	// See details for /_ah/start at
+	// https://cloud.google.com/appengine/docs/standard/go/how-instances-are-managed#startup
+	// and for /_ah/warmup at
+	// https://cloud.google.com/appengine/docs/standard/go/configuring-warmup-requests.
+	handle("/_ah/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Infof(r.Context(), "Request made to %q", r.URL.Path)
+	}))
+	handle("/static/", s.staticHandler())
 	handle("/third_party/", http.StripPrefix("/third_party", http.FileServer(http.Dir(s.thirdPartyPath))))
 	handle("/favicon.ico", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, fmt.Sprintf("%s/img/favicon.ico", http.Dir(s.staticPath.String())))
 	}))
-	handle("/fetch/", fetchHandler)
-	handle("/play/", http.HandlerFunc(s.handlePlay))
+	handle("/mod/", http.HandlerFunc(s.handleModuleDetailsRedirect))
 	handle("/pkg/", http.HandlerFunc(s.handlePackageDetailsRedirect))
+	handle("/fetch/", fetchHandler)
+	// This is legacy handler to be replaced by /play/share.
+	handle("/play", http.HandlerFunc(s.handlePlay))
+	handle("/play/compile", http.HandlerFunc(s.proxyPlayground))
+	handle("/play/fmt", http.HandlerFunc(s.handleFmt))
+	handle("/play/share", http.HandlerFunc(s.proxyPlayground))
 	handle("/search", searchHandler)
-	handle("/search-help", s.staticPageHandler("search_help.tmpl", "Search Help - go.dev"))
+	handle("/search-help", s.staticPageHandler("search_help.tmpl", "Search Help"))
 	handle("/license-policy", s.licensePolicyHandler())
 	handle("/about", http.RedirectHandler("https://go.dev/about", http.StatusFound))
 	handle("/badge/", http.HandlerFunc(s.badgeHandler))
+	handle("/C", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Package "C" is a special case: redirect to /cmd/cgo.
+		// (This is what golang.org/C does.)
+		http.Redirect(w, r, "/cmd/cgo", http.StatusMovedPermanently)
+	}))
 	handle("/", detailHandler)
-	handle("/autocomplete", http.HandlerFunc(s.handleAutoCompletion))
+	if s.serveStats {
+		handle("/detail-stats/",
+			middleware.Stats()(http.StripPrefix("/detail-stats", s.errorHandler(s.serveDetails))))
+	}
 	handle("/robots.txt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(`User-agent: *
@@ -129,16 +169,30 @@ Disallow: /fetch/*
 const (
 	// defaultTTL is used when details tab contents are subject to change, or when
 	// there is a problem confirming that the details can be permanently cached.
-	defaultTTL = 1 * time.Hour
+	defaultTTL = 10 * time.Minute
 	// shortTTL is used for volatile content, such as the latest version of a
 	// package or module.
 	shortTTL = 10 * time.Minute
 	// longTTL is used when details content is essentially static.
-	longTTL = 24 * time.Hour
+	longTTL = 10 * time.Minute
+	// tinyTTL is used to cache crawled pages.
+	tinyTTL = 1 * time.Minute
 )
+
+var crawlers = []string{
+	"+http://www.google.com/bot.html",
+	"+http://www.bing.com/bingbot.htm",
+	"+http://ahrefs.com/robot",
+}
 
 // detailsTTL assigns the cache TTL for package detail requests.
 func detailsTTL(r *http.Request) time.Duration {
+	userAgent := r.Header.Get("User-Agent")
+	for _, c := range crawlers {
+		if strings.Contains(userAgent, c) {
+			return tinyTTL
+		}
+	}
 	return detailsTTLForPath(r.Context(), r.URL.Path, r.FormValue("tab"))
 }
 
@@ -146,15 +200,12 @@ func detailsTTLForPath(ctx context.Context, urlPath, tab string) time.Duration {
 	if urlPath == "/" {
 		return defaultTTL
 	}
-	if strings.HasPrefix(urlPath, "/mod") {
-		urlPath = strings.TrimPrefix(urlPath, "/mod")
-	}
-	_, _, version, err := parseDetailsURLPath(urlPath)
+	info, err := parseDetailsURLPath(urlPath)
 	if err != nil {
 		log.Errorf(ctx, "falling back to default TTL: %v", err)
 		return defaultTTL
 	}
-	if version == internal.LatestVersion {
+	if info.requestedVersion == internal.LatestVersion {
 		return shortTTL
 	}
 	if tab == "importedby" || tab == "versions" {
@@ -170,9 +221,7 @@ func TagRoute(route string, r *http.Request) string {
 	if tab := r.FormValue("tab"); tab != "" {
 		// Verify that the tab value actually exists, otherwise this is unsanitized
 		// input and could result in unbounded cardinality in our metrics.
-		_, pkgOK := packageTabLookup[tab]
-		_, modOK := moduleTabLookup[tab]
-		if pkgOK || modOK {
+		if _, ok := unitTabLookup[tab]; ok {
 			if tag != "" {
 				tag += "-"
 			}
@@ -192,13 +241,30 @@ func (s *Server) staticPageHandler(templateName, title string) http.HandlerFunc 
 
 // basePage contains fields shared by all pages when rendering templates.
 type basePage struct {
-	HTMLTitle          string
-	Query              string
-	Experiments        *experiment.Set
-	GodocURL           string
-	DevMode            bool
-	AppVersionLabel    string
+	// HTMLTitle is the value to use in the page’s <title> tag.
+	HTMLTitle string
+
+	// MetaDescription is the html used for rendering the <meta name="Description"> tag.
+	MetaDescription safehtml.HTML
+
+	// Query is the current search query (if applicable).
+	Query string
+
+	// Experiments contains the experiments currently active.
+	Experiments *experiment.Set
+
+	// DevMode indicates whether the server is running in development mode.
+	DevMode bool
+
+	// AppVersionLabel contains the current version of the app.
+	AppVersionLabel string
+
+	// GoogleTagManagerID is the ID used to load Google Tag Manager.
 	GoogleTagManagerID string
+
+	// AllowWideContent indicates whether the content should be displayed in a
+	// way that’s amenable to wider viewports.
+	AllowWideContent bool
 }
 
 // licensePolicyPage is used to generate the static license policy page.
@@ -226,7 +292,6 @@ func (s *Server) newBasePage(r *http.Request, title string) basePage {
 		HTMLTitle:          title,
 		Query:              searchQuery(r),
 		Experiments:        experiment.FromContext(r.Context()),
-		GodocURL:           middleware.GodocURLPlaceholder,
 		DevMode:            s.devMode,
 		AppVersionLabel:    s.appVersionLabel,
 		GoogleTagManagerID: s.googleTagManagerID,
@@ -292,6 +357,7 @@ func (s *Server) serveError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	if serr.status == http.StatusInternalServerError {
 		log.Error(ctx, err)
+		s.reportError(ctx, err, w, r)
 	} else {
 		log.Infof(ctx, "returning %d (%s) for error %v", serr.status, http.StatusText(serr.status), err)
 	}
@@ -303,6 +369,26 @@ func (s *Server) serveError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	s.serveErrorPage(w, r, serr.status, serr.epage)
+}
+
+// reportError sends the error to the GCP Error Reporting service.
+func (s *Server) reportError(ctx context.Context, err error, w http.ResponseWriter, r *http.Request) {
+	if s.reportingClient == nil {
+		return
+	}
+	// Extract the stack trace from the error if there is one.
+	var stack []byte
+	if serr := (*derrors.StackError)(nil); errors.As(err, &serr) {
+		stack = serr.Stack
+	}
+	s.reportingClient.Report(errorreporting.Entry{
+		Error: err,
+		Req:   r,
+		Stack: stack,
+	})
+	log.Debugf(ctx, "reported error %v with stack size %d", err, len(stack))
+	// Bypass the error-reporting middleware.
+	w.Header().Set(config.BypassErrorReportingHeader, "true")
 }
 
 func (s *Server) serveErrorPage(w http.ResponseWriter, r *http.Request, status int, page *errorPage) {
@@ -371,6 +457,8 @@ func (s *Server) renderErrorPage(ctx context.Context, status int, templateName s
 
 // servePage is used to execute all templates for a *Server.
 func (s *Server) servePage(ctx context.Context, w http.ResponseWriter, templateName string, page interface{}) {
+	defer middleware.ElapsedStat(ctx, "servePage")()
+
 	buf, err := s.renderPage(ctx, templateName, page)
 	if err != nil {
 		log.Errorf(ctx, "s.renderPage(%q, %+v): %v", templateName, page, err)
@@ -385,6 +473,8 @@ func (s *Server) servePage(ctx context.Context, w http.ResponseWriter, templateN
 
 // renderPage executes the given templateName with page.
 func (s *Server) renderPage(ctx context.Context, templateName string, page interface{}) ([]byte, error) {
+	defer middleware.ElapsedStat(ctx, "renderPage")()
+
 	tmpl, err := s.findTemplate(templateName)
 	if err != nil {
 		return nil, err
@@ -418,6 +508,19 @@ func executeTemplate(ctx context.Context, templateName string, tmpl *template.Te
 	return buf.Bytes(), nil
 }
 
+var templateFuncs = template.FuncMap{
+	"add": func(i, j int) int { return i + j },
+	"pluralize": func(i int, s string) string {
+		if i == 1 {
+			return s
+		}
+		return s + "s"
+	},
+	"commaseparate": func(s []string) string {
+		return strings.Join(s, ", ")
+	},
+}
+
 // parsePageTemplates parses html templates contained in the given base
 // directory in order to generate a map of Name->*template.Template.
 //
@@ -435,30 +538,16 @@ func parsePageTemplates(base template.TrustedSource) (map[string]*template.Templ
 		{tsc("license_policy.tmpl")},
 		{tsc("search.tmpl")},
 		{tsc("search_help.tmpl")},
-		{tsc("overview.tmpl"), tsc("details.tmpl")},
-		{tsc("subdirectories.tmpl"), tsc("details.tmpl")},
-		{tsc("pkg_doc.tmpl"), tsc("details.tmpl")},
-		{tsc("pkg_importedby.tmpl"), tsc("details.tmpl")},
-		{tsc("pkg_imports.tmpl"), tsc("details.tmpl")},
-		{tsc("licenses.tmpl"), tsc("details.tmpl")},
-		{tsc("versions.tmpl"), tsc("details.tmpl")},
-		{tsc("not_implemented.tmpl"), tsc("details.tmpl")},
+		{tsc("unit_details.tmpl"), tsc("unit.tmpl")},
+		{tsc("unit_importedby.tmpl"), tsc("unit.tmpl")},
+		{tsc("unit_imports.tmpl"), tsc("unit.tmpl")},
+		{tsc("unit_licenses.tmpl"), tsc("unit.tmpl")},
+		{tsc("unit_versions.tmpl"), tsc("unit.tmpl")},
 	}
 
 	templates := make(map[string]*template.Template)
 	for _, set := range htmlSets {
-		t, err := template.New("base.tmpl").Funcs(template.FuncMap{
-			"add": func(i, j int) int { return i + j },
-			"pluralize": func(i int, s string) string {
-				if i == 1 {
-					return s
-				}
-				return s + "s"
-			},
-			"commaseparate": func(s []string) string {
-				return strings.Join(s, ", ")
-			},
-		}).ParseFilesFromTrustedSources(join(base, tsc("base.tmpl")))
+		t, err := template.New("base.tmpl").Funcs(templateFuncs).ParseFilesFromTrustedSources(join(base, tsc("base.tmpl")))
 		if err != nil {
 			return nil, fmt.Errorf("ParseFiles: %v", err)
 		}
@@ -477,4 +566,19 @@ func parsePageTemplates(base template.TrustedSource) (map[string]*template.Templ
 		templates[set[0].String()] = t
 	}
 	return templates, nil
+}
+
+func (s *Server) staticHandler() http.Handler {
+	staticPath := s.staticPath.String()
+
+	// In dev mode compile TypeScript files into minified JavaScript files
+	// and rebuild them on file changes.
+	if s.devMode {
+		ctx := context.Background()
+		_, err := static.Build(static.Config{StaticPath: staticPath, Watch: true, Write: true})
+		if err != nil {
+			log.Error(ctx, err)
+		}
+	}
+	return http.StripPrefix("/static/", http.FileServer(http.Dir(staticPath)))
 }

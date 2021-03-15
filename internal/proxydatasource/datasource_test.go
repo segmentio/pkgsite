@@ -7,388 +7,323 @@ package proxydatasource
 import (
 	"context"
 	"errors"
-	"sort"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/google/licensecheck"
+	"github.com/google/safehtml/template"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal/godoc/dochtml"
 	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/proxy"
 	"golang.org/x/pkgsite/internal/testing/sample"
-	"golang.org/x/pkgsite/internal/testing/testhelper"
-	"golang.org/x/pkgsite/internal/version"
 )
+
+var testModules []*proxy.Module
+
+func TestMain(m *testing.M) {
+	dochtml.LoadTemplates(template.TrustedSourceFromConstant("../../content/static/html/doc"))
+	testModules = proxy.LoadTestModules("../proxy/testdata")
+	licenses.OmitExceptions = true
+	os.Exit(m.Run())
+}
 
 func setup(t *testing.T) (context.Context, *DataSource, func()) {
 	t.Helper()
-	contents := map[string]string{
-		"go.mod":     "module foo.com/bar",
-		"LICENSE":    testhelper.MITLicense,
-		"baz/baz.go": "//Package baz provides a helpful constant.\npackage baz\nimport \"net/http\"\nconst OK = http.StatusOK",
-	}
-	testModules := []*proxy.Module{
-		{
-			ModulePath: "foo.com/bar",
-			Version:    "v1.1.0",
-			Files:      contents,
-		},
-		{
-			ModulePath: "foo.com/bar",
-			Version:    "v1.2.0",
-			Files:      contents,
-		},
-	}
-	client, teardownProxy := proxy.SetupTestProxy(t, testModules)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	return ctx, New(client), func() {
+	client, teardownProxy := proxy.SetupTestClient(t, testModules)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	return ctx, NewForTesting(client), func() {
 		teardownProxy()
 		cancel()
 	}
 }
 
 var (
-	wantLicenseMD  = sample.LicenseMetadata[0]
-	wantLicense    = &licenses.License{Metadata: wantLicenseMD}
-	wantLicenseMIT = &licenses.License{
-		Metadata: &licenses.Metadata{
-			Types:    []string{"MIT"},
-			FilePath: "LICENSE",
-			Coverage: licensecheck.Coverage{
-				Percent: 100,
-				Match:   []licensecheck.Match{{Name: "MIT", Type: licensecheck.MIT, Percent: 100, End: 1049}},
+	wantLicenseMD = sample.LicenseMetadata()[0]
+	wantPackage   = internal.Unit{
+		UnitMeta: internal.UnitMeta{
+			Path: "foo.com/bar/baz",
+			Name: "baz",
+			ModuleInfo: internal.ModuleInfo{
+				ModulePath:        "foo.com/bar",
+				Version:           "v1.2.0",
+				CommitTime:        time.Date(2019, 1, 30, 0, 0, 0, 0, time.UTC),
+				IsRedistributable: true,
 			},
+			Licenses:          []*licenses.Metadata{wantLicenseMD},
+			IsRedistributable: true,
 		},
-		Contents: []byte(testhelper.MITLicense),
-	}
-	wantLicenseBSD = &licenses.License{
-		Metadata: &licenses.Metadata{
-			Types:    []string{"BSD-0-Clause"},
-			FilePath: "qux/LICENSE",
-			Coverage: licensecheck.Coverage{
-				Percent: 100,
-				Match:   []licensecheck.Match{{Name: "BSD-0-Clause", Type: licensecheck.BSD, Percent: 100, End: 633}},
-			},
-		},
-		Contents: []byte(testhelper.BSD0License),
-	}
-	wantPackage = internal.LegacyPackage{
-		Path:              "foo.com/bar/baz",
-		Name:              "baz",
-		Imports:           []string{"net/http"},
-		Synopsis:          "Package baz provides a helpful constant.",
-		V1Path:            "foo.com/bar/baz",
-		Licenses:          []*licenses.Metadata{wantLicenseMD},
-		IsRedistributable: true,
-		GOOS:              "linux",
-		GOARCH:            "amd64",
-	}
-	wantModuleInfo = internal.ModuleInfo{
-		ModulePath:        "foo.com/bar",
-		Version:           "v1.2.0",
-		CommitTime:        time.Date(2019, 1, 30, 0, 0, 0, 0, time.UTC),
-		VersionType:       version.TypeRelease,
-		IsRedistributable: true,
-		HasGoMod:          true,
-	}
-	wantVersionedPackage = &internal.LegacyVersionedPackage{
-		LegacyModuleInfo: internal.LegacyModuleInfo{ModuleInfo: wantModuleInfo},
-		LegacyPackage:    wantPackage,
+		Imports: []string{"net/http"},
+		Documentation: []*internal.Documentation{{
+			Synopsis: "Package baz provides a helpful constant.",
+			GOOS:     "linux",
+			GOARCH:   "amd64",
+		}},
 	}
 	cmpOpts = append([]cmp.Option{
-		cmpopts.IgnoreFields(internal.LegacyPackage{}, "DocumentationHTML"),
 		cmpopts.IgnoreFields(licenses.License{}, "Contents"),
+		cmpopts.IgnoreFields(internal.ModuleInfo{}, "SourceInfo"),
 	}, sample.LicenseCmpOpts...)
 )
 
-func TestDataSource_LegacyGetDirectory(t *testing.T) {
+func TestGetModuleInfo(t *testing.T) {
 	ctx, ds, teardown := setup(t)
 	defer teardown()
-	want := &internal.LegacyDirectory{
-		LegacyModuleInfo: internal.LegacyModuleInfo{ModuleInfo: wantModuleInfo},
-		Path:             "foo.com/bar",
-		Packages:         []*internal.LegacyPackage{&wantPackage},
-	}
-	got, err := ds.LegacyGetDirectory(ctx, "foo.com/bar", internal.UnknownModulePath, "v1.2.0", internal.AllFields)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
-		t.Errorf("LegacyGetDirectory diff (-want +got):\n%s", diff)
-	}
-}
 
-func TestDataSource_GetImports(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	want := []string{"net/http"}
-	got, err := ds.GetImports(ctx, "foo.com/bar/baz", "foo.com/bar", "v1.2.0")
-	if err != nil {
-		t.Fatal(err)
+	modinfo := func(m, v string) *internal.ModuleInfo {
+		t.Helper()
+		mi, err := ds.GetModuleInfo(ctx, m, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mi
 	}
-	if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
-		t.Errorf("GetImports diff (-want +got):\n%s", diff)
-	}
-}
 
-func TestDataSource_GetPackage_Latest(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetPackage(ctx, "foo.com/bar/baz", internal.UnknownModulePath, internal.LatestVersion)
-	if err != nil {
-		t.Fatal(err)
+	wantModuleInfo := internal.ModuleInfo{
+		ModulePath:        "example.com/basic",
+		Version:           "v1.1.0",
+		CommitTime:        time.Date(2019, 1, 30, 0, 0, 0, 0, time.UTC),
+		IsRedistributable: true,
+		HasGoMod:          true,
 	}
-	if diff := cmp.Diff(wantVersionedPackage, got, cmpOpts...); diff != "" {
-		t.Errorf("GetLatestPackage diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_LegacyGetModuleInfo_Latest(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetModuleInfo(ctx, "foo.com/bar", internal.LatestVersion)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := cmp.Diff(wantModuleInfo, got.ModuleInfo, cmpOpts...); diff != "" {
-		t.Errorf("GetLatestModuleInfo diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_GetModuleInfo(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.GetModuleInfo(ctx, "foo.com/bar", "v1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := modinfo("example.com/basic", "v1.1.0")
 	if diff := cmp.Diff(&wantModuleInfo, got, cmpOpts...); diff != "" {
 		t.Errorf("GetModuleInfo diff (-want +got):\n%s", diff)
 	}
+
+	// Get v1.0.0 of a deprecated module. The deprecation comment is in
+	// the latest version, v1.1.0.
+	got = modinfo("example.com/deprecated", "v1.0.0")
+	if !got.Deprecated {
+		t.Fatal("got not deprecated, want deprecated")
+	}
+	if want := "use something else"; got.DeprecationComment != want {
+		t.Errorf("got %q, want %q", got.DeprecationComment, want)
+	}
+
+	// Get v1.0.0 of a module with retractions. It should not be marked
+	// retracted, even though its own go.mod says it should be, because
+	// the latest go.mod does not retract it.
+	if modinfo("example.com/retractions", "v1.0.0").Retracted {
+		t.Fatal("got retracted, wanted false")
+	}
+	// v1.1.0 of the module is retracted.
+	got = modinfo("example.com/retractions", "v1.1.0")
+	if !got.Retracted {
+		t.Fatal("got retracted false, wanted true")
+	}
+	if want := "worse"; got.RetractionRationale != want {
+		t.Errorf("got rationale %q, want %q", got.RetractionRationale, want)
+	}
+
 }
 
-func TestDataSource_GetLicenses(t *testing.T) {
+func TestGetUnitMeta(t *testing.T) {
+	ctx, ds, teardown := setup(t)
+	defer teardown()
+
+	for _, test := range []struct {
+		path, modulePath, version string
+		want                      *internal.UnitMeta
+	}{
+		{
+			path:       "example.com/single",
+			modulePath: "example.com/single",
+			version:    "v1.0.0",
+			want: &internal.UnitMeta{
+				ModuleInfo: internal.ModuleInfo{
+					ModulePath:        "example.com/single",
+					Version:           "v1.0.0",
+					IsRedistributable: true,
+				},
+				IsRedistributable: true,
+			},
+		},
+		{
+			path:       "example.com/single/pkg",
+			modulePath: "example.com/single",
+			version:    "v1.0.0",
+			want: &internal.UnitMeta{
+				ModuleInfo: internal.ModuleInfo{
+					ModulePath:        "example.com/single",
+					Version:           "v1.0.0",
+					IsRedistributable: true,
+				},
+				Name:              "pkg",
+				IsRedistributable: true,
+			},
+		},
+		{
+			path:       "example.com/single/pkg",
+			modulePath: internal.UnknownModulePath,
+			version:    "v1.0.0",
+			want: &internal.UnitMeta{
+				ModuleInfo: internal.ModuleInfo{
+					ModulePath:        "example.com/single",
+					Version:           "v1.0.0",
+					IsRedistributable: true,
+				},
+				Name:              "pkg",
+				IsRedistributable: true,
+			},
+		},
+		{
+			path:       "example.com/basic",
+			modulePath: internal.UnknownModulePath,
+			version:    internal.LatestVersion,
+			want: &internal.UnitMeta{
+				ModuleInfo: internal.ModuleInfo{
+					ModulePath:        "example.com/basic",
+					Version:           "v1.1.0",
+					IsRedistributable: true,
+				},
+				Name:              "basic",
+				IsRedistributable: true,
+			},
+		},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			got, err := ds.GetUnitMeta(ctx, test.path, test.modulePath, test.version)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.want.Path = test.path
+			if diff := cmp.Diff(got, test.want); diff != "" {
+				t.Errorf("mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestBypass(t *testing.T) {
+	for _, bypass := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bypass=%t", bypass), func(t *testing.T) {
+			// re-create the data source to get around caching
+			ctx, ds, teardown := setup(t)
+			defer teardown()
+			ds.bypassLicenseCheck = bypass
+			for _, test := range []struct {
+				path      string
+				wantEmpty bool
+			}{
+				{"example.com/basic", false},
+				{"example.com/nonredist/unk", !bypass},
+			} {
+				t.Run(test.path, func(t *testing.T) {
+					um, err := ds.GetUnitMeta(ctx, test.path, internal.UnknownModulePath, "v1.0.0")
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := ds.GetUnit(ctx, um, 0)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					// Assume internal.Module.RemoveNonRedistributableData is correct; we just
+					// need to check one value to confirm that it was called.
+					if gotEmpty := (got.Documentation == nil); gotEmpty != test.wantEmpty {
+						t.Errorf("got empty %t, want %t", gotEmpty, test.wantEmpty)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestGetLatestInfo(t *testing.T) {
 	t.Helper()
 	testModules := []*proxy.Module{
 		{
 			ModulePath: "foo.com/bar",
 			Version:    "v1.1.0",
 			Files: map[string]string{
-				"go.mod":  "module foo.com/bar",
-				"LICENSE": testhelper.MITLicense,
-				"bar.go":  "//Package bar provides a helpful constant.\npackage bar\nimport \"net/http\"\nconst OK = http.StatusOK",
-
-				"baz/baz.go": "//Package baz provides a helpful constant.\npackage baz\nimport \"net/http\"\nconst OK = http.StatusOK",
-
-				"qux/LICENSE": testhelper.BSD0License,
-				"qux/qux.go":  "//Package qux provides a helpful constant.\npackage qux\nimport \"net/http\"\nconst OK = http.StatusOK",
+				"baz.go": "package bar",
 			},
 		},
+		{
+			ModulePath: "foo.com/bar/v2",
+			Version:    "v2.0.5",
+		},
+		{
+			ModulePath: "foo.com/bar/v3",
+		},
+		{
+			ModulePath: "bar.com/foo",
+			Version:    "v1.1.0",
+			Files: map[string]string{
+				"baz.go": "package foo",
+			},
+		},
+		{
+			ModulePath: "incompatible.com/bar",
+			Version:    "v2.1.1+incompatible",
+			Files: map[string]string{
+				"baz.go": "package bar",
+			},
+		},
+		{
+			ModulePath: "incompatible.com/bar/v3",
+		},
 	}
-	client, teardownProxy := proxy.SetupTestProxy(t, testModules)
+	client, teardownProxy := proxy.SetupTestClient(t, testModules)
+	defer teardownProxy()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	ds := New(client)
-	teardown := func() {
-		teardownProxy()
-		cancel()
-	}
-	defer teardown()
-
-	tests := []struct {
-		err        error
-		name       string
-		fullPath   string
-		modulePath string
-		want       []*licenses.License
-	}{
-		{name: "no license dir", fullPath: "foo.com", modulePath: "foo.com/bar", err: derrors.NotFound},
-		{name: "invalid dir", fullPath: "foo.com/invalid", modulePath: "foo.com/invalid", err: derrors.NotFound},
-		{name: "root dir", fullPath: "foo.com/bar", modulePath: "foo.com/bar", want: []*licenses.License{wantLicenseMIT}},
-		{name: "package with no extra license", fullPath: "foo.com/bar/baz", modulePath: "foo.com/bar", want: []*licenses.License{wantLicenseMIT}},
-		{name: "package with additional license", fullPath: "foo.com/bar/qux", modulePath: "foo.com/bar", want: []*licenses.License{wantLicenseMIT, wantLicenseBSD}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := ds.GetLicenses(ctx, test.fullPath, test.modulePath, "v1.1.0")
-			if !errors.Is(err, test.err) {
-				t.Fatal(err)
-			}
-
-			sort.Slice(got, func(i, j int) bool {
-				return got[i].FilePath < got[j].FilePath
-			})
-			sort.Slice(test.want, func(i, j int) bool {
-				return test.want[i].FilePath < test.want[j].FilePath
-			})
-
-			if diff := cmp.Diff(test.want, got); diff != "" {
-				t.Errorf("GetLicenses diff (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestDataSource_LegacyGetModuleLicenses(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetModuleLicenses(ctx, "foo.com/bar", "v1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []*licenses.License{wantLicense}
-	if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
-		t.Errorf("LegacyGetModuleLicenses diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_LegacyGetPackage(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetPackage(ctx, "foo.com/bar/baz", internal.UnknownModulePath, "v1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := cmp.Diff(wantVersionedPackage, got, cmpOpts...); diff != "" {
-		t.Errorf("GetPackage diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_LegacyGetPackageLicenses(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetPackageLicenses(ctx, "foo.com/bar/baz", "foo.com/bar", "v1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []*licenses.License{wantLicense}
-	if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
-		t.Errorf("LegacyGetPackageLicenses diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_GetPackagesInVersion(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetPackagesInModule(ctx, "foo.com/bar", "v1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []*internal.LegacyPackage{&wantPackage}
-	if diff := cmp.Diff(want, got, cmpOpts...); diff != "" {
-		t.Errorf("GetPackagesInVersion diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_LegacyGetTaggedVersionsForModule(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetTaggedVersionsForModule(ctx, "foo.com/bar")
-	if err != nil {
-		t.Fatal(err)
-	}
-	v110 := wantModuleInfo
-	v110.Version = "v1.1.0"
-	want := []*internal.ModuleInfo{
-		&wantModuleInfo,
-		&v110,
-	}
-	ignore := cmpopts.IgnoreFields(internal.ModuleInfo{}, "CommitTime", "VersionType", "IsRedistributable", "HasGoMod")
-	if diff := cmp.Diff(want, got, ignore); diff != "" {
-		t.Errorf("LegacyGetTaggedVersionsForPackageSeries diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_LegacyGetTaggedVersionsForPackageSeries(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	// // TODO (rFindley): this shouldn't be necessary.
-	// _, err := ds.GetLatestPackage(ctx, "foo.com/bar/baz")
-	// if err != nil {
-	// 	t.Fatal(err)
-	// }
-	got, err := ds.LegacyGetTaggedVersionsForPackageSeries(ctx, "foo.com/bar/baz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	v110 := wantModuleInfo
-	v110.Version = "v1.1.0"
-	want := []*internal.ModuleInfo{
-		&wantModuleInfo,
-		&v110,
-	}
-	ignore := cmpopts.IgnoreFields(internal.ModuleInfo{}, "CommitTime", "VersionType", "IsRedistributable", "HasGoMod")
-	if diff := cmp.Diff(want, got, ignore); diff != "" {
-		t.Errorf("LegacyGetTaggedVersionsForPackageSeries diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_LegacyGetModuleInfo(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
-	got, err := ds.LegacyGetModuleInfo(ctx, "foo.com/bar", "v1.2.0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := cmp.Diff(wantModuleInfo, got.ModuleInfo, cmpOpts...); diff != "" {
-		t.Errorf("LegacyGetModuleInfo diff (-want +got):\n%s", diff)
-	}
-}
-
-func TestDataSource_GetPathInfo(t *testing.T) {
-	ctx, ds, teardown := setup(t)
-	defer teardown()
+	defer cancel()
+	ds := NewForTesting(client)
 
 	for _, test := range []struct {
-		path, modulePath, version   string
-		wantModulePath, wantVersion string
-		wantIsPackage               bool
+		fullPath        string
+		modulePath      string
+		wantModulePath  string
+		wantPackagePath string
+		wantErr         error
 	}{
 		{
-			path:           "foo.com/bar",
-			modulePath:     "foo.com/bar",
-			version:        "v1.1.0",
-			wantModulePath: "foo.com/bar",
-			wantVersion:    "v1.1.0",
-			wantIsPackage:  false,
+			fullPath:        "foo.com/bar",
+			modulePath:      "foo.com/bar",
+			wantModulePath:  "foo.com/bar/v3",
+			wantPackagePath: "foo.com/bar/v3",
 		},
 		{
-			path:           "foo.com/bar/baz",
-			modulePath:     "foo.com/bar",
-			version:        "v1.1.0",
-			wantModulePath: "foo.com/bar",
-			wantVersion:    "v1.1.0",
-			wantIsPackage:  true,
+			fullPath:        "bar.com/foo",
+			modulePath:      "bar.com/foo",
+			wantModulePath:  "bar.com/foo",
+			wantPackagePath: "bar.com/foo",
 		},
 		{
-			path:           "foo.com/bar/baz",
-			modulePath:     internal.UnknownModulePath,
-			version:        "v1.1.0",
-			wantModulePath: "foo.com/bar",
-			wantVersion:    "v1.1.0",
-			wantIsPackage:  true,
+			fullPath:   "boo.com/far",
+			modulePath: "boo.com/far",
+			wantErr:    derrors.NotFound,
 		},
 		{
-			path:           "foo.com/bar/baz",
-			modulePath:     internal.UnknownModulePath,
-			version:        internal.LatestVersion,
-			wantModulePath: "foo.com/bar",
-			wantVersion:    "v1.2.0",
-			wantIsPackage:  true,
+			fullPath:        "foo.com/bar/baz",
+			modulePath:      "foo.com/bar",
+			wantModulePath:  "foo.com/bar/v3",
+			wantPackagePath: "foo.com/bar/v3",
+		},
+		{
+			fullPath:        "incompatible.com/bar",
+			modulePath:      "incompatible.com/bar",
+			wantModulePath:  "incompatible.com/bar/v3",
+			wantPackagePath: "incompatible.com/bar/v3",
 		},
 	} {
-		gotModulePath, gotVersion, gotIsPackage, err := ds.GetPathInfo(ctx, test.path, test.modulePath, test.version)
+		gotLatest, err := ds.GetLatestInfo(ctx, test.fullPath, test.modulePath)
 		if err != nil {
-			t.Fatal(err)
+			if test.wantErr == nil {
+				t.Fatalf("got unexpected error %v", err)
+			}
+			if !errors.Is(err, test.wantErr) {
+				t.Errorf("got err = %v, want Is(%v)", err, test.wantErr)
+			}
 		}
-		if gotModulePath != test.wantModulePath || gotVersion != test.wantVersion || gotIsPackage != test.wantIsPackage {
-			t.Errorf("GetPathInfo(%q, %q, %q) = %q, %q, %t, want %q, %q, %t",
-				test.path, test.modulePath, test.version,
-				gotModulePath, gotVersion, gotIsPackage,
-				test.wantModulePath, test.wantVersion, test.wantIsPackage)
+		if gotLatest.MajorModulePath != test.wantModulePath || gotLatest.MajorUnitPath != test.wantPackagePath {
+			t.Errorf("ds.GetLatestMajorVersion(%v, %v) = (%v, %v), want = (%v, %v)",
+				test.fullPath, test.modulePath, gotLatest.MajorModulePath, gotLatest.MajorUnitPath, test.wantModulePath, test.wantPackagePath)
 		}
 	}
 }

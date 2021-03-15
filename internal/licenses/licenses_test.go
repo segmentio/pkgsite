@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"os"
@@ -35,7 +36,7 @@ The above copyright notice and this permission notice shall be included in all c
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.`
 
-	// bsd0License is the contents of the BSD-0-Clause license. It is detectable
+	// bsd0License is the contents of the 0BSD license. It is detectable
 	// by the licensecheck package, but not considered redistributable.
 	bsd0License = `Copyright 2019 Google Inc
 
@@ -225,7 +226,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH RE
 
 var mitCoverage = lc.Coverage{
 	Percent: 100,
-	Match:   []lc.Match{{Name: "MIT", Type: lc.MIT, Percent: 100}},
+	Match:   []lc.Match{{ID: "MIT"}},
 }
 
 // testDataPath returns a path corresponding to a path relative to the calling
@@ -262,7 +263,7 @@ func TestModuleIsRedistributable(t *testing.T) {
 			module:    "github.com/smasher164/mem",
 			version:   "v0.0.0-20191114064341-4e07bd0f0d69",
 			want:      true,
-			wantMetas: []*Metadata{{Types: []string{"BSD-0-Clause"}, FilePath: "LICENSE.md"}},
+			wantMetas: []*Metadata{{Types: []string{"0BSD"}, FilePath: "LICENSE.md"}},
 		},
 		{
 			filename: "gioui",
@@ -304,7 +305,7 @@ func TestModuleIsRedistributable(t *testing.T) {
 			got := d.ModuleIsRedistributable()
 			if got != test.want {
 				for _, l := range d.ModuleLicenses() {
-					t.Logf("%v %v", l.Types, l.Coverage)
+					t.Logf("%v %+v", l.Types, l.Coverage)
 				}
 				t.Fatalf("got %t, want %t", got, test.want)
 			}
@@ -334,7 +335,10 @@ func TestRedistributable(t *testing.T) {
 		{[]string{"MIT", "Unlicense"}, true},
 		{[]string{"MIT", "JSON"}, true},
 		{[]string{"MIT", "CommonsClause"}, false},
-		{[]string{"MIT", "GPL2", "ISC"}, true},
+		{[]string{"MIT", "GPL-2.0", "ISC"}, true},
+		{[]string{"MIT", "blessing"}, true},
+		{[]string{"blessing"}, false},
+		{[]string{"Freetype"}, true}, // appears in exceptions/freetype.lre
 	} {
 		got := Redistributable(test.types)
 		if got != test.want {
@@ -400,6 +404,63 @@ func TestFiles(t *testing.T) {
 	}
 }
 
+func TestDetectFile(t *testing.T) {
+	for _, test := range []struct {
+		file string
+		want []string
+	}{
+		{"atlantis", []string{"Apache-2.0"}},
+		{"hid", []string{"BSD-3-Clause", "LGPL-2.1"}},
+		{"freetype", []string{"Freetype"}},
+		{"mynewt", []string{"Apache-2.0"}},
+		{"rocketlaunchr", []string{"MIT"}},
+	} {
+		t.Run(test.file, func(t *testing.T) {
+			data, err := ioutil.ReadFile(filepath.Join("testdata", test.file+".df"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := DetectFile(data, test.file, nil)
+			if !cmp.Equal(got, test.want) {
+				t.Errorf("got %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+// func TestExceptions(t *testing.T) {
+// 	// This is the license in exception-files/atlantis, with different line wrapping and case.
+// 	const in = `
+// 		Atlantis was originally copyrighted and licensed under:
+// 			Copyright 2017 HootSuite Media Inc.
+// 			Licensed under the Apache License, Version 2.0 (the "License");
+// 			YOU MAY NOT USE THIS FILE EXCEPT IN COMPLIANCE WITH THE LICENSE.
+// 			You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+// 			Unless required by applicable law or agreed to in writing, software
+// 			distributed under the License is distributed on an "as is" basis,
+// 			without warranties or conditions of any kind, either express or implied.
+// 			See the License for the specific language governing permissions and
+// 			limitations under the License.
+// 		In 2018 it was forked from github.com/hootsuite/atlantis to github.com/runatlantis/atlantis.
+// 		The contents of files created before the fork
+// 		are obviously still under the Hootsuite copyright and contain a header to that
+// 		effect in addition to a disclaimer that they have subsequently been modified by
+// 		contributors to github.com/runatlantis/atlantis. Modifications and new files
+// 		hereafter are still under the Apache 2.0 license, but are not under copyright of
+// 		Hootsuite Media Inc.`
+// 	got := exceptionFileTypes([]byte(in))
+// 	want := []string{"Apache-2.0"}
+// 	if !cmp.Equal(got, want) {
+// 		t.Errorf("got %v, want %v", got, want)
+// 	}
+
+// 	// If we don't have it, it shouldn't match.
+// 	got = exceptionFileTypes([]byte("Not an exception."))
+// 	if got != nil {
+// 		t.Errorf("got %v, want nil", got)
+// 	}
+// }
+
 func TestDetectFiles(t *testing.T) {
 	defer func(m uint64) { maxLicenseSize = m }(maxLicenseSize)
 	maxLicenseSize = uint64(len(mitLicense) * 10)
@@ -424,9 +485,9 @@ func TestDetectFiles(t *testing.T) {
 				"COPYING":        bsd0License,
 			},
 			want: []*Metadata{
-				{Types: []string{"BSD-0-Clause"}, FilePath: "COPYING", Coverage: lc.Coverage{
+				{Types: []string{"0BSD"}, FilePath: "COPYING", Coverage: lc.Coverage{
 					Percent: 100,
-					Match:   []lc.Match{{Name: "BSD-0-Clause", Type: lc.BSD, Percent: 100}},
+					Match:   []lc.Match{{ID: "0BSD"}},
 				}},
 				{Types: []string{"MIT"}, FilePath: "LICENSE", Coverage: mitCoverage},
 				{Types: []string{"MIT"}, FilePath: "foo/LICENSE.md", Coverage: mitCoverage},
@@ -438,11 +499,11 @@ func TestDetectFiles(t *testing.T) {
 				"LICENSE": mitLicense + "\n" + bsd0License,
 			},
 			want: []*Metadata{
-				{Types: []string{"BSD-0-Clause", "MIT"}, FilePath: "LICENSE", Coverage: lc.Coverage{
+				{Types: []string{"0BSD", "MIT"}, FilePath: "LICENSE", Coverage: lc.Coverage{
 					Percent: 100,
 					Match: []lc.Match{
-						{Name: "MIT", Type: lc.MIT, Percent: 100},
-						{Name: "BSD-0-Clause", Type: lc.BSD, Percent: 100},
+						{ID: "MIT"},
+						{ID: "0BSD"},
 					},
 				}},
 			},
@@ -474,7 +535,7 @@ func TestDetectFiles(t *testing.T) {
 					FilePath: "foo/LICENSE",
 					Coverage: lc.Coverage{
 						Percent: 69.361,
-						Match:   []lc.Match{{Name: "MIT", Type: lc.MIT, Percent: 100}},
+						Match:   []lc.Match{{ID: "MIT"}},
 					},
 				},
 			},
@@ -516,9 +577,7 @@ func TestDetectFiles(t *testing.T) {
 					Coverage: lc.Coverage{
 						Percent: 100,
 						Match: []lc.Match{{
-							Name:    "Apache-2.0-Short",
-							Type:    lc.Apache,
-							Percent: 99,
+							ID: "Apache-2.0",
 						}},
 					},
 				},
@@ -655,39 +714,6 @@ func TestPackageInfo(t *testing.T) {
 				t.Errorf("mismatch (-want +got):\n%s", diff)
 			}
 		})
-	}
-}
-
-func TestExceptions(t *testing.T) {
-	// This is the license in exception-files/atlantis, with different line wrapping and case.
-	const in = `
-		Atlantis was originally copyrighted and licensed under:
-			Copyright 2017 HootSuite Media Inc.
-			Licensed under the Apache License, Version 2.0 (the "License");
-			YOU MAY NOT USE THIS FILE EXCEPT IN COMPLIANCE WITH THE LICENSE.
-			You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
-			Unless required by applicable law or agreed to in writing, software
-			distributed under the License is distributed on an "as is" basis,
-			without warranties or conditions of any kind, either express or implied.
-			See the License for the specific language governing permissions and
-			limitations under the License.
-		In 2018 it was forked from github.com/hootsuite/atlantis to github.com/runatlantis/atlantis.
-		The contents of files created before the fork
-		are obviously still under the Hootsuite copyright and contain a header to that
-		effect in addition to a disclaimer that they have subsequently been modified by
-		contributors to github.com/runatlantis/atlantis. Modifications and new files
-		hereafter are still under the Apache 2.0 license, but are not under copyright of
-		Hootsuite Media Inc.`
-	got := exceptionFileTypes([]byte(in))
-	want := []string{"Apache-2.0"}
-	if !cmp.Equal(got, want) {
-		t.Errorf("got %v, want %v", got, want)
-	}
-
-	// If we don't have it, it shouldn't match.
-	got = exceptionFileTypes([]byte("Not an exception."))
-	if got != nil {
-		t.Errorf("got %v, want nil", got)
 	}
 }
 

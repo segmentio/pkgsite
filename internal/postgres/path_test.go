@@ -1,4 +1,4 @@
-// Copyright 2020 The Go Authors. All rights reserved.
+// Copyright 2021 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,229 +6,214 @@ package postgres
 
 import (
 	"context"
-	"path"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
-	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"golang.org/x/pkgsite/internal"
-	"golang.org/x/pkgsite/internal/stdlib"
+	"golang.org/x/pkgsite/internal/database"
 	"golang.org/x/pkgsite/internal/testing/sample"
-	"golang.org/x/pkgsite/internal/version"
 )
 
-func TestGetPathInfo(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
+func TestGetLatestMajorPathForV1Path(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
 
-	defer ResetTestDB(testDB, t)
-
-	for _, testModule := range []struct {
-		module, version, packageSuffix string
-		isMaster                       bool
-	}{
-		{"m.com", "v1.0.0", "a", false},
-		{"m.com", "v1.0.1", "dir/a", false},
-		{"m.com", "v1.1.0", "a/b", false},
-		{"m.com", "v1.2.0-pre", "a", true},
-		{"m.com/a", "v1.1.0", "b", false},
-	} {
-		vtype, err := version.ParseType(testModule.version)
+	checkLatest := func(t *testing.T, db *DB, versions []string, v1path string, version, suffix string) {
+		t.Helper()
+		gotPath, gotVer, err := db.GetLatestMajorPathForV1Path(ctx, v1path)
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		pkgName := path.Base(testModule.packageSuffix)
-		pkgPath := path.Join(testModule.module, testModule.packageSuffix)
-		m := &internal.Module{
-			LegacyModuleInfo: internal.LegacyModuleInfo{
-				ModuleInfo: internal.ModuleInfo{
-					ModulePath:  testModule.module,
-					Version:     testModule.version,
-					VersionType: vtype,
-					CommitTime:  time.Now(),
-				},
-			},
-			LegacyPackages: []*internal.LegacyPackage{{
-				Name: pkgName,
-				Path: pkgPath,
-			}},
+		want := sample.ModulePath
+		if suffix != "" {
+			want = want + "/" + suffix
 		}
-		for d := pkgPath; d != "." && len(d) >= len(testModule.module); d = path.Dir(d) {
-			dir := &internal.Directory{
-				DirectoryMeta: internal.DirectoryMeta{
-					Path: d,
-				},
+		var wantVer int
+		if version == "" {
+			wantVer = 1
+		} else {
+			wantVer, err = strconv.Atoi(strings.TrimPrefix(version, "v"))
+			if err != nil {
+				t.Fatal(err)
 			}
-			if d == pkgPath {
-				dir.Package = &internal.Package{
-					Path:          pkgPath,
-					Name:          pkgName,
-					Documentation: &internal.Documentation{},
-				}
-			}
-			sample.AddDirectory(m, dir)
 		}
-		if err := testDB.InsertModule(ctx, m); err != nil {
-			t.Fatal(err)
-		}
-		requested := m.Version
-		if testModule.isMaster {
-			requested = internal.MasterVersion
-		}
-		if err := testDB.UpsertVersionMap(ctx, &internal.VersionMap{
-			ModulePath:       m.ModulePath,
-			RequestedVersion: requested,
-			ResolvedVersion:  m.Version,
-		}); err != nil {
-			t.Fatal(err)
+		if gotPath != want || gotVer != wantVer {
+			t.Errorf("GetLatestMajorPathForV1Path(%q) = %q, %d, want %q, %d", v1path, gotPath, gotVer, want, wantVer)
 		}
 	}
 
 	for _, test := range []struct {
-		name                    string
-		path, module, version   string
-		wantModule, wantVersion string
-		wantIsPackage           bool
+		name, want string
+		versions   []string
 	}{
 		{
-			name:          "known module and version",
-			path:          "m.com/a",
-			module:        "m.com",
-			version:       "v1.2.0-pre",
-			wantModule:    "m.com",
-			wantVersion:   "v1.2.0-pre",
-			wantIsPackage: true,
+			"want highest major version",
+			"v11",
+			[]string{"", "v2", "v11"},
 		},
 		{
-			name:    "unknown module, known version",
-			path:    "m.com/a/b",
-			version: "v1.1.0",
-			// The path is in two modules at v1.1.0. Prefer the longer one.
-			wantModule:    "m.com/a",
-			wantVersion:   "v1.1.0",
-			wantIsPackage: true,
+			"only v1 version",
+			"",
+			[]string{""},
 		},
 		{
-			name:   "known module, unknown version",
-			path:   "m.com/a",
-			module: "m.com",
-			// Choose the latest release version.
-			wantModule:    "m.com",
-			wantVersion:   "v1.1.0",
-			wantIsPackage: false,
-		},
-		{
-			name: "unknown module and version",
-			path: "m.com/a/b",
-			// Select the latest release version, longest module.
-			wantModule:    "m.com/a",
-			wantVersion:   "v1.1.0",
-			wantIsPackage: true,
-		},
-		{
-			name: "module",
-			path: "m.com",
-			// Select the latest version of the module.
-			wantModule:    "m.com",
-			wantVersion:   "v1.1.0",
-			wantIsPackage: false,
-		},
-		{
-			name:    "longest module",
-			path:    "m.com/a",
-			version: "v1.1.0",
-			// Prefer module m/a over module m, directory a.
-			wantModule:    "m.com/a",
-			wantVersion:   "v1.1.0",
-			wantIsPackage: false, //  m/a is a module
-		},
-		{
-			name:          "directory",
-			path:          "m.com/dir",
-			wantModule:    "m.com",
-			wantVersion:   "v1.0.1",
-			wantIsPackage: false, //  m/dir is a directory
-		},
-		{
-			name:          "module at master version",
-			path:          "m.com",
-			version:       "master",
-			wantModule:    "m.com",
-			wantVersion:   "v1.2.0-pre",
-			wantIsPackage: false,
-		},
-		{
-			name:          "package at master version",
-			path:          "m.com/a",
-			version:       "master",
-			wantModule:    "m.com",
-			wantVersion:   "v1.2.0-pre",
-			wantIsPackage: true,
+			"no v1 version",
+			"v4",
+			[]string{"v4"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if test.module == "" {
-				test.module = internal.UnknownModulePath
+			testDB, release := acquire(t)
+			defer release()
+
+			suffix := "a/b/c"
+
+			for _, v := range test.versions {
+				modpath := sample.ModulePath
+				if v != "" {
+					modpath = modpath + "/" + v
+				}
+				if v == "" {
+					v = sample.VersionString
+				} else {
+					v = v + ".0.0"
+				}
+				m := sample.Module(modpath, v, suffix)
+				MustInsertModule(ctx, t, testDB, m)
 			}
-			if test.version == "" {
-				test.version = internal.LatestVersion
-			}
-			gotModule, gotVersion, gotIsPackage, err := testDB.GetPathInfo(ctx, test.path, test.module, test.version)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if gotModule != test.wantModule || gotVersion != test.wantVersion || gotIsPackage != test.wantIsPackage {
-				t.Errorf("got (%q, %q, %t), want (%q, %q, %t)",
-					gotModule, gotVersion, gotIsPackage,
-					test.wantModule, test.wantVersion, test.wantIsPackage)
-			}
+			t.Run("module", func(t *testing.T) {
+				v1path := sample.ModulePath
+				checkLatest(t, testDB, test.versions, v1path, test.want, test.want)
+			})
+			t.Run("package", func(t *testing.T) {
+				want := test.want
+				if test.want != "" {
+					want += "/"
+				}
+				v1path := sample.ModulePath + "/" + suffix
+				checkLatest(t, testDB, test.versions, v1path, test.want, want+suffix)
+			})
 		})
 	}
 }
 
-func TestGetStdlibPaths(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-	defer ResetTestDB(testDB, t)
+func TestUpsertPathConcurrently(t *testing.T) {
+	// Verify that we get no constraint violations or other errors when
+	// the same path is upserted multiple times concurrently.
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
 
-	// Insert two versions of some stdlib packages.
-	for _, data := range []struct {
-		version  string
-		suffixes []string
-	}{
-		{
-			// earlier version; should be ignored
-			"v1.1.0",
-			[]string{"bad/json"},
-		},
-		{
-			"v1.2.0",
-			[]string{
-				"encoding/json",
-				"archive/json",
-				"net/http",     // no "json"
-				"foo/json/moo", // "json" not the last component
-				"bar/xjson",    // "json" not alone
-				"baz/jsonx",    // ditto
-			},
-		},
-	} {
-		m := sample.Module(stdlib.ModulePath, data.version, data.suffixes...)
-		for _, p := range m.LegacyPackages {
-			p.Imports = nil
-		}
-		if err := testDB.InsertModule(ctx, m); err != nil {
+	const n = 10
+	errc := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			errc <- testDB.db.Transact(ctx, sql.LevelRepeatableRead, func(tx *database.DB) error {
+				id, err := upsertPath(ctx, tx, "a/path")
+				if err != nil {
+					return err
+				}
+				if id == 0 {
+					return errors.New("zero id")
+				}
+				return nil
+			})
+		}()
+
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errc; err != nil {
 			t.Fatal(err)
 		}
 	}
+}
 
-	got, err := testDB.GetStdlibPathsWithSuffix(ctx, "json")
+func TestUpsertPaths(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+
+	check := func(paths []string) {
+		got, err := upsertPathsInTx(ctx, testDB.db, paths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkPathMap(t, got, paths)
+	}
+
+	check([]string{"a", "b", "c"})
+	check([]string{"b", "c", "d", "e"})
+}
+
+func checkPathMap(t *testing.T, got map[string]int, paths []string) {
+	t.Helper()
+	if g, w := len(got), len(paths); g != w {
+		t.Errorf("got %d paths, want %d", g, w)
+		return
+	}
+	for _, p := range paths {
+		g, ok := got[p]
+		if !ok {
+			t.Errorf("missing path %q", p)
+		} else if g == 0 {
+			t.Errorf("path %q has a 0 ID", p)
+		}
+	}
+}
+
+func TestUpsertPathsConcurrently(t *testing.T) {
+	// Verify that we get no constraint violations or other errors when
+	// the same set of paths is upserted multiple times concurrently.
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+
+	const n = 10
+	paths := make([]string, 100)
+	for i := 0; i < len(paths); i++ {
+		paths[i] = fmt.Sprintf("p%d", i)
+	}
+	errc := make(chan error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			start := (10 * i) % len(paths)
+			end := start + 50
+			if end > len(paths) {
+				end = len(paths)
+			}
+			sub := paths[start:end]
+			got, err := upsertPathsInTx(ctx, testDB.db, sub)
+			if err == nil {
+				checkPathMap(t, got, sub)
+
+			}
+			errc <- err
+		}()
+
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errc; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func upsertPathsInTx(ctx context.Context, db *database.DB, paths []string) (map[string]int, error) {
+	var m map[string]int
+	err := db.Transact(ctx, sql.LevelRepeatableRead, func(tx *database.DB) error {
+		var err error
+		m, err = upsertPaths(ctx, tx, paths)
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	want := []string{"archive/json", "encoding/json"}
-	if !cmp.Equal(got, want) {
-		t.Errorf("got %v, want %v", got, want)
-	}
+	return m, nil
 }

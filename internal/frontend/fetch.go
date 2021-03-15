@@ -14,15 +14,13 @@ import (
 	"sync"
 	"time"
 
-	"go.opencensus.io/plugin/ochttp"
+	"github.com/google/safehtml/template"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
 	"golang.org/x/mod/module"
-	"golang.org/x/mod/semver"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
-	"golang.org/x/pkgsite/internal/experiment"
 	"golang.org/x/pkgsite/internal/fetch"
 	"golang.org/x/pkgsite/internal/log"
 	"golang.org/x/pkgsite/internal/postgres"
@@ -42,8 +40,6 @@ var (
 	fetchTimeout                = 30 * time.Second
 	pollEvery                   = 1 * time.Second
 
-	// keyFetchVersion is a census tag for frontend fetch version types.
-	keyFetchVersion = tag.MustNewKey("frontend-fetch.version")
 	// keyFetchStatus is a census tag for frontend fetch status types.
 	keyFetchStatus = tag.MustNewKey("frontend-fetch.status")
 	// frontendFetchLatency holds observed latency in individual
@@ -53,12 +49,22 @@ var (
 		"Latency of a frontend fetch request.",
 		stats.UnitMilliseconds,
 	)
+
 	// FetchLatencyDistribution aggregates frontend fetch request
 	// latency by status code.
 	FetchLatencyDistribution = &view.View{
-		Name:        "go-discovery/frontend-fetch/latency",
-		Measure:     frontendFetchLatency,
-		Aggregation: ochttp.DefaultLatencyDistribution,
+		Name:    "go-discovery/frontend-fetch/latency",
+		Measure: frontendFetchLatency,
+		// Modified from ochttp.DefaultLatencyDistribution to remove high
+		// values. Because our unit is seconds rather than milliseconds, the
+		// high values are too large (100000 = 27 hours). The main consequence
+		// is that the Fetch Latency heatmap on the dashboard is less
+		// informative.
+		Aggregation: view.Distribution(
+			1, 2, 3, 4, 5, 6, 8, 10, 13, 16, 20, 25, 30, 40, 50, 65, 80, 100,
+			130, 160, 200, 250, 300, 400, 500, 650, 800, 1000,
+			30*60, // half hour: the max time an HTTP task can run
+			60*60),
 		Description: "FrontendFetch latency, by result source query type.",
 		TagKeys:     []tag.Key{keyFetchStatus},
 	}
@@ -87,8 +93,7 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, ds internal.
 		// There's no reason for the proxydatasource to need this codepath.
 		return proxydatasourceNotSupportedErr()
 	}
-	ctx := r.Context()
-	if !isActiveFrontendFetch(ctx) || r.Method != http.MethodPost {
+	if r.Method != http.MethodPost {
 		// If the experiment flag is not on, or the user makes a GET request,
 		// treat this as a request for the "fetch" package, which does not
 		// exist.
@@ -100,10 +105,7 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, ds internal.
 	if err != nil {
 		return &serverError{status: http.StatusBadRequest}
 	}
-	if !isActivePathAtMaster(ctx) && urlInfo.requestedVersion == internal.MasterVersion {
-		return &serverError{status: http.StatusBadRequest}
-	}
-	if !isSupportedVersion(ctx, urlInfo.fullPath, urlInfo.requestedVersion) ||
+	if !isSupportedVersion(urlInfo.fullPath, urlInfo.requestedVersion) ||
 		// TODO(https://golang.org/issue/39973): add support for fetching the
 		// latest and master versions of the standard library.
 		(stdlib.Contains(urlInfo.fullPath) && urlInfo.requestedVersion == internal.LatestVersion) {
@@ -117,10 +119,11 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, ds internal.
 }
 
 type fetchResult struct {
-	modulePath string
-	goModPath  string
-	status     int
-	err        error
+	modulePath   string
+	goModPath    string
+	status       int
+	err          error
+	responseText string
 }
 
 func (s *Server) fetchAndPoll(ctx context.Context, ds internal.DataSource, modulePath, fullPath, requestedVersion string) (status int, responseText string) {
@@ -128,10 +131,10 @@ func (s *Server) fetchAndPoll(ctx context.Context, ds internal.DataSource, modul
 	defer func() {
 		log.Infof(ctx, "fetchAndPoll(ctx, ds, q, %q, %q, %q): status=%d, responseText=%q",
 			modulePath, fullPath, requestedVersion, status, responseText)
-		recordFrontendFetchMetric(ctx, status, requestedVersion, time.Since(start))
+		recordFrontendFetchMetric(ctx, status, time.Since(start))
 	}()
 
-	if !isSupportedVersion(ctx, fullPath, requestedVersion) ||
+	if !isSupportedVersion(fullPath, requestedVersion) ||
 		// TODO(https://golang.org/issue/39973): add support for fetching the
 		// latest and master versions of the standard library
 		(stdlib.Contains(fullPath) && requestedVersion == internal.LatestVersion) {
@@ -146,17 +149,19 @@ func (s *Server) fetchAndPoll(ctx context.Context, ds internal.DataSource, modul
 		if errors.As(err, &serr) {
 			return serr.status, http.StatusText(serr.status)
 		}
+		log.Errorf(ctx, "fetchAndPoll(ctx, ds, q, %q, %q, %q): %v", modulePath, fullPath, requestedVersion, err)
 		return http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError)
 	}
 	results := s.checkPossibleModulePaths(ctx, db, fullPath, requestedVersion, modulePaths, true)
-	// If the context timed out or was canceled before all of the requests
-	// finished, return an error letting the user to check back later. The
-	// worker will still be processing the modules in the background.
-	if ctx.Err() != nil {
-		return http.StatusRequestTimeout,
-			fmt.Sprintf("We're still working on “%s”. Come back in a few minutes!", displayPath(fullPath, requestedVersion))
+	fr, err := resultFromFetchRequest(results, fullPath, requestedVersion)
+	if err != nil {
+		log.Errorf(ctx, "fetchAndPoll(ctx, ds, q, %q, %q, %q): %v", modulePath, fullPath, requestedVersion, err)
+		return http.StatusInternalServerError, http.StatusText(http.StatusInternalServerError)
 	}
-	return fetchRequestStatusAndResponseText(results, fullPath, requestedVersion)
+	if fr.status == derrors.ToStatus(derrors.AlternativeModule) {
+		fr.status = http.StatusNotFound
+	}
+	return fr.status, fr.responseText
 }
 
 // checkPossibleModulePaths checks all modulePaths at the requestedVersion, to see
@@ -184,16 +189,20 @@ func (s *Server) checkPossibleModulePaths(ctx context.Context, db *postgres.DB,
 			// have already attempted to fetch it in the past. If so, just
 			// return the result from that fetch process.
 			fr := checkForPath(ctx, db, fullPath, modulePath, requestedVersion, s.taskIDChangeInterval)
+			log.Debugf(ctx, "initial checkForPath(ctx, db, %q, %q, %q, %d): status=%d, err=%v", fullPath, modulePath, requestedVersion, s.taskIDChangeInterval, fr.status, fr.err)
 			if !shouldQueue || fr.status != statusNotFoundInVersionMap {
 				results[i] = fr
 				return
 			}
+
 			// A row for this modulePath and requestedVersion combination does not
 			// exist in version_map. Enqueue the module version to be fetched.
-			if err := s.queue.ScheduleFetch(ctx, modulePath, requestedVersion, "", s.taskIDChangeInterval); err != nil {
+			if _, err := s.queue.ScheduleFetch(ctx, modulePath, requestedVersion, "", false); err != nil {
 				fr.err = err
 				fr.status = http.StatusInternalServerError
 			}
+			log.Debugf(ctx, "queued %s@%s to frontend-fetch task queue", modulePath, requestedVersion)
+
 			// After the fetch request is enqueued, poll the database until it has been
 			// inserted or the request times out.
 			fr = pollForPath(ctx, db, pollEvery, fullPath, modulePath, requestedVersion, s.taskIDChangeInterval)
@@ -209,7 +218,7 @@ func (s *Server) checkPossibleModulePaths(ctx context.Context, db *postgres.DB,
 	return results
 }
 
-// fetchRequestStatusAndResponseText returns the HTTP status code and response
+// resultFromFetchRequest returns the HTTP status code and response
 // text from the results of fetching possible module paths for fullPath at the
 // requestedVersion. It is assumed the results are sorted in order of
 // decreasing modulePath length, so the first result that is not a
@@ -217,7 +226,12 @@ func (s *Server) checkPossibleModulePaths(ctx context.Context, db *postgres.DB,
 // path was found that shares the path prefix of fullPath, the responseText will
 // contain that information. The status and responseText will be displayed to the
 // user.
-func fetchRequestStatusAndResponseText(results []*fetchResult, fullPath, requestedVersion string) (int, string) {
+func resultFromFetchRequest(results []*fetchResult, fullPath, requestedVersion string) (_ *fetchResult, err error) {
+	defer derrors.Wrap(&err, "resultFromFetchRequest(results, %q, %q)", fullPath, requestedVersion)
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no results")
+	}
+
 	var moduleMatchingPathPrefix string
 	for _, fr := range results {
 		switch fr.status {
@@ -225,15 +239,51 @@ func fetchRequestStatusAndResponseText(results []*fetchResult, fullPath, request
 		// appropriate result is found, return. Otherwise, look at the next
 		// path.
 		case http.StatusOK:
-			return fr.status, ""
+			if fr.err == nil {
+				return fr, nil
+			}
+		case http.StatusRequestTimeout:
+			// If the context timed out or was canceled before all of the requests
+			// finished, return an error letting the user to check back later. The
+			// worker will still be processing the modules in the background.
+			fr.responseText = fmt.Sprintf("We're still working on “%s”. Check back in a few minutes!", displayPath(fullPath, requestedVersion))
+			return fr, nil
 		case http.StatusInternalServerError:
-			return fr.status, "Oops! Something went wrong."
+			fr.responseText = "Oops! Something went wrong."
+			return fr, nil
 		case derrors.ToStatus(derrors.AlternativeModule):
-			// TODO(https://golang.org/issue/40306): Make the canonical module
-			// path a clickable link.
-			return http.StatusSeeOther,
-				fmt.Sprintf("“%s” is not a valid package or module. Were you looking for “%s”?",
-					displayPath(fullPath, requestedVersion), fr.goModPath)
+			if err := module.CheckPath(fr.goModPath); err != nil {
+				fr.status = http.StatusNotFound
+				fr.responseText = fmt.Sprintf(`%q does not have a valid module path (%q).`, fullPath, fr.goModPath)
+				return fr, nil
+			}
+			t := template.Must(template.New("").Parse(`{{.}}`))
+			h, err := t.ExecuteToHTML(fmt.Sprintf("%s is not a valid path. Were you looking for “<a href='https://pkg.go.dev/%s'>%s</a>”?",
+				displayPath(fullPath, requestedVersion), fr.goModPath, fr.goModPath))
+			if err != nil {
+				fr.status = http.StatusInternalServerError
+				return fr, err
+			}
+			fr.responseText = h.String()
+			return fr, nil
+		case derrors.ToStatus(derrors.BadModule):
+			// There are 3 categories of 490 errors that we see:
+			// - module contains 0 packages
+			// - empty commit time
+			// - zip.NewReader: zip: not a valid zip file: bad module
+			//   (only seen for foo.maxj.us/oops.fossil)
+			//
+			// Provide a specific message for the first error.
+			fr.status = http.StatusNotFound
+			p := fullPath
+			if requestedVersion != internal.LatestVersion {
+				p = fullPath + "@" + requestedVersion
+			}
+			fr.responseText = fmt.Sprintf("%s could not be processed.", p)
+			if fr.err != nil && strings.Contains(fr.err.Error(), fetch.ErrModuleContainsNoPackages.Error()) {
+				fr.responseText = fmt.Sprintf("There are no packages in module %s.", p)
+			}
+			return fr, nil
 		}
 
 		// A module was found for a prefix of the path, but the path did not exist
@@ -246,20 +296,32 @@ func fetchRequestStatusAndResponseText(results []*fetchResult, fullPath, request
 			moduleMatchingPathPrefix = fr.modulePath
 		}
 	}
+
+	fr := results[0]
 	if moduleMatchingPathPrefix != "" {
-		// TODO(https://golang.org/issue/40306): Make the link clickable.
-		return http.StatusNotFound,
-			fmt.Sprintf("Package “%s” could not be found, but you can view module “%s” at https://pkg.go.dev/mod/%s.",
-				displayPath(fullPath, requestedVersion),
-				displayPath(moduleMatchingPathPrefix, requestedVersion),
-				displayPath(moduleMatchingPathPrefix, requestedVersion),
-			)
+		t := template.Must(template.New("").Parse(`{{.}}`))
+		h, err := t.ExecuteToHTML(fmt.Sprintf(`
+		    <div class="Error-message">%s could not be found.</div>
+		    <div class="Error-message">However, you can view <a href="https://pkg.go.dev/%s">module %s</a>.</div>`,
+			displayPath(fullPath, requestedVersion),
+			displayPath(moduleMatchingPathPrefix, requestedVersion),
+			displayPath(moduleMatchingPathPrefix, requestedVersion),
+		))
+		if err != nil {
+			fr.status = http.StatusInternalServerError
+			return fr, err
+		}
+		fr.status = http.StatusNotFound
+		fr.responseText = h.String()
+		return fr, nil
 	}
 	p := fullPath
 	if requestedVersion != internal.LatestVersion {
 		p = fullPath + "@" + requestedVersion
 	}
-	return http.StatusNotFound, fmt.Sprintf("%q could not be found.", p)
+	fr.status = http.StatusNotFound
+	fr.responseText = fmt.Sprintf("%q could not be found.", p)
+	return fr, nil
 }
 
 func displayPath(path, version string) string {
@@ -345,6 +407,7 @@ func checkForPath(ctx context.Context, db *postgres.DB,
 		status:     vm.Status,
 		goModPath:  vm.GoModPath,
 	}
+
 	switch fr.status {
 	case http.StatusNotFound,
 		derrors.ToStatus(derrors.DBModuleInsertInvalid),
@@ -366,8 +429,12 @@ func checkForPath(ctx context.Context, db *postgres.DB,
 			fr.status = statusNotFoundInVersionMap
 			return fr
 		}
-		// The version_map indicates that the proxy returned a 404/410.
-		fr.err = errModuleDoesNotExist
+		if fr.status == http.StatusInternalServerError {
+			fr.err = fmt.Errorf("%q: %v", http.StatusText(fr.status), vm.Error)
+		} else {
+			// The version_map indicates that the proxy returned a 404/410.
+			fr.err = errModuleDoesNotExist
+		}
 		return fr
 	case derrors.ToStatus(derrors.AlternativeModule):
 		// The row indicates that the provided module path did not match the
@@ -385,7 +452,7 @@ func checkForPath(ctx context.Context, db *postgres.DB,
 		}
 		// All remaining non-200 statuses will be in the 40x range.
 		// In that case, just return a not found error.
-		if fr.status > 400 {
+		if fr.status >= 400 {
 			fr.status = http.StatusNotFound
 			fr.err = errModuleDoesNotExist
 			return
@@ -396,7 +463,7 @@ func checkForPath(ctx context.Context, db *postgres.DB,
 	// was 200 or 290).  Now check the paths table to see if the fullPath exists.
 	// vm.status for the module version was either a 200 or 290. Now determine if
 	// the fullPath exists in that module.
-	if _, _, _, err := db.GetPathInfo(ctx, fullPath, modulePath, vm.ResolvedVersion); err != nil {
+	if _, err := db.GetUnitMeta(ctx, fullPath, modulePath, vm.ResolvedVersion); err != nil {
 		if errors.Is(err, derrors.NotFound) {
 			// The module version exists, but the fullPath does not exist in
 			// that module version.
@@ -404,7 +471,7 @@ func checkForPath(ctx context.Context, db *postgres.DB,
 			fr.status = http.StatusNotFound
 			return fr
 		}
-		// Something went wrong when we made the DB request to ds.GetPathInfo.
+		// Something went wrong when we made the DB request to ds.GetUnitMeta.
 		fr.status = http.StatusInternalServerError
 		fr.err = err
 		return fr
@@ -424,7 +491,7 @@ func modulePathsToFetch(ctx context.Context, ds internal.DataSource, fullPath, m
 	if modulePath != internal.UnknownModulePath {
 		return []string{modulePath}, nil
 	}
-	modulePath, _, _, err = ds.GetPathInfo(ctx, fullPath, modulePath, internal.LatestVersion)
+	um, err := ds.GetUnitMeta(ctx, fullPath, modulePath, internal.LatestVersion)
 	if err != nil && !errors.Is(err, derrors.NotFound) {
 		return nil, &serverError{
 			status: http.StatusInternalServerError,
@@ -432,7 +499,7 @@ func modulePathsToFetch(ctx context.Context, ds internal.DataSource, fullPath, m
 		}
 	}
 	if err == nil {
-		return []string{modulePath}, nil
+		return []string{um.ModulePath}, nil
 	}
 	return candidateModulePaths(fullPath)
 }
@@ -443,36 +510,33 @@ var vcsHostsWithThreeElementRepoName = map[string]bool{
 	"gitee.com":     true,
 	"github.com":    true,
 	"gitlab.com":    true,
-	"golang.org":    true,
 }
+
+// maxPathsToFetch is the number of modulePaths that are fetched from a single
+// fetch request. The longest module path we've seen in our database had 7 path
+// elements. maxPathsToFetch is set to 10 as a buffer.
+var maxPathsToFetch = 10
 
 // candidateModulePaths returns the potential module paths that could contain
 // the fullPath. The paths are returned in reverse length order.
 func candidateModulePaths(fullPath string) (_ []string, err error) {
-	var (
-		path        string
-		modulePaths []string
-	)
-	parts := strings.Split(fullPath, "/")
-	if _, ok := vcsHostsWithThreeElementRepoName[parts[0]]; ok {
-		if len(parts) < 3 {
-			return nil, &serverError{
-				status: http.StatusBadRequest,
-				err:    fmt.Errorf("invalid path: %q", fullPath),
-			}
+	if !isValidPath(fullPath) {
+		return nil, &serverError{
+			status: http.StatusBadRequest,
+			err:    fmt.Errorf("isValidPath(%q): false", fullPath),
 		}
-		path = strings.Join(parts[0:2], "/") + "/"
-		parts = parts[2:]
 	}
-	for _, part := range parts {
-		path += part
-		if err := module.CheckImportPath(path); err != nil {
-			continue
+	paths := internal.CandidateModulePaths(fullPath)
+	if paths == nil {
+		return nil, &serverError{
+			status: http.StatusBadRequest,
+			err:    fmt.Errorf("invalid path: %q", fullPath),
 		}
-		modulePaths = append([]string{path}, modulePaths...)
-		path += "/"
 	}
-	return modulePaths, nil
+	if len(paths) > maxPathsToFetch {
+		return paths[len(paths)-maxPathsToFetch:], nil
+	}
+	return paths, nil
 }
 
 // FetchAndUpdateState is used by the InMemory queue for testing in
@@ -491,14 +555,17 @@ func FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion strin
 	}()
 
 	fr := fetch.FetchModule(ctx, modulePath, requestedVersion, proxyClient, sourceClient)
+	defer fr.Defer()
 	if fr.Error == nil {
 		// Only attempt to insert the module into module_version_states if the
 		// fetch process was successful.
-		if err := db.InsertModule(ctx, fr.Module); err != nil {
-			return http.StatusInternalServerError, err
+		if _, err := db.InsertModule(ctx, fr.Module); err != nil {
+			fr.Status = http.StatusInternalServerError
+			log.Errorf(ctx, "FetchAndUpdateState(%q, %q): db.InsertModule failed: %v", modulePath, requestedVersion, err)
 		}
 		log.Infof(ctx, "FetchAndUpdateState(%q, %q): db.InsertModule succeeded", modulePath, requestedVersion)
 	}
+
 	var errMsg string
 	if fr.Error != nil {
 		errMsg = fr.Error.Error()
@@ -520,21 +587,10 @@ func FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion strin
 	return http.StatusOK, nil
 }
 
-func isActiveFrontendFetch(ctx context.Context) bool {
-	return experiment.IsActive(ctx, internal.ExperimentFrontendFetch) &&
-		experiment.IsActive(ctx, internal.ExperimentUsePathInfo)
-}
-
-func recordFrontendFetchMetric(ctx context.Context, status int, requestedVersion string, latency time.Duration) {
+func recordFrontendFetchMetric(ctx context.Context, status int, latency time.Duration) {
 	l := float64(latency) / float64(time.Millisecond)
 
-	// Tag versions based on latest, master and semver.
-	v := requestedVersion
-	if semver.IsValid(v) {
-		v = "semver"
-	}
 	stats.RecordWithTags(ctx, []tag.Mutator{
 		tag.Upsert(keyFetchStatus, strconv.Itoa(status)),
-		tag.Upsert(keyFetchVersion, v),
 	}, frontendFetchLatency.M(l))
 }

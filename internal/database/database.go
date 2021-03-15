@@ -15,10 +15,9 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-	"unicode"
 
+	"github.com/jackc/pgconn"
 	"github.com/lib/pq"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/log"
@@ -47,7 +46,10 @@ func Open(driverName, dbinfo, instanceID string) (_ *DB, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
 		return nil, err
 	}
 	return New(db, instanceID), nil
@@ -56,6 +58,10 @@ func Open(driverName, dbinfo, instanceID string) (_ *DB, err error) {
 // New creates a new DB from a sql.DB.
 func New(db *sql.DB, instanceID string) *DB {
 	return &DB{db: db, instanceID: instanceID}
+}
+
+func (db *DB) Ping() error {
+	return db.db.Ping()
 }
 
 func (db *DB) InTransaction() bool {
@@ -73,10 +79,22 @@ func (db *DB) Close() error {
 	return db.db.Close()
 }
 
-// Exec executes a SQL statement.
-func (db *DB) Exec(ctx context.Context, query string, args ...interface{}) (res sql.Result, err error) {
+// Exec executes a SQL statement and returns the number of rows it affected.
+func (db *DB) Exec(ctx context.Context, query string, args ...interface{}) (_ int64, err error) {
 	defer logQuery(ctx, query, args, db.instanceID)(&err)
+	res, err := db.execResult(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("RowsAffected: %v", err)
+	}
+	return n, nil
+}
 
+// execResult executes a SQL statement and returns a sql.Result.
+func (db *DB) execResult(ctx context.Context, query string, args ...interface{}) (res sql.Result, err error) {
 	if db.tx != nil {
 		return db.tx.ExecContext(ctx, query, args...)
 	}
@@ -95,6 +113,14 @@ func (db *DB) Query(ctx context.Context, query string, args ...interface{}) (_ *
 // QueryRow runs the query and returns a single row.
 func (db *DB) QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	defer logQuery(ctx, query, args, db.instanceID)(nil)
+	start := time.Now()
+	defer func() {
+		if ctx.Err() != nil {
+			d, _ := ctx.Deadline()
+			msg := fmt.Sprintf("args=%v; elapsed=%q, start=%q, deadline=%q", args, time.Since(start), start, d)
+			log.Errorf(ctx, "QueryRow context error: %v "+msg, ctx.Err())
+		}
+	}()
 	if db.tx != nil {
 		return db.tx.QueryRowContext(ctx, query, args...)
 	}
@@ -161,8 +187,7 @@ func (db *DB) transactWithRetry(ctx context.Context, opts *sql.TxOptions, txFunc
 	const maxRetries = 30
 	for i := 0; i <= maxRetries; i++ {
 		err = db.transact(ctx, opts, txFunc)
-		var perr *pq.Error
-		if errors.As(err, &perr) && perr.Code == serializationFailureCode {
+		if isSerializationFailure(err) {
 			db.mu.Lock()
 			if i > db.maxRetries {
 				db.maxRetries = i
@@ -170,12 +195,32 @@ func (db *DB) transactWithRetry(ctx context.Context, opts *sql.TxOptions, txFunc
 			db.mu.Unlock()
 			continue
 		}
+		if err != nil {
+			log.Debugf(ctx, "transactWithRetry: error type %T: %[1]v", err)
+			if strings.Contains(err.Error(), serializationFailureCode) {
+				return fmt.Errorf("error text has %q but not recognized as serialization failure: type %T, err %v",
+					serializationFailureCode, err, err)
+			}
+		}
 		if i > 0 {
 			log.Debugf(ctx, "retried serializable transaction %d time(s)", i)
 		}
 		return err
 	}
 	return fmt.Errorf("reached max number of tries due to serialization failure (%d)", maxRetries)
+}
+
+func isSerializationFailure(err error) bool {
+	// The underlying error type depends on the driver. Try both pq and pgx types.
+	var perr *pq.Error
+	if errors.As(err, &perr) && perr.Code == serializationFailureCode {
+		return true
+	}
+	var gerr *pgconn.PgError
+	if errors.As(err, &gerr) && gerr.Code == serializationFailureCode {
+		return true
+	}
+	return false
 }
 
 func (db *DB) transact(ctx context.Context, opts *sql.TxOptions, txFunc func(*DB) error) (err error) {
@@ -434,115 +479,6 @@ func buildBulkUpdateQuery(table string, columns, types []string) string {
 		strings.Join(unnests, ", "), // 3
 		columns[0],                  // 4
 	)
-}
-
-// QueryLoggingDisabled stops logging of queries when true.
-// For use in tests only: not concurrency-safe.
-var QueryLoggingDisabled bool
-
-var queryCounter int64 // atomic: per-process counter for unique query IDs
-
-type queryEndLogEntry struct {
-	ID              string
-	Query           string
-	Args            string
-	DurationSeconds float64
-	Error           string `json:",omitempty"`
-}
-
-func logQuery(ctx context.Context, query string, args []interface{}, instanceID string) func(*error) {
-	if QueryLoggingDisabled {
-		return func(*error) {}
-	}
-	const maxlen = 300 // maximum length of displayed query
-
-	// To make the query more compact and readable, replace newlines with spaces
-	// and collapse adjacent whitespace.
-	var r []rune
-	for _, c := range query {
-		if c == '\n' {
-			c = ' '
-		}
-		if len(r) == 0 || !unicode.IsSpace(r[len(r)-1]) || !unicode.IsSpace(c) {
-			r = append(r, c)
-		}
-	}
-	query = string(r)
-	if len(query) > maxlen {
-		query = query[:maxlen] + "..."
-	}
-
-	uid := generateLoggingID(instanceID)
-
-	// Construct a short string of the args.
-	const (
-		maxArgs   = 20
-		maxArgLen = 50
-	)
-	var argStrings []string
-	for i := 0; i < len(args) && i < maxArgs; i++ {
-		s := fmt.Sprint(args[i])
-		if len(s) > maxArgLen {
-			s = s[:maxArgLen] + "..."
-		}
-		argStrings = append(argStrings, s)
-	}
-	if len(args) > maxArgs {
-		argStrings = append(argStrings, "...")
-	}
-	argString := strings.Join(argStrings, ", ")
-
-	log.Debugf(ctx, "%s %s args=%s", uid, query, argString)
-	start := time.Now()
-	return func(errp *error) {
-		dur := time.Since(start)
-		if errp == nil { // happens with queryRow
-			log.Debugf(ctx, "%s done", uid)
-		} else {
-			derrors.Wrap(errp, "DB running query %s", uid)
-			entry := queryEndLogEntry{
-				ID:              uid,
-				Query:           query,
-				Args:            argString,
-				DurationSeconds: dur.Seconds(),
-			}
-			if *errp == nil {
-				log.Debug(ctx, entry)
-			} else {
-				entry.Error = (*errp).Error()
-				log.Error(ctx, entry)
-			}
-		}
-	}
-}
-
-func (db *DB) logTransaction(ctx context.Context, opts *sql.TxOptions) func(*error) {
-	if QueryLoggingDisabled {
-		return func(*error) {}
-	}
-	uid := generateLoggingID(db.instanceID)
-	isoLevel := "default"
-	if opts != nil {
-		isoLevel = opts.Isolation.String()
-	}
-	log.Debugf(ctx, "%s transaction (isolation %s) started", uid, isoLevel)
-	start := time.Now()
-	return func(errp *error) {
-		log.Debugf(ctx, "%s transaction (isolation %s) finished in %s with error %v",
-			uid, isoLevel, time.Since(start), *errp)
-	}
-}
-
-func generateLoggingID(instanceID string) string {
-	if instanceID == "" {
-		instanceID = "local"
-	} else {
-		// Instance IDs are long strings. The low-order part seems quite random, so
-		// shortening the ID will still likely result in something unique.
-		instanceID = instanceID[len(instanceID)-4:]
-	}
-	n := atomic.AddInt64(&queryCounter, 1)
-	return fmt.Sprintf("%s-%d", instanceID, n)
 }
 
 // emptyStringScanner wraps the functionality of sql.NullString to just write

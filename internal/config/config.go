@@ -10,7 +10,9 @@ package config
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -18,6 +20,8 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,12 +42,44 @@ func GetEnv(key, fallback string) string {
 	return fallback
 }
 
+// GetEnvInt looks up the given key from the environment and expects an integer,
+// returning the integer value if it exists, and otherwise returning the given
+// fallback value.
+// If the environment variable has a value but it can't be parsed as an integer,
+// GetEnvInt terminates the program.
+func GetEnvInt(key string, fallback int) int {
+	if s, ok := os.LookupEnv(key); ok {
+		v, err := strconv.Atoi(s)
+		if err != nil {
+			log.Fatalf("bad value %q for %s: %v", s, key, err)
+		}
+		return v
+	}
+	return fallback
+}
+
+// GetEnvFloat64 looks up the given key from the environment and expects a
+// float64, returning the float64 value if it exists, and otherwise returning
+// the given fallback value.
+func GetEnvFloat64(key string, fallback float64) float64 {
+	if valueStr, ok := os.LookupEnv(key); ok {
+		if value, err := strconv.ParseFloat(valueStr, 64); err == nil {
+			return value
+		}
+	}
+	return fallback
+}
+
 // AppVersionFormat is the expected format of the app version timestamp.
 const AppVersionFormat = "20060102t150405"
 
 // ValidateAppVersion validates that appVersion follows the expected format
 // defined by AppVersionFormat.
 func ValidateAppVersion(appVersion string) error {
+	// Accept GKE versions, which start with the docker image name.
+	if strings.HasPrefix(appVersion, "gcr.io/") {
+		return nil
+	}
 	if _, err := time.Parse(AppVersionFormat, appVersion); err != nil {
 		// Accept alternative version, used by our AppEngine deployment script.
 		const altDateFormat = "2006-01-02t15-04"
@@ -58,12 +94,26 @@ func ValidateAppVersion(appVersion string) error {
 	return nil
 }
 
+const (
+	// BypassQuotaAuthHeader is the header key used by the frontend server to know
+	// that a request can bypass the quota server.
+	BypassQuotaAuthHeader = "X-Go-Discovery-Auth-Bypass-Quota"
+
+	// BypassCacheAuthHeader is the header key used by the frontend server to
+	// know that a request can bypass cache.
+	BypassCacheAuthHeader = "X-Go-Discovery-Auth-Bypass-Cache"
+
+	// BypassErrorReportingHeader is the header key used by the ErrorReporting middleware
+	// to avoid calling the errorreporting service.
+	BypassErrorReportingHeader = "X-Go-Discovery-Bypass-Error-Reporting"
+)
+
 // Config holds shared configuration values used in instantiating our server
 // components.
 type Config struct {
-	// AuthHeader is the header key used by the frontend server to know that a
-	// request is coming from a known source.
-	AuthHeader string
+	// AuthValues is the set of values that could be set on the AuthHeader, in
+	// order to bypass checks by the cache.
+	AuthValues []string
 
 	// Discovery environment variables
 	ProxyURL, IndexURL string
@@ -74,23 +124,31 @@ type Config struct {
 	// AppEngine identifiers
 	ProjectID, ServiceID, VersionID, ZoneID, InstanceID, LocationID string
 
-	// QueueService is used to identify which service Cloud Tasks queue
-	// should send requests to.
-	QueueService string
+	// ServiceAccount is the email of the service account that this process
+	// is running as when on GCP.
+	ServiceAccount string
 
-	GaeEnv string
+	// QueueURL is the URL that the Cloud Tasks queue should send requests to.
+	// It should be used when the worker is not on AppEngine.
+	QueueURL string
+
+	// QueueAudience is used to allow the Cloud Tasks queue to authorize itself
+	// to the worker. It should be the OAuth 2.0 client ID associated with the
+	// IAP that is gating access to the worker.
+	QueueAudience string
 
 	// GoogleTagManagerID is the ID used for GoogleTagManager. It has the
 	// structure GTM-XXXX.
 	GoogleTagManagerID string
 
-	// AppMonitoredResource is the resource for the current GAE app.
-	// See https://cloud.google.com/monitoring/api/resources#tag_gae_app for more
+	// MonitoredResource represents the resource that is running the current binary.
+	// It might be a Google AppEngine app or a Kubernetes pod.
+	// See https://cloud.google.com/monitoring/api/resources for more
 	// details:
 	// "An object representing a resource that can be used for monitoring, logging,
 	// billing, or other purposes. Examples include virtual machine instances,
 	// databases, and storage devices such as disks.""
-	AppMonitoredResource *mrpb.MonitoredResource
+	MonitoredResource *mrpb.MonitoredResource
 
 	// FallbackVersionLabel is used as the VersionLabel when not hosting on
 	// AppEngine.
@@ -99,6 +157,7 @@ type Config struct {
 	DBSecret, DBUser, DBHost, DBPort, DBName string
 	DBSecondaryHost                          string // DB host to use if first one is down
 	DBPassword                               string `json:"-"`
+	DBDriver                                 string
 
 	// Configuration for redis page cache.
 	RedisCacheHost, RedisCachePort string
@@ -112,13 +171,21 @@ type Config struct {
 
 	Quota QuotaSettings
 
-	// TeeproxyAuthValue is the value set by the teeproxy header, so that
-	// the frontend server knows the source of those requests.
-	TeeproxyAuthValue string
+	// Minimum log level below which no logs will be printed.
+	// Possible values are [debug, info, error, fatal].
+	// In case of invalid/empty value, all logs will be printed.
+	LogLevel string
 
-	// TeeproxyTargetHosts is a list of hosts that teeproxy will forward
-	// requests to.
-	TeeproxyForwardedHosts []string
+	// DynamicConfigLocation is the location (either a file or gs://bucket/object) for
+	// dynamic configuration.
+	DynamicConfigLocation string
+
+	// ServeStats determines whether the server has an endpoint that serves statistics for
+	// benchmarking or other purposes.
+	ServeStats bool
+
+	// DisableErrorReporting disables sending errors to the GCP ErrorReporting system.
+	DisableErrorReporting bool
 }
 
 // AppVersionLabel returns the version label for the current instance.  This is
@@ -134,7 +201,18 @@ func (c *Config) AppVersionLabel() string {
 // OnAppEngine reports if the current process is running in an AppEngine
 // environment.
 func (c *Config) OnAppEngine() bool {
-	return c.GaeEnv == "standard"
+	return os.Getenv("GAE_ENV") == "standard"
+}
+
+// OnGKE reports whether the current process is running on GKE.
+func (c *Config) OnGKE() bool {
+	return os.Getenv("GO_DISCOVERY_ON_GKE") == "true"
+}
+
+// OnGCP reports whether the current process is running on Google Cloud
+// Platform.
+func (c *Config) OnGCP() bool {
+	return c.OnAppEngine() || c.OnGKE()
 }
 
 // StatementTimeout is the value of the Postgres statement_timeout parameter.
@@ -145,10 +223,6 @@ const StatementTimeout = 10 * time.Minute
 // SourceTimeout is the value of the timeout for source.Client, which is used
 // to fetch source code from third party URLs.
 const SourceTimeout = 1 * time.Minute
-
-// TaskIDChangeIntervalWorker is the time period during which a given module
-// version can be re-enqueued to fetch tasks.
-const TaskIDChangeIntervalWorker = 3 * time.Hour
 
 // TaskIDChangeIntervalFrontend is the time period during which a given module
 // version can be re-enqueued to frontend tasks.
@@ -198,6 +272,43 @@ func (c *Config) DebugAddr(dflt string) string {
 	return dflt
 }
 
+// DeploymentEnvironment returns the deployment environment this process
+// is in: usually one of "local", "exp", "dev", "staging" or "prod".
+func (c *Config) DeploymentEnvironment() string {
+	if c.ServiceID == "" {
+		return "local"
+	}
+	parts := strings.SplitN(c.ServiceID, "-", 2)
+	if len(parts) == 1 {
+		return "prod"
+	}
+	if parts[0] == "" {
+		return "unknownEnv"
+	}
+	return parts[0]
+}
+
+// Application returns the name of the running application: "worker",
+// "frontend", etc.
+func (c *Config) Application() string {
+	if c.ServiceID == "" {
+		return "unknownApp"
+	}
+	parts := strings.SplitN(c.ServiceID, "-", 2)
+	var svc string
+	if len(parts) == 1 {
+		svc = parts[0]
+	} else {
+		svc = parts[1]
+	}
+	switch svc {
+	case "default":
+		return "frontend"
+	default:
+		return svc
+	}
+}
+
 // configOverride holds selected config settings that can be dynamically overridden.
 type configOverride struct {
 	DBHost          string
@@ -208,21 +319,18 @@ type configOverride struct {
 
 // QuotaSettings is config for internal/middleware/quota.go
 type QuotaSettings struct {
+	Enable     bool
 	QPS        int // allowed queries per second, per IP block
 	Burst      int // maximum requests per second, per block; the size of the token bucket
 	MaxEntries int // maximum number of entries to keep track of
 	// Record data about blocking, but do not actually block.
 	// This is a *bool, so we can distinguish "not present" from "false" in an override
 	RecordOnly *bool
-	// AuthHeader is the name of the header used by the frontend server to
-	// determine if a request is coming from a known source.
-	AuthHeader string
 	// AuthValues is the set of values that could be set on the AuthHeader, in
 	// order to bypass checks by the quota server.
 	AuthValues []string
+	HMACKey    []byte `json:"-"` // key for obfuscating IPs
 }
-
-const overrideBucket = "go-discovery"
 
 // Init resolves all configuration values provided by the config package. It
 // must be called before any configuration values are used.
@@ -231,19 +339,20 @@ func Init(ctx context.Context) (_ *Config, err error) {
 	// Build a Config from the execution environment, loading some values
 	// from envvars and others from remote services.
 	cfg := &Config{
-		AuthHeader: os.Getenv("GO_DISCOVERY_AUTH_HEADER"),
+		AuthValues: parseCommaList(os.Getenv("GO_DISCOVERY_AUTH_VALUES")),
 		IndexURL:   GetEnv("GO_MODULE_INDEX_URL", "https://index.golang.org/index"),
 		ProxyURL:   GetEnv("GO_MODULE_PROXY_URL", "https://proxy.golang.org"),
 		Port:       os.Getenv("PORT"),
 		DebugPort:  os.Getenv("DEBUG_PORT"),
 		// Resolve AppEngine identifiers
 		ProjectID:          os.Getenv("GOOGLE_CLOUD_PROJECT"),
-		ServiceID:          os.Getenv("GAE_SERVICE"),
-		VersionID:          os.Getenv("GAE_VERSION"),
-		InstanceID:         os.Getenv("GAE_INSTANCE"),
-		GaeEnv:             os.Getenv("GAE_ENV"),
+		ServiceID:          GetEnv("GAE_SERVICE", os.Getenv("GO_DISCOVERY_SERVICE")),
+		VersionID:          GetEnv("GAE_VERSION", os.Getenv("DOCKER_IMAGE")),
+		InstanceID:         GetEnv("GAE_INSTANCE", os.Getenv("GO_DISCOVERY_INSTANCE")),
 		GoogleTagManagerID: os.Getenv("GO_DISCOVERY_GOOGLE_TAG_MANAGER_ID"),
-		QueueService:       GetEnv("GO_DISCOVERY_QUEUE_SERVICE", os.Getenv("GAE_SERVICE")),
+		QueueURL:           os.Getenv("GO_DISCOVERY_QUEUE_URL"),
+		QueueAudience:      os.Getenv("GO_DISCOVERY_QUEUE_AUDIENCE"),
+
 		// LocationID is essentially hard-coded until we figure out a good way to
 		// determine it programmatically, but we check an environment variable in
 		// case it needs to be overridden.
@@ -257,39 +366,83 @@ func Init(ctx context.Context) (_ *Config, err error) {
 		DBPort:               GetEnv("GO_DISCOVERY_DATABASE_PORT", "5432"),
 		DBName:               GetEnv("GO_DISCOVERY_DATABASE_NAME", "discovery-db"),
 		DBSecret:             os.Getenv("GO_DISCOVERY_DATABASE_SECRET"),
+		DBDriver:             GetEnv("GO_DISCOVERY_DATABASE_DRIVER", "postgres"),
 		RedisCacheHost:       os.Getenv("GO_DISCOVERY_REDIS_HOST"),
 		RedisCachePort:       GetEnv("GO_DISCOVERY_REDIS_PORT", "6379"),
 		RedisHAHost:          os.Getenv("GO_DISCOVERY_REDIS_HA_HOST"),
 		RedisHAPort:          GetEnv("GO_DISCOVERY_REDIS_HA_PORT", "6379"),
 		Quota: QuotaSettings{
-			QPS:        10,
-			Burst:      20,
-			MaxEntries: 1000,
-			RecordOnly: func() *bool { t := true; return &t }(),
-			AuthHeader: os.Getenv("GO_DISCOVERY_AUTH_HEADER"),
+			Enable:     os.Getenv("GO_DISCOVERY_ENABLE_QUOTA") == "true",
+			QPS:        GetEnvInt("GO_DISCOVERY_QUOTA_QPS", 10),
+			Burst:      20,   // ignored in redis-based quota implementation
+			MaxEntries: 1000, // ignored in redis-based quota implementation
+			RecordOnly: func() *bool {
+				t := (os.Getenv("GO_DISCOVERY_QUOTA_RECORD_ONLY") != "false")
+				return &t
+			}(),
 			AuthValues: parseCommaList(os.Getenv("GO_DISCOVERY_AUTH_VALUES")),
 		},
-		UseProfiler:            os.Getenv("GO_DISCOVERY_USE_PROFILER") == "TRUE",
-		TeeproxyAuthValue:      os.Getenv("GO_DISCOVERY_TEEPROXY_AUTH_VALUE"),
-		TeeproxyForwardedHosts: parseCommaList(os.Getenv("GO_DISCOVERY_TEEPROXY_FORWARDED_HOSTS")),
+		UseProfiler:           os.Getenv("GO_DISCOVERY_USE_PROFILER") == "true",
+		LogLevel:              os.Getenv("GO_DISCOVERY_LOG_LEVEL"),
+		ServeStats:            os.Getenv("GO_DISCOVERY_SERVE_STATS") == "true",
+		DisableErrorReporting: os.Getenv("GO_DISCOVERY_DISABLE_ERROR_REPORTING") == "true",
 	}
-	cfg.AppMonitoredResource = &mrpb.MonitoredResource{
-		Type: "gae_app",
-		Labels: map[string]string{
-			"project_id": cfg.ProjectID,
-			"module_id":  cfg.ServiceID,
-			"version_id": cfg.VersionID,
-			"zone":       cfg.ZoneID,
-		},
+	bucket := os.Getenv("GO_DISCOVERY_CONFIG_BUCKET")
+	object := os.Getenv("GO_DISCOVERY_CONFIG_DYNAMIC")
+	if bucket != "" {
+		if object == "" {
+			return nil, errors.New("GO_DISCOVERY_CONFIG_DYNAMIC must be set if GO_DISCOVERY_CONFIG_BUCKET is")
+		}
+		cfg.DynamicConfigLocation = fmt.Sprintf("gs://%s/%s", bucket, object)
+	} else {
+		cfg.DynamicConfigLocation = object
 	}
-
-	if cfg.GaeEnv != "" {
+	if cfg.OnGCP() {
 		// Zone is not available in the environment but can be queried via the metadata API.
 		zone, err := gceMetadata(ctx, "instance/zone")
 		if err != nil {
 			return nil, err
 		}
 		cfg.ZoneID = zone
+		sa, err := gceMetadata(ctx, "instance/service-accounts/default/email")
+		if err != nil {
+			return nil, err
+		}
+		cfg.ServiceAccount = sa
+		switch {
+		case cfg.OnAppEngine():
+			// Use the gae_app monitored resource. It would be better to use the
+			// gae_instance monitored resource, but that's not currently supported:
+			// https://cloud.google.com/logging/docs/api/v2/resource-list#resource-types
+			cfg.MonitoredResource = &mrpb.MonitoredResource{
+				Type: "gae_app",
+				Labels: map[string]string{
+					"project_id": cfg.ProjectID,
+					"module_id":  cfg.ServiceID,
+					"version_id": cfg.VersionID,
+					"zone":       cfg.ZoneID,
+				},
+			}
+		case cfg.OnGKE():
+			cfg.MonitoredResource = &mrpb.MonitoredResource{
+				Type: "k8s_container",
+				Labels: map[string]string{
+					"project_id":     cfg.ProjectID,
+					"location":       path.Base(cfg.ZoneID),
+					"cluster_name":   cfg.DeploymentEnvironment() + "-pkgsite",
+					"namespace_name": "default",
+					"pod_name":       os.Getenv("HOSTNAME"),
+					"container_name": cfg.Application(),
+				},
+			}
+		default:
+			return nil, errors.New("on GCP but using an unknown product")
+		}
+	} else { // running locally, perhaps
+		cfg.MonitoredResource = &mrpb.MonitoredResource{
+			Type:   "global",
+			Labels: map[string]string{"project_id": cfg.ProjectID},
+		}
 	}
 	if cfg.DBHost == "" {
 		panic("DBHost is empty; impossible")
@@ -301,18 +454,34 @@ func Init(ctx context.Context) (_ *Config, err error) {
 			return nil, fmt.Errorf("could not get database password secret: %v", err)
 		}
 	}
+	if cfg.Quota.Enable {
+		s, err := secrets.Get(ctx, "quota-hmac-key")
+		if err != nil {
+			return nil, err
+		}
+		hmacKey, err := hex.DecodeString(s)
+		if err != nil {
+			return nil, err
+		}
+		if len(hmacKey) < 16 {
+			return nil, errors.New("HMAC secret must be at least 16 bytes")
+		}
+		cfg.Quota.HMACKey = hmacKey
+	} else {
+		log.Print("quota enforcement disabled")
+	}
 
-	// If GO_DISCOVERY_CONFIG_OVERRIDE is set, it should point to a file
-	// in overrideBucket which provides overrides for selected configuration.
+	// If GO_DISCOVERY_CONFIG_OVERRIDE is set, it should point to a file in a
+	// configured bucket which provides overrides for selected configuration.
 	// Use this when you want to fix something in prod quickly, without waiting
 	// to re-deploy. (Otherwise, do not use it.)
 	overrideObj := os.Getenv("GO_DISCOVERY_CONFIG_OVERRIDE")
 	if overrideObj != "" {
-		overrideBytes, err := readOverrideFile(ctx, overrideBucket, overrideObj)
+		overrideBytes, err := readOverrideFile(ctx, bucket, overrideObj)
 		if err != nil {
 			log.Print(err)
 		} else {
-			log.Printf("processing overrides from gs://%s/%s", overrideBucket, overrideObj)
+			log.Printf("processing overrides from gs://%s/%s", bucket, overrideObj)
 			processOverrides(cfg, overrideBytes)
 		}
 	}
@@ -392,13 +561,15 @@ func chooseOne(configVar string) string {
 }
 
 // gceMetadata reads a metadata value from GCE.
+// For the possible values of name, see
+// https://cloud.google.com/appengine/docs/standard/java/accessing-instance-metadata.
 func gceMetadata(ctx context.Context, name string) (_ string, err error) {
 	// See https://cloud.google.com/appengine/docs/standard/java/accessing-instance-metadata.
 	// (This documentation doesn't exist for Golang, but it seems to work).
 	defer derrors.Wrap(&err, "gceMetadata(ctx, %q)", name)
 
-	const zoneURL = "http://metadata.google.internal/computeMetadata/v1/"
-	req, err := http.NewRequest("GET", zoneURL+name, nil)
+	const metadataURL = "http://metadata.google.internal/computeMetadata/v1/"
+	req, err := http.NewRequest("GET", metadataURL+name, nil)
 	if err != nil {
 		return "", fmt.Errorf("http.NewRequest: %v", err)
 	}

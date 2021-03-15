@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Package experiment provides functionality for experiments.
 package experiment
 
 import (
@@ -42,7 +43,7 @@ func NewSet(experimentNames ...string) *Set {
 	return &Set{set: set}
 }
 
-// NewContext stores the provided experiment set in the context.
+// NewContext stores a set constructed from the provided experiment names in the context.
 func NewContext(ctx context.Context, experimentNames ...string) context.Context {
 	return context.WithValue(ctx, contextKey{}, NewSet(experimentNames...))
 }

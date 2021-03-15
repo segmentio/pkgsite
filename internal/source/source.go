@@ -49,11 +49,18 @@ type Info struct {
 	templates urlTemplates // for building URLs
 }
 
+// RepoURL returns a URL for the home page of the repository.
 func (i *Info) RepoURL() string {
 	if i == nil {
 		return ""
 	}
-	return i.repoURL
+	if i.templates.Repo == "" {
+		// The default repo template is just "{repo}".
+		return i.repoURL
+	}
+	return expand(i.templates.Repo, map[string]string{
+		"repo": i.repoURL,
+	})
 }
 
 // ModuleURL returns a URL for the home page of the module.
@@ -67,9 +74,10 @@ func (i *Info) DirectoryURL(dir string) string {
 		return ""
 	}
 	return strings.TrimSuffix(expand(i.templates.Directory, map[string]string{
-		"repo":   i.repoURL,
-		"commit": i.commit,
-		"dir":    path.Join(i.moduleDir, dir),
+		"repo":       i.repoURL,
+		"importPath": path.Join(strings.TrimPrefix(i.repoURL, "https://"), dir),
+		"commit":     i.commit,
+		"dir":        path.Join(i.moduleDir, dir),
 	}), "/")
 }
 
@@ -78,10 +86,13 @@ func (i *Info) FileURL(pathname string) string {
 	if i == nil {
 		return ""
 	}
+	dir, base := path.Split(pathname)
 	return expand(i.templates.File, map[string]string{
-		"repo":   i.repoURL,
-		"commit": i.commit,
-		"file":   path.Join(i.moduleDir, pathname),
+		"repo":       i.repoURL,
+		"importPath": path.Join(strings.TrimPrefix(i.repoURL, "https://"), dir),
+		"commit":     i.commit,
+		"file":       path.Join(i.moduleDir, pathname),
+		"base":       base,
 	})
 }
 
@@ -90,11 +101,14 @@ func (i *Info) LineURL(pathname string, line int) string {
 	if i == nil {
 		return ""
 	}
+	dir, base := path.Split(pathname)
 	return expand(i.templates.Line, map[string]string{
-		"repo":   i.repoURL,
-		"commit": i.commit,
-		"file":   path.Join(i.moduleDir, pathname),
-		"line":   strconv.Itoa(line),
+		"repo":       i.repoURL,
+		"importPath": path.Join(strings.TrimPrefix(i.repoURL, "https://"), dir),
+		"commit":     i.commit,
+		"file":       path.Join(i.moduleDir, pathname),
+		"base":       base,
+		"line":       strconv.Itoa(line),
 	})
 }
 
@@ -112,8 +126,8 @@ func (i *Info) RawURL(pathname string) string {
 	// Special case: the standard library's source module path is set to "src",
 	// which is correct for source file links. But the README is at the repo
 	// root, not in the src directory. In other words,
-	// VersionInfo.LegacyReadmeFilePath is not relative to
-	// VersionInfo.SourceInfo.moduleDir, as it is for every other module.
+	// Module.Units[0].Readme.FilePath is not relative to
+	// Module.Units[0].SourceInfo.moduleDir, as it is for every other module.
 	// Correct for that here.
 	if i.repoURL == stdlib.GoSourceRepoURL {
 		moduleDir = ""
@@ -178,7 +192,7 @@ func (i *Info) UnmarshalJSON(data []byte) (err error) {
 	if err := json.Unmarshal(data, &ji); err != nil {
 		return err
 	}
-	i.repoURL = ji.RepoURL
+	i.repoURL = trimVCSSuffix(ji.RepoURL)
 	i.moduleDir = ji.ModuleDir
 	i.commit = ji.Commit
 	if ji.Kind != "" {
@@ -191,6 +205,7 @@ func (i *Info) UnmarshalJSON(data []byte) (err error) {
 
 type Client struct {
 	// client used for HTTP requests. It is mutable for testing purposes.
+	// If nil, then moduleInfoDynamic will return nil, nil; also for testing.
 	httpClient *http.Client
 }
 
@@ -202,6 +217,13 @@ func NewClient(timeout time.Duration) *Client {
 			Timeout:   timeout,
 		},
 	}
+}
+
+// NewClientForTesting returns a Client suitable for testing. It returns the
+// same results as an ordinary client for statically recognizable paths, but
+// always returns a nil *Info for dynamic paths (those requiring HTTP requests).
+func NewClientForTesting() *Client {
+	return &Client{}
 }
 
 // doURL makes an HTTP request using the given url and method. It returns an
@@ -228,27 +250,25 @@ func (c *Client) doURL(ctx context.Context, method, url string, only200 bool) (_
 	return resp, nil
 }
 
-// LegacyModuleInfo determines the repository corresponding to the module path. It
+// ModuleInfo determines the repository corresponding to the module path. It
 // returns a URL to that repo, as well as the directory of the module relative
 // to the repo root.
 //
-// LegacyModuleInfo may fetch from arbitrary URLs, so it can be slow.
+// ModuleInfo may fetch from arbitrary URLs, so it can be slow.
 func ModuleInfo(ctx context.Context, client *Client, modulePath, version string) (info *Info, err error) {
-	defer derrors.Wrap(&err, "source.LegacyModuleInfo(ctx, %q, %q)", modulePath, version)
-	ctx, span := trace.StartSpan(ctx, "source.LegacyModuleInfo")
+	defer derrors.Wrap(&err, "source.ModuleInfo(ctx, %q, %q)", modulePath, version)
+	ctx, span := trace.StartSpan(ctx, "source.ModuleInfo")
 	defer span.End()
 
+	// The example.com domain can never be real; it is reserved for testing
+	// (https://en.wikipedia.org/wiki/Example.com). Treat it as if it used
+	// GitHub templates.
+	if strings.HasPrefix(modulePath, "example.com/") {
+		return NewGitHubInfo("https://"+modulePath, "", version), nil
+	}
+
 	if modulePath == stdlib.ModulePath {
-		commit, err := stdlib.TagForVersion(version)
-		if err != nil {
-			return nil, err
-		}
-		return &Info{
-			repoURL:   stdlib.GoSourceRepoURL,
-			moduleDir: stdlib.Directory(version),
-			commit:    commit,
-			templates: githubURLTemplates,
-		}, nil
+		return newStdlibInfo(version)
 	}
 	repo, relativeModulePath, templates, transformCommit, err := matchStatic(modulePath)
 	if err != nil {
@@ -262,16 +282,36 @@ func ModuleInfo(ctx context.Context, client *Client, modulePath, version string)
 			commit = transformCommit(commit, isHash)
 		}
 		info = &Info{
-			repoURL:   "https://" + repo,
+			repoURL:   trimVCSSuffix("https://" + repo),
 			moduleDir: relativeModulePath,
 			commit:    commit,
 			templates: templates,
 		}
 	}
-	adjustVersionedModuleDirectory(ctx, client, info)
+	if info != nil {
+		adjustVersionedModuleDirectory(ctx, client, info)
+	}
 	return info, nil
 	// TODO(golang/go#39627): support launchpad.net, including the special case
 	// in cmd/go/internal/get/vcs.go.
+}
+
+func newStdlibInfo(version string) (_ *Info, err error) {
+	defer derrors.Wrap(&err, "newStdlibInfo(%q)", version)
+
+	commit, err := stdlib.TagForVersion(version)
+	if err != nil {
+		return nil, err
+	}
+
+	templates := googlesourceURLTemplates
+	templates.Raw = "https://github.com/golang/go/raw/{commit}/{file}"
+	return &Info{
+		repoURL:   stdlib.GoSourceRepoURL,
+		moduleDir: stdlib.Directory(version),
+		commit:    commit,
+		templates: templates,
+	}, nil
 }
 
 // matchStatic matches the given module or repo path against a list of known
@@ -296,7 +336,7 @@ func ModuleInfo(ctx context.Context, client *Client, modulePath, version string)
 //   example.com/a/b.git/c
 // then repo="example.com/a/b" and relativeModulePath="c"; the ".git" is omitted, since it is neither
 // part of the repo nor part of the relative path to the module within the repo.
-func matchStatic(moduleOrRepoPath string) (repo, relativeModulePath string, _ urlTemplates, transformCommit func(string, bool) string, _ error) {
+func matchStatic(moduleOrRepoPath string) (repo, relativeModulePath string, _ urlTemplates, transformCommit transformCommitFunc, _ error) {
 	for _, pat := range patterns {
 		matches := pat.re.FindStringSubmatch(moduleOrRepoPath)
 		if matches == nil {
@@ -326,6 +366,10 @@ func matchStatic(moduleOrRepoPath string) (repo, relativeModulePath string, _ ur
 // moduleInfoDynamic uses the go-import and go-source meta tags to construct an Info.
 func moduleInfoDynamic(ctx context.Context, client *Client, modulePath, version string) (_ *Info, err error) {
 	defer derrors.Wrap(&err, "source.moduleInfoDynamic(ctx, client, %q, %q)", modulePath, version)
+
+	if client.httpClient == nil {
+		return nil, nil // for testing
+	}
 
 	sourceMeta, err := fetchMeta(ctx, client, modulePath)
 	if err != nil {
@@ -358,7 +402,12 @@ func moduleInfoDynamic(ctx context.Context, client *Client, modulePath, version 
 		var repo string
 		repo, _, templates, transformCommit, _ = matchStatic(removeHTTPScheme(sourceMeta.dirTemplate))
 		if templates == (urlTemplates{}) {
-			log.Infof(ctx, "no templates for repo URL %q from meta tag: err=%v", sourceMeta.repoURL, err)
+			if err == nil {
+				templates, transformCommit = matchLegacyTemplates(ctx, sourceMeta)
+				repoURL = strings.TrimSuffix(repoURL, ".git")
+			} else {
+				log.Infof(ctx, "no templates for repo URL %q from meta tag: err=%v", sourceMeta.repoURL, err)
+			}
 		} else {
 			// Use the repo from the template, not the original one.
 			repoURL = "https://" + repo
@@ -374,6 +423,63 @@ func moduleInfoDynamic(ctx context.Context, client *Client, modulePath, version 
 		moduleDir: dir,
 		commit:    commit,
 		templates: templates,
+	}, nil
+}
+
+// List of template regexps and their corresponding likely templates,
+// used by matchLegacyTemplates below.
+var legacyTemplateMatches = []struct {
+	fileRegexp      *regexp.Regexp
+	templates       urlTemplates
+	transformCommit transformCommitFunc
+}{
+	{
+		regexp.MustCompile(`/src/branch/\w+\{/dir\}/\{file\}#L\{line\}$`),
+		giteaURLTemplates, giteaTransformCommit,
+	},
+	{
+		regexp.MustCompile(`/src/\w+\{/dir\}/\{file\}#L\{line\}$`),
+		giteaURLTemplates, nil,
+	},
+	{
+		regexp.MustCompile(`/-/blob/\w+\{/dir\}/\{file\}#L\{line\}$`),
+		gitlab2URLTemplates, nil,
+	},
+	{
+		regexp.MustCompile(`/tree\{/dir\}/\{file\}#n\{line\}$`),
+		fdioURLTemplates, fdioTransformCommit,
+	},
+}
+
+// matchLegacyTemplates matches the templates from the go-source meta tag
+// against some known patterns to guess the version-aware URL templates. If it
+// can't find a match, it falls back using the go-source templates with some
+// small replacements. These will not be version-aware but will still serve
+// source at a fixed commit, which is better than nothing.
+func matchLegacyTemplates(ctx context.Context, sm *sourceMeta) (_ urlTemplates, transformCommit transformCommitFunc) {
+	if sm.fileTemplate == "" {
+		return urlTemplates{}, nil
+	}
+	for _, ltm := range legacyTemplateMatches {
+		if ltm.fileRegexp.MatchString(sm.fileTemplate) {
+			return ltm.templates, ltm.transformCommit
+		}
+	}
+	log.Infof(ctx, "matchLegacyTemplates: no matches for repo URL %q; replacing", sm.repoURL)
+	rep := strings.NewReplacer(
+		"{/dir}/{file}", "/{file}",
+		"{dir}/{file}", "{file}",
+		"{/dir}", "/{dir}")
+	line := rep.Replace(sm.fileTemplate)
+	file := line
+	if i := strings.LastIndexByte(line, '#'); i > 0 {
+		file = line[:i]
+	}
+	return urlTemplates{
+		Repo:      sm.repoURL,
+		Directory: rep.Replace(sm.dirTemplate),
+		File:      file,
+		Line:      line,
 	}, nil
 }
 
@@ -426,6 +532,8 @@ func removeVersionSuffix(s string) string {
 	return strings.TrimSuffix(dir, "/")
 }
 
+type transformCommitFunc func(commit string, isHash bool) string
+
 // Patterns for determining repo and URL templates from module paths or repo
 // URLs. Each regexp must match a prefix of the target string, and must have a
 // group named "repo".
@@ -434,7 +542,7 @@ var patterns = []struct {
 	templates urlTemplates
 	re        *regexp.Regexp
 	// transformCommit may alter the commit before substitution
-	transformCommit func(commit string, isHash bool) string
+	transformCommit transformCommitFunc
 }{
 	{
 		pattern:   `^(?P<repo>github\.com/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)`,
@@ -467,30 +575,13 @@ var patterns = []struct {
 		},
 	},
 	{
-		pattern: `^(?P<repo>git\.fd\.io/[a-z0-9A-Z_.\-]+)`,
-		templates: urlTemplates{
-			Directory: "{repo}/tree/{dir}?{commit}",
-			File:      "{repo}/tree/{file}?{commit}",
-			Line:      "{repo}/tree/{file}?{commit}#n{line}",
-			Raw:       "{repo}/plain/{file}?{commit}",
-		},
-		transformCommit: func(commit string, isHash bool) string {
-			// hashes use "?id=", tags use "?h="
-			p := "h"
-			if isHash {
-				p = "id"
-			}
-			return fmt.Sprintf("%s=%s", p, commit)
-		},
+		pattern:         `^(?P<repo>git\.fd\.io/[a-z0-9A-Z_.\-]+)`,
+		templates:       fdioURLTemplates,
+		transformCommit: fdioTransformCommit,
 	},
 	{
-		pattern: `^(?P<repo>git\.pirl\.io/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)`,
-		templates: urlTemplates{
-			Directory: "{repo}/-/tree/{commit}/{dir}",
-			File:      "{repo}/-/blob/{commit}/{file}",
-			Line:      "{repo}/-/blob/{commit}/{file}#L{line}",
-			Raw:       "{repo}/-/raw/{commit}/{file}",
-		},
+		pattern:   `^(?P<repo>git\.pirl\.io/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)`,
+		templates: gitlab2URLTemplates,
 	},
 	{
 		pattern:         `^(?P<repo>gitea\.com/[a-z0-9A-Z_.\-]+/[a-z0-9A-Z_.\-]+)(\.git|$)`,
@@ -521,17 +612,23 @@ var patterns = []struct {
 		// URLs anyway. See gogs/gogs#6242.
 		templates: giteaURLTemplates,
 	},
+
+	{
+		pattern: `^(?P<repo>dmitri\.shuralyov\.com\/.+)$`,
+		templates: urlTemplates{
+			Repo:      "{repo}/...",
+			Directory: "https://gotools.org/{importPath}?rev={commit}",
+			File:      "https://gotools.org/{importPath}?rev={commit}#{base}",
+			Line:      "https://gotools.org/{importPath}?rev={commit}#{base}-L{line}",
+		},
+	},
+
 	// Patterns that match the general go command pattern, where they must have
 	// a ".git" repo suffix in an import path. If matching a repo URL from a meta tag,
 	// there is no ".git".
 	{
-		pattern: `^(?P<repo>[^.]+\.googlesource\.com/[^.]+)(\.git|$)`,
-		templates: urlTemplates{
-			Directory: "{repo}/+/{commit}/{dir}",
-			File:      "{repo}/+/{commit}/{file}",
-			Line:      "{repo}/+/{commit}/{file}#{line}",
-			// Gitiles has no support for serving raw content at this time.
-		},
+		pattern:   `^(?P<repo>[^.]+\.googlesource\.com/[^.]+)(\.git|$)`,
+		templates: googlesourceURLTemplates,
 	},
 	{
 		pattern:   `^(?P<repo>git\.apache\.org/[^.]+)(\.git|$)`,
@@ -567,21 +664,41 @@ func init() {
 // giteaTransformCommit transforms commits for the Gitea code hosting system.
 func giteaTransformCommit(commit string, isHash bool) string {
 	// Hashes use "commit", tags use "tag".
-	// Short hashes aren't currently supported, but we build the URL
-	// anyway in the hope that someday they will be.
+	// Short hashes are supported as of v1.14.0.
 	if isHash {
 		return "commit/" + commit
 	}
 	return "tag/" + commit
 }
 
+func fdioTransformCommit(commit string, isHash bool) string {
+	// hashes use "?id=", tags use "?h="
+	p := "h"
+	if isHash {
+		p = "id"
+	}
+	return fmt.Sprintf("%s=%s", p, commit)
+}
+
 // urlTemplates describes how to build URLs from bits of source information.
 // The fields are exported for JSON encoding.
+//
+// The template variables are:
+//
+// 	• {repo}       - Repository URL with "https://" prefix ("https://example.com/myrepo").
+// 	• {importPath} - Package import path ("example.com/myrepo/mypkg").
+// 	• {commit}     - Tag name or commit hash corresponding to version ("v0.1.0" or "1234567890ab").
+// 	• {dir}        - Path to directory of the package, relative to repo root ("mypkg").
+// 	• {file}       - Path to file containing the identifier, relative to repo root ("mypkg/file.go").
+// 	• {base}       - Base name of file containing the identifier, including file extension ("file.go").
+// 	• {line}       - Line number for the identifier ("41").
+//
 type urlTemplates struct {
-	Directory string // URL template for a directory, with {repo}, {commit} and {dir}
-	File      string // URL template for a file, with {repo}, {commit} and {file}
-	Line      string // URL template for a line, with {repo}, {commit}, {file} and {line}
-	Raw       string // URL template for the raw contents of a file, with {repo}, {repoPath}, {commit} and {file}
+	Repo      string `json:",omitempty"` // Optional URL template for the repository home page, with {repo}. If left empty, a default template "{repo}" is used.
+	Directory string // URL template for a directory, with {repo}, {importPath}, {commit}, {dir}.
+	File      string // URL template for a file, with {repo}, {importPath}, {commit}, {file}, {base}.
+	Line      string // URL template for a line, with {repo}, {importPath}, {commit}, {file}, {base}, {line}.
+	Raw       string // Optional URL template for the raw contents of a file, with {repo}, {commit}, {file}.
 }
 
 var (
@@ -603,6 +720,24 @@ var (
 		File:      "{repo}/src/{commit}/{file}",
 		Line:      "{repo}/src/{commit}/{file}#L{line}",
 		Raw:       "{repo}/raw/{commit}/{file}",
+	}
+	googlesourceURLTemplates = urlTemplates{
+		Directory: "{repo}/+/{commit}/{dir}",
+		File:      "{repo}/+/{commit}/{file}",
+		Line:      "{repo}/+/{commit}/{file}#{line}",
+		// Gitiles has no support for serving raw content at this time.
+	}
+	gitlab2URLTemplates = urlTemplates{
+		Directory: "{repo}/-/tree/{commit}/{dir}",
+		File:      "{repo}/-/blob/{commit}/{file}",
+		Line:      "{repo}/-/blob/{commit}/{file}#L{line}",
+		Raw:       "{repo}/-/raw/{commit}/{file}",
+	}
+	fdioURLTemplates = urlTemplates{
+		Directory: "{repo}/tree/{dir}?{commit}",
+		File:      "{repo}/tree/{file}?{commit}",
+		Line:      "{repo}/tree/{file}?{commit}#n{line}",
+		Raw:       "{repo}/plain/{file}?{commit}",
 	}
 )
 
@@ -627,6 +762,26 @@ func commitFromVersion(vers, relativeModulePath string) (commit string, isHash b
 	}
 }
 
+// trimVCSSuffix removes a VCS suffix from a repo URL in selected cases.
+//
+// The Go command allows a VCS suffix on a repo, like github.com/foo/bar.git. But
+// some code hosting sites don't support all paths constructed from such URLs.
+// For example, GitHub will redirect github.com/foo/bar.git to github.com/foo/bar,
+// but will 404 on github.com/goo/bar.git/tree/master and any other URL with a
+// non-empty path.
+//
+// To be conservative, we remove the suffix only in cases where we know it's
+// wrong.
+func trimVCSSuffix(repoURL string) string {
+	if !strings.HasSuffix(repoURL, ".git") {
+		return repoURL
+	}
+	if strings.HasPrefix(repoURL, "https://github.com/") || strings.HasPrefix(repoURL, "https://gitlab.com/") {
+		return strings.TrimSuffix(repoURL, ".git")
+	}
+	return repoURL
+}
+
 // The following code copied from cmd/go/internal/get:
 
 // expand rewrites s to replace {k} with match[k] for each key k in match.
@@ -645,9 +800,20 @@ func expand(s string, match map[string]string) string {
 // It is for testing only.
 func NewGitHubInfo(repoURL, moduleDir, commit string) *Info {
 	return &Info{
-		repoURL:   repoURL,
+		repoURL:   trimVCSSuffix(repoURL),
 		moduleDir: moduleDir,
 		commit:    commit,
 		templates: githubURLTemplates,
 	}
+}
+
+// NewStdlibInfo returns a source.Info for the standard library at the given
+// semantic version. It panics if the version does not correspond to a Go release
+// tag. It is for testing only.
+func NewStdlibInfo(version string) *Info {
+	info, err := newStdlibInfo(version)
+	if err != nil {
+		panic(err)
+	}
+	return info
 }

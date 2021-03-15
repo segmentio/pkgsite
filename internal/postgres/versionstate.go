@@ -23,13 +23,13 @@ import (
 // InsertIndexVersions inserts new versions into the module_version_states
 // table with a status of zero.
 func (db *DB) InsertIndexVersions(ctx context.Context, versions []*internal.IndexVersion) (err error) {
-	defer derrors.Wrap(&err, "InsertIndexVersions(ctx, %v)", versions)
+	defer derrors.WrapStack(&err, "InsertIndexVersions(ctx, %v)", versions)
 
 	var vals []interface{}
 	for _, v := range versions {
-		vals = append(vals, v.Path, v.Version, version.ForSorting(v.Version), v.Timestamp, 0, "", "")
+		vals = append(vals, v.Path, v.Version, version.ForSorting(v.Version), v.Timestamp, 0, "", "", version.IsIncompatible(v.Version))
 	}
-	cols := []string{"module_path", "version", "sort_version", "index_timestamp", "status", "error", "go_mod_path"}
+	cols := []string{"module_path", "version", "sort_version", "index_timestamp", "status", "error", "go_mod_path", "incompatible"}
 	conflictAction := `
 		ON CONFLICT
 			(module_path, version)
@@ -41,45 +41,59 @@ func (db *DB) InsertIndexVersions(ctx context.Context, versions []*internal.Inde
 	})
 }
 
+type ModuleVersionStateForUpsert struct {
+	ModulePath           string
+	Version              string
+	AppVersion           string
+	Timestamp            time.Time
+	Status               int
+	HasGoMod             bool
+	GoModPath            string
+	FetchErr             error
+	PackageVersionStates []*internal.PackageVersionState
+}
+
 // UpsertModuleVersionState inserts or updates the module_version_state table with
 // the results of a fetch operation for a given module version.
-func (db *DB) UpsertModuleVersionState(ctx context.Context, modulePath, vers, appVersion string, timestamp time.Time, status int, goModPath string, fetchErr error, packageVersionStates []*internal.PackageVersionState) (err error) {
-	defer derrors.Wrap(&err, "UpsertModuleVersionState(ctx, %q, %q, %q, %s, %d, %q, %v",
-		modulePath, vers, appVersion, timestamp, status, goModPath, fetchErr)
+func (db *DB) UpsertModuleVersionState(ctx context.Context, mvs *ModuleVersionStateForUpsert) (err error) {
+	defer derrors.WrapStack(&err, "UpsertModuleVersionState(ctx, %+v", mvs)
 	ctx, span := trace.StartSpan(ctx, "UpsertModuleVersionState")
 	defer span.End()
 
 	var numPackages *int
-	if !(status >= http.StatusBadRequest && status <= http.StatusNotFound) {
+	if !(mvs.Status >= http.StatusBadRequest && mvs.Status <= http.StatusNotFound) {
 		// If a module was fetched a 40x error in this range, we won't know how
 		// many packages it has.
-		n := len(packageVersionStates)
+		n := len(mvs.PackageVersionStates)
 		numPackages = &n
 	}
 
 	return db.db.Transact(ctx, sql.LevelDefault, func(tx *database.DB) error {
-		if err := upsertModuleVersionState(ctx, tx, modulePath, vers, appVersion, numPackages, timestamp, status, goModPath, fetchErr); err != nil {
+		if err := upsertModuleVersionState(ctx, tx, numPackages, mvs); err != nil {
 			return err
 		}
-		if len(packageVersionStates) == 0 {
+		// Sync modules.status if the module exists in the modules table.
+		if err := updateModulesStatus(ctx, tx, mvs.ModulePath, mvs.Version, mvs.Status); err != nil {
+			return err
+		}
+		if len(mvs.PackageVersionStates) == 0 {
 			return nil
 		}
-		return upsertPackageVersionStates(ctx, tx, packageVersionStates)
+		return upsertPackageVersionStates(ctx, tx, mvs.PackageVersionStates)
 	})
 }
 
-func upsertModuleVersionState(ctx context.Context, db *database.DB, modulePath, vers, appVersion string, numPackages *int, timestamp time.Time, status int, goModPath string, fetchErr error) (err error) {
-	defer derrors.Wrap(&err, "upsertModuleVersionState(ctx, %q, %q, %q, %s, %d, %q, %v",
-		modulePath, vers, appVersion, timestamp, status, goModPath, fetchErr)
+func upsertModuleVersionState(ctx context.Context, db *database.DB, numPackages *int, mvs *ModuleVersionStateForUpsert) (err error) {
+	defer derrors.WrapStack(&err, "upsertModuleVersionState(%q, %q, ...)", mvs.ModulePath, mvs.Version)
 	ctx, span := trace.StartSpan(ctx, "upsertModuleVersionState")
 	defer span.End()
 
 	var sqlErrorMsg string
-	if fetchErr != nil {
-		sqlErrorMsg = fetchErr.Error()
+	if mvs.FetchErr != nil {
+		sqlErrorMsg = mvs.FetchErr.Error()
 	}
 
-	result, err := db.Exec(ctx, `
+	affected, err := db.Exec(ctx, `
 			INSERT INTO module_version_states AS mvs (
 				module_path,
 				version,
@@ -87,15 +101,18 @@ func upsertModuleVersionState(ctx context.Context, db *database.DB, modulePath, 
 				app_version,
 				index_timestamp,
 				status,
+				has_go_mod,
 				go_mod_path,
 				error,
-				num_packages)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				num_packages,
+				incompatible)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (module_path, version)
 			DO UPDATE
 			SET
 				app_version=excluded.app_version,
 				status=excluded.status,
+				has_go_mod=excluded.has_go_mod,
 				go_mod_path=excluded.go_mod_path,
 				error=excluded.error,
 				num_packages=excluded.num_packages,
@@ -110,14 +127,11 @@ func upsertModuleVersionState(ctx context.Context, db *database.DB, modulePath, 
 					ELSE
 						CURRENT_TIMESTAMP + INTERVAL '1 hour'
 					END;`,
-		modulePath, vers, version.ForSorting(vers),
-		appVersion, timestamp, status, goModPath, sqlErrorMsg, numPackages)
+		mvs.ModulePath, mvs.Version, version.ForSorting(mvs.Version),
+		mvs.AppVersion, mvs.Timestamp, mvs.Status, mvs.HasGoMod, mvs.GoModPath, sqlErrorMsg, numPackages,
+		version.IsIncompatible(mvs.Version))
 	if err != nil {
 		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("result.RowsAffected(): %v", err)
 	}
 	if affected != 1 {
 		return fmt.Errorf("module version state update affected %d rows, expected exactly 1", affected)
@@ -125,8 +139,29 @@ func upsertModuleVersionState(ctx context.Context, db *database.DB, modulePath, 
 	return nil
 }
 
+// updateModulesStatus updates the status of the module with the given modulePath
+// and version, if it exists, in the modules table.
+func updateModulesStatus(ctx context.Context, db *database.DB, modulePath, resolvedVersion string, status int) (err error) {
+	defer derrors.WrapStack(&err, "updateModulesStatus(%q, %q, %d)", modulePath, resolvedVersion, status)
+
+	query := `UPDATE modules
+			SET
+				status = $1
+			WHERE
+				module_path = $2
+				AND version = $3;`
+	affected, err := db.Exec(ctx, query, status, modulePath, resolvedVersion)
+	if err != nil {
+		return err
+	}
+	if affected > 1 {
+		return fmt.Errorf("module status update affected %d rows, expected at most 1", affected)
+	}
+	return nil
+}
+
 func upsertPackageVersionStates(ctx context.Context, db *database.DB, packageVersionStates []*internal.PackageVersionState) (err error) {
-	defer derrors.Wrap(&err, "upsertPackageVersionStates")
+	defer derrors.WrapStack(&err, "upsertPackageVersionStates")
 	ctx, span := trace.StartSpan(ctx, "upsertPackageVersionStates")
 	defer span.End()
 
@@ -159,7 +194,7 @@ func upsertPackageVersionStates(ctx context.Context, db *database.DB, packageVer
 // LatestIndexTimestamp returns the last timestamp successfully inserted into
 // the module_version_states table.
 func (db *DB) LatestIndexTimestamp(ctx context.Context) (_ time.Time, err error) {
-	defer derrors.Wrap(&err, "LatestIndexTimestamp(ctx)")
+	defer derrors.WrapStack(&err, "LatestIndexTimestamp(ctx)")
 
 	query := `SELECT index_timestamp
 		FROM module_version_states
@@ -189,6 +224,7 @@ const moduleVersionStateColumns = `
 			last_processed_at,
 			next_processed_after,
 			app_version,
+			has_go_mod,
 			go_mod_path,
 			num_packages`
 
@@ -199,14 +235,19 @@ func scanModuleVersionState(scan func(dest ...interface{}) error) (*internal.Mod
 		v               internal.ModuleVersionState
 		lastProcessedAt pq.NullTime
 		numPackages     sql.NullInt64
+		hasGoMod        sql.NullBool
 	)
 	if err := scan(&v.ModulePath, &v.Version, &v.IndexTimestamp, &v.CreatedAt, &v.Status, &v.Error,
-		&v.TryCount, &v.LastProcessedAt, &v.NextProcessedAfter, &v.AppVersion, &v.GoModPath, &numPackages); err != nil {
+		&v.TryCount, &v.LastProcessedAt, &v.NextProcessedAfter, &v.AppVersion, &hasGoMod, &v.GoModPath,
+		&numPackages); err != nil {
 		return nil, err
 	}
 	if lastProcessedAt.Valid {
 		lp := lastProcessedAt.Time
 		v.LastProcessedAt = &lp
+	}
+	if hasGoMod.Valid {
+		v.HasGoMod = hasGoMod.Bool
 	}
 	if numPackages.Valid {
 		n := int(numPackages.Int64)
@@ -240,7 +281,7 @@ func (db *DB) queryModuleVersionStates(ctx context.Context, queryFormat string, 
 
 // GetRecentFailedVersions returns versions that have most recently failed.
 func (db *DB) GetRecentFailedVersions(ctx context.Context, limit int) (_ []*internal.ModuleVersionState, err error) {
-	defer derrors.Wrap(&err, "GetRecentFailedVersions(ctx, %d)", limit)
+	defer derrors.WrapStack(&err, "GetRecentFailedVersions(ctx, %d)", limit)
 
 	queryFormat := `
 		SELECT %s
@@ -254,7 +295,7 @@ func (db *DB) GetRecentFailedVersions(ctx context.Context, limit int) (_ []*inte
 
 // GetRecentVersions returns recent versions that have been processed.
 func (db *DB) GetRecentVersions(ctx context.Context, limit int) (_ []*internal.ModuleVersionState, err error) {
-	defer derrors.Wrap(&err, "GetRecentVersions(ctx, %d)", limit)
+	defer derrors.WrapStack(&err, "GetRecentVersions(ctx, %d)", limit)
 
 	queryFormat := `
 		SELECT %s
@@ -267,8 +308,8 @@ func (db *DB) GetRecentVersions(ctx context.Context, limit int) (_ []*internal.M
 
 // GetModuleVersionState returns the current module version state for
 // modulePath and version.
-func (db *DB) GetModuleVersionState(ctx context.Context, modulePath, version string) (_ *internal.ModuleVersionState, err error) {
-	defer derrors.Wrap(&err, "GetModuleVersionState(ctx, %q, %q)", modulePath, version)
+func (db *DB) GetModuleVersionState(ctx context.Context, modulePath, resolvedVrsion string) (_ *internal.ModuleVersionState, err error) {
+	defer derrors.WrapStack(&err, "GetModuleVersionState(ctx, %q, %q)", modulePath, resolvedVrsion)
 
 	query := fmt.Sprintf(`
 		SELECT %s
@@ -278,7 +319,7 @@ func (db *DB) GetModuleVersionState(ctx context.Context, modulePath, version str
 			module_path = $1
 			AND version = $2;`, moduleVersionStateColumns)
 
-	row := db.db.QueryRow(ctx, query, modulePath, version)
+	row := db.db.QueryRow(ctx, query, modulePath, resolvedVrsion)
 	v, err := scanModuleVersionState(row.Scan)
 	switch err {
 	case nil:
@@ -292,8 +333,8 @@ func (db *DB) GetModuleVersionState(ctx context.Context, modulePath, version str
 
 // GetPackageVersionStatesForModule returns the current package version states
 // for modulePath and version.
-func (db *DB) GetPackageVersionStatesForModule(ctx context.Context, modulePath, version string) (_ []*internal.PackageVersionState, err error) {
-	defer derrors.Wrap(&err, "GetPackageVersionState(ctx, %q, %q)", modulePath, version)
+func (db *DB) GetPackageVersionStatesForModule(ctx context.Context, modulePath, resolvedVersion string) (_ []*internal.PackageVersionState, err error) {
+	defer derrors.WrapStack(&err, "GetPackageVersionState(ctx, %q, %q)", modulePath, resolvedVersion)
 
 	query := `
 		SELECT
@@ -318,7 +359,7 @@ func (db *DB) GetPackageVersionStatesForModule(ctx context.Context, modulePath, 
 		states = append(states, &s)
 		return nil
 	}
-	if err := db.db.RunQuery(ctx, query, collect, modulePath, version); err != nil {
+	if err := db.db.RunQuery(ctx, query, collect, modulePath, resolvedVersion); err != nil {
 		return nil, err
 	}
 	return states, nil
@@ -326,8 +367,8 @@ func (db *DB) GetPackageVersionStatesForModule(ctx context.Context, modulePath, 
 
 // GetPackageVersionState returns the current package version state for
 // pkgPath, modulePath and version.
-func (db *DB) GetPackageVersionState(ctx context.Context, pkgPath, modulePath, version string) (_ *internal.PackageVersionState, err error) {
-	defer derrors.Wrap(&err, "GetPackageVersionState(ctx, %q, %q, %q)", pkgPath, modulePath, version)
+func (db *DB) GetPackageVersionState(ctx context.Context, pkgPath, modulePath, resolvedVersion string) (_ *internal.PackageVersionState, err error) {
+	defer derrors.WrapStack(&err, "GetPackageVersionState(ctx, %q, %q, %q)", pkgPath, modulePath, resolvedVersion)
 
 	query := `
 		SELECT
@@ -344,7 +385,7 @@ func (db *DB) GetPackageVersionState(ctx context.Context, pkgPath, modulePath, v
 			AND version = $3;`
 
 	var pvs internal.PackageVersionState
-	err = db.db.QueryRow(ctx, query, pkgPath, modulePath, version).Scan(
+	err = db.db.QueryRow(ctx, query, pkgPath, modulePath, resolvedVersion).Scan(
 		&pvs.PackagePath, &pvs.ModulePath, &pvs.Version,
 		&pvs.Status, &pvs.Error)
 	switch err {
@@ -368,7 +409,7 @@ type VersionStats struct {
 // information about the current state of module versions, grouping them by
 // their current status code.
 func (db *DB) GetVersionStats(ctx context.Context) (_ *VersionStats, err error) {
-	defer derrors.Wrap(&err, "GetVersionStats(ctx)")
+	defer derrors.WrapStack(&err, "GetVersionStats(ctx)")
 
 	query := `
 		SELECT

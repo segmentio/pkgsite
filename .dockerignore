@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 .dockerignore
 Dockerfile
 docker-compose*
@@ -16,3 +17,17 @@ docker-compose*
 /teeproxy
 /worker
 Makefile
+=======
+# Exclude all git directories.
+**/.git
+# Exclude downloaded node modules.
+node_modules
+# Exclude the private sub-repo...
+private
+# ...except for the config directory.
+!private/config
+# Exclude e2e tests.
+e2e
+# Exclude devtools config.
+devtools/config
+>>>>>>> upstream/master

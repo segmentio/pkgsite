@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/Masterminds/squirrel"
+	"github.com/lib/pq"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/version"
@@ -16,7 +18,7 @@ import (
 
 // UpsertVersionMap inserts a version_map entry into the database.
 func (db *DB) UpsertVersionMap(ctx context.Context, vm *internal.VersionMap) (err error) {
-	defer derrors.Wrap(&err, "DB.UpsertVersionMap(ctx, tx, %q, %q, %q)",
+	defer derrors.WrapStack(&err, "DB.UpsertVersionMap(ctx, tx, %q, %q, %q)",
 		vm.ModulePath, vm.RequestedVersion, vm.ResolvedVersion)
 
 	var moduleID int
@@ -66,27 +68,20 @@ func (db *DB) UpsertVersionMap(ctx context.Context, vm *internal.VersionMap) (er
 // GetVersionMap fetches a version_map entry corresponding to the given
 // modulePath and requestedVersion.
 func (db *DB) GetVersionMap(ctx context.Context, modulePath, requestedVersion string) (_ *internal.VersionMap, err error) {
-	defer derrors.Wrap(&err, "DB.GetVersionMap(ctx, tx, %q, %q)", modulePath, requestedVersion)
+	defer derrors.WrapStack(&err, "DB.GetVersionMap(ctx, tx, %q, %q)", modulePath, requestedVersion)
 	if modulePath == internal.UnknownModulePath {
 		return nil, fmt.Errorf("modulePath must be specified: %w", derrors.InvalidArgument)
 	}
 
-	query := `
-		SELECT
-			module_path,
-			requested_version,
-			resolved_version,
-			go_mod_path,
-			status,
-			error,
-			updated_at
-		FROM
-			version_map
-		WHERE
-			module_path=$1
-			AND requested_version=$2;`
+	q, args, err := versionMapSelect().
+		Where(squirrel.Eq{"module_path": modulePath}).
+		Where(squirrel.Eq{"requested_version": requestedVersion}).
+		PlaceholderFormat(squirrel.Dollar).ToSql()
+	if err != nil {
+		return nil, err
+	}
 	var vm internal.VersionMap
-	err = db.db.QueryRow(ctx, query, modulePath, requestedVersion).Scan(
+	err = db.db.QueryRow(ctx, q, args...).Scan(
 		&vm.ModulePath, &vm.RequestedVersion, &vm.ResolvedVersion, &vm.GoModPath,
 		&vm.Status, &vm.Error, &vm.UpdatedAt)
 	switch err {
@@ -97,4 +92,50 @@ func (db *DB) GetVersionMap(ctx context.Context, modulePath, requestedVersion st
 	default:
 		return nil, err
 	}
+}
+
+// GetVersionMaps returns all of the version maps for the provided
+// path and requested version if they are present.
+func (db *DB) GetVersionMaps(ctx context.Context, paths []string, requestedVersion string) (_ []*internal.VersionMap, err error) {
+	defer derrors.WrapStack(&err, "DB.GetVersionMapsWith4xxStatus(ctx, %v, %q)", paths, requestedVersion)
+
+	var result []*internal.VersionMap
+	versionMaps := map[string]*internal.VersionMap{}
+	collect := func(rows *sql.Rows) error {
+		var vm internal.VersionMap
+		if err := rows.Scan(
+			&vm.ModulePath, &vm.RequestedVersion, &vm.ResolvedVersion, &vm.GoModPath,
+			&vm.Status, &vm.Error, &vm.UpdatedAt); err != nil {
+			return err
+		}
+		if _, ok := versionMaps[vm.ModulePath]; !ok {
+			versionMaps[vm.ModulePath] = &vm
+			result = append(result, &vm)
+		}
+		return nil
+	}
+	q, args, err := versionMapSelect().
+		Where("module_path = ANY(?)", pq.Array(paths)).
+		Where(squirrel.Or{squirrel.Eq{"requested_version": requestedVersion}, squirrel.Eq{"resolved_version": requestedVersion}}).
+		OrderBy("module_path DESC").
+		PlaceholderFormat(squirrel.Dollar).ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("squirrel.ToSql: %v", err)
+	}
+	if err := db.db.RunQuery(ctx, q, collect, args...); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func versionMapSelect() squirrel.SelectBuilder {
+	return squirrel.Select(
+		"module_path",
+		"requested_version",
+		"resolved_version",
+		"go_mod_path",
+		"status",
+		"error",
+		"updated_at",
+	).From("version_map")
 }

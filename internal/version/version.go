@@ -41,6 +41,11 @@ func IsPseudo(v string) bool {
 	return strings.Count(v, "-") >= 2 && pseudoVersionRE.MatchString(v)
 }
 
+// IsIncompatible reports whether a valid version v is an incompatible version.
+func IsIncompatible(v string) bool {
+	return strings.HasSuffix(v, "+incompatible")
+}
+
 // ParseType returns the Type of a given a version.
 func ParseType(version string) (Type, error) {
 	if !semver.IsValid(version) {
@@ -154,4 +159,97 @@ func appendNumericPrefix(dst []byte, n int) []byte {
 		dst = append(dst, byte('a'+rem-1))
 	}
 	return dst
+}
+
+// Later reports whether v1 is later than v2, using semver but preferring
+// release versions to pre-release versions, and both to pseudo-versions.
+func Later(v1, v2 string) bool {
+	rel1 := semver.Prerelease(v1) == ""
+	rel2 := semver.Prerelease(v2) == ""
+	if rel1 && rel2 {
+		return semver.Compare(v1, v2) > 0
+	}
+	if rel1 != rel2 {
+		return rel1
+	}
+	// Both are pre-release.
+	pseudo1 := IsPseudo(v1)
+	pseudo2 := IsPseudo(v2)
+	if pseudo1 == pseudo2 {
+		return semver.Compare(v1, v2) > 0
+	}
+	return !pseudo1
+}
+
+// Latest finds the latest version of a module using the same algorithm as the
+// Go command. It prefers tagged release versions to tagged pre-release
+// versions, and both of those to pseudo-versions. If versions is empty, Latest
+// returns the empty string.
+//
+// hasGoMod should report whether the version it is given has a go.mod file.
+// Latest returns the latest incompatible version only if the latest compatible
+// version does not have a go.mod file.
+//
+// The meaning of latest is defined at
+// https://golang.org/ref/mod#version-queries. That definition does not deal
+// with retractions, or with a subtlety involving incompatible versions. The
+// actual definition is embodied in the go command's queryMatcher.filterVersions
+// method. This function is a re-implementation and specialization of that
+// method at Go version 1.16
+// (https://go.googlesource.com/go/+/refs/tags/go1.16/src/cmd/go/internal/modload/query.go#441).
+func Latest(versions []string, hasGoMod func(v string) (bool, error)) (v string, err error) {
+	latest := LatestOf(versions)
+	if latest == "" {
+		return "", nil
+	}
+
+	// If the latest is a compatible version, use it.
+	if !IsIncompatible(latest) {
+		return latest, nil
+	}
+	// The latest version is incompatible. If there is a go.mod file at the
+	// latest compatible tagged version, assume the module author has adopted
+	// proper versioning, and use that latest compatible version. Otherwise, use
+	// this incompatible version.
+	latestCompat := LatestOf(RemoveIf(versions, func(v string) bool { return IsIncompatible(v) || IsPseudo(v) }))
+	if latestCompat == "" {
+		// No compatible versions; use the latest (incompatible) version.
+		return latest, nil
+	}
+	latestCompatHasGoMod, err := hasGoMod(latestCompat)
+	if err != nil {
+		return "", err
+	}
+	if latestCompatHasGoMod {
+		return latestCompat, nil
+	}
+	return latest, nil
+}
+
+// LatestOf returns the latest version of a module from a list of versions, using
+// the go command's definition of latest: semver is observed, except that
+// release versions are preferred to prerelease, and both are preferred to pseudo-versions.
+// If versions is empty, the empty string is returned.
+func LatestOf(versions []string) string {
+	if len(versions) == 0 {
+		return ""
+	}
+	latest := versions[0]
+	for _, v := range versions[1:] {
+		if Later(v, latest) {
+			latest = v
+		}
+	}
+	return latest
+}
+
+// RemoveIf returns a copy of s that omits all values for which f returns true.
+func RemoveIf(s []string, f func(string) bool) []string {
+	var r []string
+	for _, x := range s {
+		if !f(x) {
+			r = append(r, x)
+		}
+	}
+	return r
 }

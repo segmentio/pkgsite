@@ -2,30 +2,32 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Package worker provides functionality for running a worker service.
+// Its primary operation is to fetch modules from a proxy and write them to the
+// database.
 package worker
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/errorreporting"
-	"github.com/go-redis/redis/v7"
+	"github.com/go-redis/redis/v8"
 	"github.com/google/safehtml/template"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/stats/view"
-	"go.opencensus.io/tag"
 	"go.opencensus.io/trace"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/cache"
 	"golang.org/x/pkgsite/internal/config"
 	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal/godoc/dochtml"
 	"golang.org/x/pkgsite/internal/index"
 	"golang.org/x/pkgsite/internal/log"
 	"golang.org/x/pkgsite/internal/middleware"
@@ -34,72 +36,99 @@ import (
 	"golang.org/x/pkgsite/internal/queue"
 	"golang.org/x/pkgsite/internal/source"
 	"golang.org/x/pkgsite/internal/stdlib"
-	"golang.org/x/sync/errgroup"
 )
 
 // Server can be installed to serve the go discovery worker.
 type Server struct {
-	cfg                  *config.Config
-	indexClient          *index.Client
-	proxyClient          *proxy.Client
-	sourceClient         *source.Client
-	redisHAClient        *redis.Client
-	redisCacheClient     *redis.Client
-	db                   *postgres.DB
-	queue                queue.Queue
-	reportingClient      *errorreporting.Client
-	taskIDChangeInterval time.Duration
-
-	indexTemplate *template.Template
+	cfg             *config.Config
+	indexClient     *index.Client
+	proxyClient     *proxy.Client
+	sourceClient    *source.Client
+	redisHAClient   *redis.Client
+	cache           *cache.Cache
+	db              *postgres.DB
+	queue           queue.Queue
+	reportingClient *errorreporting.Client
+	templates       map[string]*template.Template
+	staticPath      template.TrustedSource
+	getExperiments  func() []*internal.Experiment
 }
 
 // ServerConfig contains everything needed by a Server.
 type ServerConfig struct {
-	DB                   *postgres.DB
-	IndexClient          *index.Client
-	ProxyClient          *proxy.Client
-	SourceClient         *source.Client
-	RedisHAClient        *redis.Client
-	RedisCacheClient     *redis.Client
-	Queue                queue.Queue
-	ReportingClient      *errorreporting.Client
-	TaskIDChangeInterval time.Duration
-	StaticPath           template.TrustedSource
+	DB               *postgres.DB
+	IndexClient      *index.Client
+	ProxyClient      *proxy.Client
+	SourceClient     *source.Client
+	RedisHAClient    *redis.Client
+	RedisCacheClient *redis.Client
+	Queue            queue.Queue
+	ReportingClient  *errorreporting.Client
+	StaticPath       template.TrustedSource
+	GetExperiments   func() []*internal.Experiment
 }
+
+const (
+	indexTemplate    = "index.tmpl"
+	versionsTemplate = "versions.tmpl"
+)
 
 // NewServer creates a new Server with the given dependencies.
 func NewServer(cfg *config.Config, scfg ServerConfig) (_ *Server, err error) {
 	defer derrors.Wrap(&err, "NewServer(db, %+v)", scfg)
-
-	indexTemplate, err := parseTemplate(scfg.StaticPath, template.TrustedSourceFromConstant("index.tmpl"))
+	t1, err := parseTemplate(scfg.StaticPath, template.TrustedSourceFromConstant(indexTemplate))
 	if err != nil {
 		return nil, err
 	}
-
+	t2, err := parseTemplate(scfg.StaticPath, template.TrustedSourceFromConstant(versionsTemplate))
+	if err != nil {
+		return nil, err
+	}
+	dochtml.LoadTemplates(template.TrustedSourceJoin(scfg.StaticPath, template.TrustedSourceFromConstant("html/doc")))
+	templates := map[string]*template.Template{
+		indexTemplate:    t1,
+		versionsTemplate: t2,
+	}
+	var c *cache.Cache
+	if scfg.RedisCacheClient != nil {
+		c = cache.New(scfg.RedisCacheClient)
+	}
 	return &Server{
-		cfg:                  cfg,
-		db:                   scfg.DB,
-		indexClient:          scfg.IndexClient,
-		proxyClient:          scfg.ProxyClient,
-		sourceClient:         scfg.SourceClient,
-		redisHAClient:        scfg.RedisHAClient,
-		redisCacheClient:     scfg.RedisCacheClient,
-		queue:                scfg.Queue,
-		reportingClient:      scfg.ReportingClient,
-		taskIDChangeInterval: scfg.TaskIDChangeInterval,
-		indexTemplate:        indexTemplate,
+		cfg:             cfg,
+		db:              scfg.DB,
+		indexClient:     scfg.IndexClient,
+		proxyClient:     scfg.ProxyClient,
+		sourceClient:    scfg.SourceClient,
+		redisHAClient:   scfg.RedisHAClient,
+		cache:           c,
+		queue:           scfg.Queue,
+		reportingClient: scfg.ReportingClient,
+		templates:       templates,
+		staticPath:      scfg.StaticPath,
+		getExperiments:  scfg.GetExperiments,
 	}, nil
 }
 
 // Install registers server routes using the given handler registration func.
 func (s *Server) Install(handle func(string, http.Handler)) {
 	// rmw wires in error reporting to the handler. It is configured here, in
-	// Install, because not every handler should have error reporting. For
-	// example, we don't want to get an error report each time a /fetch fails.
+	// Install, because not every handler should have error reporting.
 	rmw := middleware.Identity()
 	if s.reportingClient != nil {
 		rmw = middleware.ErrorReporting(s.reportingClient.Report)
 	}
+
+	// Each AppEngine instance is created in response to a start request, which
+	// is an empty HTTP GET request to /_ah/start when scaling is set to manual
+	// or basic, and /_ah/warmup when scaling is automatic and min_instances is
+	// set. AppEngine sends this request to bring an instance into existence.
+	// See details for /_ah/start at
+	// https://cloud.google.com/appengine/docs/standard/go/how-instances-are-managed#startup
+	// and for /_ah/warmup at
+	// https://cloud.google.com/appengine/docs/standard/go/configuring-warmup-requests.
+	handle("/_ah/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Infof(r.Context(), "Request made to %q", r.URL.Path)
+	}))
 
 	// scheduled: poll polls the Module Index for new modules
 	// that have been published and inserts that metadata into
@@ -108,24 +137,11 @@ func (s *Server) Install(handle func(string, http.Handler)) {
 	// See the note about duplicate tasks for "/enqueue" below.
 	handle("/poll", rmw(s.errorHandler(s.handlePollIndex)))
 
-	// TODO: remove after /poll is in production and the scheduler jobs have been changed.
-	// scheduled: poll-and-queue polls the Module Index for new modules
-	// that have been published and inserts that metadata into
-	// module_version_states. It also inserts the version into the task-queue
-	// to to be fetched and processed.
-	// This endpoint is intended to be invoked periodically by a scheduler.
-	// See the note about duplicate tasks for "/requeue" below.
-	handle("/poll-and-queue", rmw(s.errorHandler(s.handleIndexAndQueue)))
-
 	// scheduled: update-imported-by-count update the imported_by_count for
 	// packages in search_documents where imported_by_count_updated_at is null
 	// or imported_by_count_updated_at < version_updated_at.
 	// This endpoint is intended to be invoked periodically by a scheduler.
 	handle("/update-imported-by-count", rmw(s.errorHandler(s.handleUpdateImportedByCount)))
-
-	// scheduled: download search document data and update the redis sorted
-	// set(s) used in auto-completion.
-	handle("/update-redis-indexes", rmw(s.errorHandler(s.handleUpdateRedisIndexes)))
 
 	// task-queue: fetch fetches a module version from the Module Mirror, and
 	// processes the contents, and inserts it into the database. If a fetch
@@ -134,7 +150,12 @@ func (s *Server) Install(handle func(string, http.Handler)) {
 	// fetching module versions that have a terminal error.
 	// This endpoint is intended to be invoked by a task queue with semantics like
 	// Google Cloud Task Queues.
-	handle("/fetch/", http.StripPrefix("/fetch", http.HandlerFunc(s.handleFetch)))
+	handle("/fetch/", http.StripPrefix("/fetch", rmw(http.HandlerFunc(s.handleFetch))))
+
+	// scheduled: fetch-std-master checks if the std@master version in the
+	// database is up to date with the version at HEAD. If not, a fetch request
+	// is queued to refresh the std@master version.
+	handle("/fetch-std-master/", rmw(s.errorHandler(s.handleFetchStdMaster)))
 
 	// scheduled: enqueue queries the module_version_states table for the next
 	// batch of module versions to process, and enqueues them for processing.
@@ -151,7 +172,7 @@ func (s *Server) Install(handle func(string, http.Handler)) {
 	// batch of module versions to process, and enqueues them for processing.
 	// Normally this will not cause duplicate processing, because Cloud Tasks
 	// are de-duplicated. That does not apply after a task has been finished or
-	// deleted for Server.taskIDChangeInterval (see
+	// deleted for about an hour
 	// https://cloud.google.com/tasks/docs/reference/rpc/google.cloud.tasks.v2#createtaskrequest,
 	// under "Task De-duplication"). If you cannot wait, you can force
 	// duplicate tasks by providing any string as the "suffix" query parameter.
@@ -180,14 +201,23 @@ func (s *Server) Install(handle func(string, http.Handler)) {
 	// manual: clear-cache clears the redis cache.
 	handle("/clear-cache", rmw(s.errorHandler(s.clearCache)))
 
-	// manual: update-experiment updates a given experiment.
-	handle("/update-experiment", rmw(s.errorHandler(s.updateExperiment)))
-
 	// manual: delete the specified module version.
 	handle("/delete/", http.StripPrefix("/delete", rmw(s.errorHandler(s.handleDelete))))
 
-	// returns the Worker homepage.
-	handle("/", http.HandlerFunc(s.handleStatusPage))
+	handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir(s.staticPath.String()))))
+
+	// returns an HTML page displaying information about recent versions that were processed.
+	handle("/versions", http.HandlerFunc(s.handleHTMLPage(s.doVersionsPage)))
+
+	// Health check.
+	handle("/healthz", http.HandlerFunc(s.handleHealthCheck))
+
+	handle("/favicon.ico", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "content/static/img/worker-favicon.ico")
+	}))
+
+	// returns an HTML page displaying the homepage.
+	handle("/", http.HandlerFunc(s.handleHTMLPage(s.doIndexPage)))
 }
 
 // handleUpdateImportedByCount updates imported_by_count for all packages.
@@ -241,12 +271,8 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<p><a href="/fetch/rsc.io/quote/@v/v1.0.0">Fetch an example module</a></p>`)
 		return
 	}
-	if r.URL.Path == "/favicon.ico" {
-		return
-	}
-
-	msg, code := s.doFetch(r)
-	if code == http.StatusInternalServerError {
+	msg, code := s.doFetch(w, r)
+	if code == http.StatusInternalServerError || code == http.StatusServiceUnavailable {
 		log.Infof(r.Context(), "doFetch of %s returned %d; returning that code to retry task", r.URL.Path, code)
 		http.Error(w, http.StatusText(code), code)
 		return
@@ -263,17 +289,49 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 }
 
 // doFetch executes a fetch request and returns the msg and status.
-func (s *Server) doFetch(r *http.Request) (string, int) {
-	modulePath, version, err := parseModulePathAndVersion(r.URL.Path)
+func (s *Server) doFetch(w http.ResponseWriter, r *http.Request) (string, int) {
+	ctx := r.Context()
+	modulePath, requestedVersion, err := parseModulePathAndVersion(r.URL.Path)
 	if err != nil {
 		return err.Error(), http.StatusBadRequest
 	}
 
-	code, err := FetchAndUpdateState(r.Context(), modulePath, version, s.proxyClient, s.sourceClient, s.db, s.cfg.AppVersionLabel())
-	if err != nil {
+	f := &Fetcher{
+		ProxyClient:  s.proxyClient,
+		SourceClient: s.sourceClient,
+		DB:           s.db,
+		Cache:        s.cache,
+	}
+	if r.FormValue(queue.DisableProxyFetchParam) == queue.DisableProxyFetchValue {
+		f.ProxyClient = f.ProxyClient.WithFetchDisabled()
+	}
+	code, resolvedVersion, err := f.FetchAndUpdateState(ctx, modulePath, requestedVersion, s.cfg.AppVersionLabel())
+	if code == http.StatusInternalServerError {
+		s.reportError(ctx, err, w, r)
 		return err.Error(), code
 	}
-	return fmt.Sprintf("fetched and updated %s@%s", modulePath, version), code
+	return fmt.Sprintf("fetched and updated %s@%s", modulePath, resolvedVersion), code
+}
+
+// reportError sends the error to the GCP Error Reporting service.
+// TODO(jba): factor out from here and frontend/server.go.
+func (s *Server) reportError(ctx context.Context, err error, w http.ResponseWriter, r *http.Request) {
+	if s.reportingClient == nil {
+		return
+	}
+	// Extract the stack trace from the error if there is one.
+	var stack []byte
+	if serr := (*derrors.StackError)(nil); errors.As(err, &serr) {
+		stack = serr.Stack
+	}
+	s.reportingClient.Report(errorreporting.Entry{
+		Error: err,
+		Req:   r,
+		Stack: stack,
+	})
+	log.Debugf(ctx, "reported error %v with stack size %d", err, len(stack))
+	// Bypass the error-reporting middleware.
+	w.Header().Set(config.BypassErrorReportingHeader, "true")
 }
 
 // parseModulePathAndVersion returns the module and version specified by p. p
@@ -316,58 +374,25 @@ func (s *Server) handlePollIndex(w http.ResponseWriter, r *http.Request) (err er
 		return err
 	}
 	log.Infof(ctx, "Inserted %d modules from the index", len(modules))
+	s.computeProcessingLag(ctx)
 	return nil
 }
 
-func (s *Server) handleIndexAndQueue(w http.ResponseWriter, r *http.Request) (err error) {
-	defer derrors.Wrap(&err, "handleIndexAndQueue(%q)", r.URL.Path)
-	ctx := r.Context()
-	limit := parseLimitParam(r, 10)
-	suffixParam := r.FormValue("suffix")
-	since, err := s.db.LatestIndexTimestamp(ctx)
-	if err != nil {
-		return err
+func (s *Server) computeProcessingLag(ctx context.Context) {
+	ot, err := s.db.StalenessTimestamp(ctx)
+	if errors.Is(err, derrors.NotFound) {
+		recordProcessingLag(ctx, 0)
+	} else if err != nil {
+		log.Warningf(ctx, "StalenessTimestamp: %v", err)
+		return
+	} else {
+		// If the times on this machine and the machine that wrote the index
+		// timestamp into the DB are out of sync, then the difference we compute
+		// here will be off. But that is unlikely since both machines are
+		// running on GCP.
+		recordProcessingLag(ctx, time.Since(ot))
 	}
-	modules, err := s.indexClient.GetVersions(ctx, since, limit)
-	if err != nil {
-		return err
-	}
-	if err := s.db.InsertIndexVersions(ctx, modules); err != nil {
-		return err
-	}
-	log.Infof(ctx, "Scheduling modules to be fetched: %d new modules from index.golang.org", len(modules))
-	for _, version := range modules {
-		if err := s.queue.ScheduleFetch(ctx, version.Path, version.Version, suffixParam, s.taskIDChangeInterval); err != nil {
-			return err
-		}
-	}
-	log.Infof(ctx, "Successfully scheduled modules to be fetched: %d new modules from index.golang.org", len(modules))
-
-	w.Header().Set("Content-Type", "text/plain")
-	for _, v := range modules {
-		fmt.Fprintf(w, "scheduled %s@%s\n", v.Path, v.Version)
-	}
-	return nil
 }
-
-var (
-	// keyEnqueueStatus is a census tag used to keep track of the status
-	// of the modules being enqueued.
-	keyEnqueueStatus = tag.MustNewKey("enqueue.status")
-	enqueueStatus    = stats.Int64(
-		"go-discovery/worker_enqueue_count",
-		"The status of a module version enqueued to Cloud Tasks.",
-		stats.UnitDimensionless,
-	)
-	// EnqueueResponseCount counts worker enqueue responses by response type.
-	EnqueueResponseCount = &view.View{
-		Name:        "go-discovery/worker-enqueue/count",
-		Measure:     enqueueStatus,
-		Aggregation: view.Count(),
-		Description: "Worker enqueue request count",
-		TagKeys:     []tag.Key{keyEnqueueStatus},
-	}
-)
 
 // handleEnqueue queries the module_version_states table for the next batch of
 // module versions to process, and enqueues them for processing. Note that this
@@ -387,155 +412,71 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) (err erro
 	span.Annotate([]trace.Attribute{trace.Int64Attribute("modules to fetch", int64(len(modules)))}, "processed limit")
 	w.Header().Set("Content-Type", "text/plain")
 	log.Infof(ctx, "Scheduling modules to be fetched: queuing %d modules", len(modules))
-	for _, m := range modules {
-		stats.RecordWithTags(r.Context(),
-			[]tag.Mutator{tag.Upsert(keyEnqueueStatus, strconv.Itoa(m.Status))},
-			enqueueStatus.M(int64(m.Status)))
-		if err := s.queue.ScheduleFetch(ctx, m.ModulePath, m.Version, suffixParam, s.taskIDChangeInterval); err != nil {
-			return err
-		}
-	}
-	log.Infof(ctx, "Successfully scheduled modules to be fetched: %d modules queued", len(modules))
 
+	// Enqueue concurrently, because sequentially takes a while.
+	const concurrentEnqueues = 10
+	var (
+		mu                 sync.Mutex
+		nEnqueued, nErrors int
+	)
+	sem := make(chan struct{}, concurrentEnqueues)
+	for _, m := range modules {
+		m := m
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem }()
+			enqueued, err := s.queue.ScheduleFetch(ctx, m.ModulePath, m.Version, suffixParam,
+				shouldDisableProxyFetch(m))
+			mu.Lock()
+			if err != nil {
+				log.Errorf(ctx, "enqueuing: %v", err)
+				nErrors++
+			} else if enqueued {
+				nEnqueued++
+				recordEnqueue(r.Context(), m.Status)
+			}
+			mu.Unlock()
+		}()
+	}
+	// Wait for goroutines to finish.
+	for i := 0; i < concurrentEnqueues; i++ {
+		sem <- struct{}{}
+	}
+	log.Infof(ctx, "Successfully scheduled modules to be fetched: %d modules enqueued, %d errors", nEnqueued, nErrors)
 	return nil
 }
 
-// handleStatusPage serves the worker status page.
-func (s *Server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
-	msg, err := s.doStatusPage(w, r)
-	if err != nil {
-		http.Error(w, msg, http.StatusInternalServerError)
+func shouldDisableProxyFetch(m *internal.ModuleVersionState) bool {
+	// Don't ask the proxy to fetch if this module is being reprocessed.
+	// We use codes 52x and 54x for reprocessing.
+	return m.Status/10 == 52 || m.Status/10 == 54
+}
+
+// handleHTMLPage returns an HTML page using a template from s.templates.
+func (s *Server) handleHTMLPage(f func(w http.ResponseWriter, r *http.Request) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := f(w, r); err != nil {
+			log.Errorf(r.Context(), "handleHTMLPage", err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		}
 	}
 }
 
-// doStatusPage writes the status page. On error it returns the error and a short
-// string to be written back to the client.
-func (s *Server) doStatusPage(w http.ResponseWriter, r *http.Request) (_ string, err error) {
-	defer derrors.Wrap(&err, "doStatusPage")
-	const pageSize = 20
-	var (
-		next, failures, recents []*internal.ModuleVersionState
-		stats                   *postgres.VersionStats
-		experiments             []*internal.Experiment
-		excluded                []string
-	)
-	type annotation struct {
-		error
-		msg string
+func (s *Server) handleFetchStdMaster(w http.ResponseWriter, r *http.Request) error {
+	_, resolvedVersion, _, err := stdlib.Zip("master")
+	if err != nil {
+		return err
 	}
-	g, ctx := errgroup.WithContext(r.Context())
-	g.Go(func() error {
-		var err error
-		next, err = s.db.GetNextModulesToFetch(ctx, pageSize)
-		if err != nil {
-			return annotation{err, "error fetching next versions"}
-		}
-		return nil
-	})
-	g.Go(func() error {
-		var err error
-		failures, err = s.db.GetRecentFailedVersions(ctx, pageSize)
-		if err != nil {
-			return annotation{err, "error fetching recent failures"}
-		}
-		return nil
-	})
-	g.Go(func() error {
-		var err error
-		recents, err = s.db.GetRecentVersions(ctx, pageSize)
-		if err != nil {
-			return annotation{err, "error fetching recent versions"}
-		}
-		return nil
-	})
-	g.Go(func() error {
-		var err error
-		stats, err = s.db.GetVersionStats(ctx)
-		if err != nil {
-			return annotation{err, "error fetching stats"}
-		}
-		return nil
-	})
-	g.Go(func() error {
-		var err error
-		experiments, err = s.db.GetExperiments(ctx)
-		if err != nil {
-			return annotation{err, "error fetching experiments"}
-		}
-		return nil
-	})
-	g.Go(func() error {
-		var err error
-		excluded, err = s.db.GetExcludedPrefixes(ctx)
-		if err != nil {
-			return annotation{err, "error fetching excluded"}
-		}
-		return nil
-	})
-	if err := g.Wait(); err != nil {
-		var e annotation
-		if errors.As(err, &e) {
-			return e.msg, err
-		}
-		return "", err
+	vm, err := s.db.GetVersionMap(r.Context(), stdlib.ModulePath, "master")
+	if err != nil {
+		return err
 	}
-
-	type count struct {
-		Code  int
-		Desc  string
-		Count int
-	}
-	var counts []*count
-	for code, n := range stats.VersionCounts {
-		c := &count{Code: code, Count: n}
-		if e := derrors.FromStatus(code, ""); e != nil && e != derrors.Unknown {
-			c.Desc = e.Error()
+	if vm.ResolvedVersion != resolvedVersion {
+		if _, err := s.queue.ScheduleFetch(r.Context(), stdlib.ModulePath, "master", "", false); err != nil {
+			return fmt.Errorf("error scheduling fetch for %s: %w", "master", err)
 		}
-		counts = append(counts, c)
 	}
-	sort.Slice(counts, func(i, j int) bool { return counts[i].Code < counts[j].Code })
-
-	var env string
-	switch s.cfg.ServiceID {
-	case "":
-		env = "Local"
-	case "dev-etl":
-		env = "Dev"
-	case "staging-etl":
-		env = "Staging"
-	case "etl":
-		env = "Prod"
-	}
-	page := struct {
-		Config                       *config.Config
-		Env                          string
-		ResourcePrefix               string
-		LatestTimestamp              *time.Time
-		Counts                       []*count
-		Next, Recent, RecentFailures []*internal.ModuleVersionState
-		Experiments                  []*internal.Experiment
-		Excluded                     []string
-	}{
-		Config:          s.cfg,
-		Env:             env,
-		ResourcePrefix:  strings.ToLower(env) + "-",
-		LatestTimestamp: &stats.LatestTimestamp,
-		Counts:          counts,
-		Next:            next,
-		Recent:          recents,
-		RecentFailures:  failures,
-		Experiments:     experiments,
-		Excluded:        excluded,
-	}
-	var buf bytes.Buffer
-	if err := s.indexTemplate.Execute(&buf, page); err != nil {
-		return "error rendering template", err
-	}
-	if _, err := io.Copy(w, &buf); err != nil {
-		log.Errorf(ctx, "Error copying buffer to ResponseWriter: %v", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-	}
-	return "", nil
+	return s.db.DeletePseudoversionsExcept(r.Context(), stdlib.ModulePath, vm.ResolvedVersion)
 }
 
 func (s *Server) handlePopulateStdLib(w http.ResponseWriter, r *http.Request) error {
@@ -555,7 +496,7 @@ func (s *Server) doPopulateStdLib(ctx context.Context, suffix string) (string, e
 		return "", err
 	}
 	for _, v := range versions {
-		if err := s.queue.ScheduleFetch(ctx, stdlib.ModulePath, v, suffix, s.taskIDChangeInterval); err != nil {
+		if _, err := s.queue.ScheduleFetch(ctx, stdlib.ModulePath, v, suffix, false); err != nil {
 			return "", fmt.Errorf("error scheduling fetch for %s: %w", v, err)
 		}
 	}
@@ -570,6 +511,19 @@ func (s *Server) handleReprocess(w http.ResponseWriter, r *http.Request) error {
 	if err := config.ValidateAppVersion(appVersion); err != nil {
 		return &serverError{http.StatusBadRequest, fmt.Errorf("config.ValidateAppVersion(%q): %v", appVersion, err)}
 	}
+
+	// Reprocess only the latest version of a module version with a previous
+	// status of 200 or 290.
+	latestOnly := r.FormValue("latest_only") == "true"
+	if latestOnly {
+		if err := s.db.UpdateModuleVersionStatesForReprocessingLatestOnly(r.Context(), appVersion); err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "Scheduled latest version of modules to be reprocessed for appVersion > %q.", appVersion)
+		return nil
+	}
+
+	// Reprocess only module versions with the given status code.
 	status := r.FormValue("status")
 	if status != "" {
 		code, err := strconv.Atoi(status)
@@ -583,6 +537,7 @@ func (s *Server) handleReprocess(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
+	// Reprocess all module versions in module_version_states.
 	if err := s.db.UpdateModuleVersionStatesForReprocessing(r.Context(), appVersion); err != nil {
 		return err
 	}
@@ -591,12 +546,11 @@ func (s *Server) handleReprocess(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) clearCache(w http.ResponseWriter, r *http.Request) error {
-	if s.redisCacheClient == nil {
+	if s.cache == nil {
 		return errors.New("redis cache client is not configured")
 	}
-	status := s.redisCacheClient.FlushAll()
-	if status.Err() != nil {
-		return status.Err()
+	if err := s.cache.Clear(r.Context()); err != nil {
+		return err
 	}
 	fmt.Fprint(w, "Cache cleared.")
 	return nil
@@ -615,20 +569,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (s *Server) updateExperiment(w http.ResponseWriter, r *http.Request) error {
-	name := r.FormValue("name")
-	description := r.FormValue("description")
-	rollout, err := strconv.Atoi(r.FormValue("rollout"))
-	if err != nil || rollout < 0 || rollout > 100 {
-		return &serverError{http.StatusBadRequest, fmt.Errorf("rollout is invalid: %q", rollout)}
+func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	if err := s.db.Underlying().Ping(); err != nil {
+		http.Error(w, fmt.Sprintf("DB ping failed: %v", err), http.StatusInternalServerError)
+		return
 	}
-
-	if err := s.db.UpdateExperiment(r.Context(), &internal.Experiment{Name: name, Description: description, Rollout: uint(rollout)}); err != nil {
-		return &serverError{http.StatusInternalServerError, err}
-	}
-
-	fmt.Fprintf(w, "Updated %q experiment rollout to %d percent", name, rollout)
-	return nil
+	fmt.Fprintln(w, "OK")
 }
 
 // Parse the template for the status page.
@@ -638,8 +584,16 @@ func parseTemplate(staticPath, filename template.TrustedSource) (*template.Templ
 	}
 	templatePath := template.TrustedSourceJoin(staticPath, template.TrustedSourceFromConstant("html/worker"), filename)
 	return template.New(filename.String()).Funcs(template.FuncMap{
-		"truncate": truncate,
-		"timefmt":  formatTime,
+		"truncate":  truncate,
+		"timefmt":   formatTime,
+		"bytesToMi": bytesToMi,
+		"pct":       percentage,
+		"timeSince": func(t time.Time) time.Duration {
+			return time.Since(t).Round(time.Second)
+		},
+		"timeSub": func(t1, t2 time.Time) time.Duration {
+			return t1.Sub(t2).Round(time.Second)
+		},
 	}).ParseFilesFromTrustedSources(templatePath)
 }
 
@@ -670,6 +624,32 @@ func formatTime(t *time.Time) string {
 		return "Never"
 	}
 	return t.In(locNewYork).Format("2006-01-02 15:04:05")
+}
+
+// bytesToMi converts an integral value of bytes into mebibytes.
+func bytesToMi(b uint64) uint64 {
+	return b / (1024 * 1024)
+}
+
+// percentage computes the truncated percentage of x/y.
+// It returns 0 if y is 0.
+// x and y can be any int or uint type.
+func percentage(x, y interface{}) int {
+	denom := toUint64(y)
+	if denom == 0 {
+		return 0
+	}
+	return int(toUint64(x) * 100 / denom)
+}
+
+func toUint64(n interface{}) uint64 {
+	v := reflect.ValueOf(n)
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return uint64(v.Int())
+	default: // assume uint
+		return v.Uint()
+	}
 }
 
 // parseLimitParam parses the query parameter with name as in integer. If the
@@ -715,6 +695,7 @@ func (s *Server) serveError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	if serr.status == http.StatusInternalServerError {
 		log.Error(ctx, serr.err)
+		s.reportError(ctx, err, w, r)
 	} else {
 		log.Infof(ctx, "returning %d (%s) for error %v", serr.status, http.StatusText(serr.status), err)
 	}

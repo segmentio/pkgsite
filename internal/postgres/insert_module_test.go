@@ -8,27 +8,30 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/licensecheck"
 	"github.com/google/safehtml"
-	"github.com/google/safehtml/testconversions"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/database"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/source"
+	"golang.org/x/pkgsite/internal/stdlib"
 	"golang.org/x/pkgsite/internal/testing/sample"
 )
 
 func TestInsertModule(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout*2)
-	defer cancel()
+	t.Parallel()
+	ctx := context.Background()
 
 	for _, test := range []struct {
 		name   string
@@ -40,7 +43,15 @@ func TestInsertModule(t *testing.T) {
 		},
 		{
 			name:   "valid test with internal package",
-			module: sample.Module(sample.ModulePath, sample.VersionString, "internal/ffoo"),
+			module: sample.Module(sample.ModulePath, sample.VersionString, "internal/foo"),
+		},
+		{
+			name:   "valid test for prerelease version",
+			module: sample.Module(sample.ModulePath, "v1.0.0-beta", "internal/foo"),
+		},
+		{
+			name:   "valid test for pseudoversion version",
+			module: sample.Module(sample.ModulePath, "v0.0.0-20210212193344-7015347762c1", "internal/foo"),
 		},
 		{
 			name: "valid test with go.mod missing",
@@ -51,125 +62,149 @@ func TestInsertModule(t *testing.T) {
 			}(),
 		},
 		{
-			name: "stdlib",
+			name:   "stdlib",
+			module: sample.Module(stdlib.ModulePath, "v1.12.5", "context"),
+		},
+		{
+			name: "deprecated",
 			module: func() *internal.Module {
-				m := sample.Module("std", "v1.12.5")
-				p := &internal.LegacyPackage{
-					Name:              "context",
-					Path:              "context",
-					Synopsis:          "This is a package synopsis",
-					Licenses:          sample.LicenseMetadata,
-					DocumentationHTML: testconversions.MakeHTMLForTest("This is the documentation HTML"),
-				}
-				return sample.AddPackage(m, p)
+				m := sample.DefaultModule()
+				m.Deprecated = true
+				m.DeprecationComment = "use v2"
+				return m
 			}(),
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			defer ResetTestDB(testDB, t)
+			testDB, release := acquire(t)
+			defer release()
 
-			if err := testDB.InsertModule(ctx, test.module); err != nil {
-				t.Fatal(err)
-			}
+			MustInsertModule(ctx, t, testDB, test.module)
 			// Test that insertion of duplicate primary key won't fail.
-			if err := testDB.InsertModule(ctx, test.module); err != nil {
-				t.Fatal(err)
-			}
-
-			checkModule(ctx, t, test.module)
+			MustInsertModule(ctx, t, testDB, test.module)
+			checkModule(ctx, t, testDB, test.module)
 		})
 	}
 }
 
-func checkModule(ctx context.Context, t *testing.T, want *internal.Module) {
-	got, err := testDB.LegacyGetModuleInfo(ctx, want.ModulePath, want.Version)
+func checkModule(ctx context.Context, t *testing.T, db *DB, want *internal.Module) {
+	got, err := db.GetModuleInfo(ctx, want.ModulePath, want.Version)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff(want.LegacyModuleInfo, *got, cmp.AllowUnexported(source.Info{})); diff != "" {
-		t.Fatalf("testDB.LegacyGetModuleInfo(%q, %q) mismatch (-want +got):\n%s", want.ModulePath, want.Version, diff)
+	if diff := cmp.Diff(want.ModuleInfo, *got, cmp.AllowUnexported(source.Info{})); diff != "" {
+		t.Fatalf("testDB.GetModuleInfo(%q, %q) mismatch (-want +got):\n%s", want.ModulePath, want.Version, diff)
 	}
 
-	for _, wantp := range want.LegacyPackages {
-		got, err := testDB.LegacyGetPackage(ctx, wantp.Path, want.ModulePath, want.Version)
+	for _, wantu := range want.Units {
+		got, err := db.GetUnit(ctx, &wantu.UnitMeta, internal.AllFields)
 		if err != nil {
 			t.Fatal(err)
 		}
+		var subdirectories []*internal.PackageMeta
+		for _, u := range want.Units {
+			if u.IsPackage() && (strings.HasPrefix(u.Path, wantu.Path) || wantu.Path == stdlib.ModulePath) {
+				subdirectories = append(subdirectories, packageMetaFromUnit(u))
+			}
+		}
+		wantu.Subdirectories = subdirectories
 		opts := cmp.Options{
-			// The packages table only includes partial license information; it
-			// omits the Coverage field.
-			cmpopts.IgnoreFields(internal.LegacyPackage{}, "Imports"),
-			cmpopts.IgnoreFields(licenses.Metadata{}, "Coverage"),
-			cmpopts.EquateEmpty(),
-			cmp.AllowUnexported(safehtml.HTML{}),
-		}
-		if diff := cmp.Diff(*wantp, got.LegacyPackage, opts...); diff != "" {
-			t.Fatalf("testDB.LegacyGetPackage(%q, %q) mismatch (-want +got):\n%s", wantp.Path, want.Version, diff)
-		}
-	}
-
-	for _, dir := range want.Directories {
-		got, err := testDB.GetDirectory(ctx, dir.Path, want.ModulePath, want.Version)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// TODO(golang/go#38513): remove once we start displaying
-		// READMEs for directories instead of the top-level module.
-		dir.Readme = &internal.Readme{
-			Filepath: sample.ReadmeFilePath,
-			Contents: sample.ReadmeContents,
-		}
-		wantd := internal.VersionedDirectory{
-			Directory:  *dir,
-			ModuleInfo: want.ModuleInfo,
-		}
-		opts := cmp.Options{
-			cmpopts.IgnoreFields(internal.LegacyModuleInfo{}, "LegacyReadmeFilePath"),
-			cmpopts.IgnoreFields(internal.LegacyModuleInfo{}, "LegacyReadmeContents"),
-			cmpopts.IgnoreFields(licenses.Metadata{}, "Coverage"),
+			cmpopts.IgnoreFields(licenses.Metadata{}, "Coverage", "OldCoverage"),
 			cmp.AllowUnexported(source.Info{}, safehtml.HTML{}),
 		}
-		if diff := cmp.Diff(wantd, *got, opts); diff != "" {
-			t.Errorf("testDB.getDirectory(%q, %q) mismatch (-want +got):\n%s", dir.Path, want.Version, diff)
+		if diff := cmp.Diff(wantu, got, opts); diff != "" {
+			t.Errorf("mismatch (-want +got):\n%s", diff)
 		}
+	}
+}
+
+func packageMetaFromUnit(u *internal.Unit) *internal.PackageMeta {
+	return &internal.PackageMeta{
+		Path:              u.Path,
+		IsRedistributable: u.IsRedistributable,
+		Name:              u.Name,
+		Synopsis:          u.Documentation[0].Synopsis,
+		Licenses:          u.Licenses,
+	}
+}
+
+func TestInsertModuleLicenseCheck(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, bypass := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bypass=%t", bypass), func(t *testing.T) {
+			testDB, release := acquire(t)
+			defer release()
+
+			var db *DB
+			if bypass {
+				db = NewBypassingLicenseCheck(testDB.db)
+			} else {
+				db = testDB
+			}
+			checkHasRedistData := func(readme string, doc []byte, want bool) {
+				t.Helper()
+				if got := readme != ""; got != want {
+					t.Errorf("readme: got %t, want %t", got, want)
+				}
+				if got := doc != nil; got != want {
+					t.Errorf("doc: got %t, want %t", got, want)
+				}
+			}
+
+			mod := sample.Module(sample.ModulePath, sample.VersionString, "")
+			checkHasRedistData(mod.Units[0].Readme.Contents, mod.Units[0].Documentation[0].Source, true)
+			mod.IsRedistributable = false
+			mod.Units[0].IsRedistributable = false
+
+			MustInsertModule(ctx, t, db, mod)
+
+			// New model
+			u, err := db.GetUnit(ctx, newUnitMeta(mod.ModulePath, mod.ModulePath, mod.Version), internal.AllFields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var (
+				source []byte
+				readme string
+			)
+			if u.Readme != nil {
+				readme = u.Readme.Contents
+			}
+			if u.Documentation != nil {
+				source = u.Documentation[0].Source
+			}
+			checkHasRedistData(readme, source, bypass)
+		})
 	}
 }
 
 func TestUpsertModule(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	m := sample.Module("upsert.org", "v1.2.3")
-	p := &internal.LegacyPackage{
-		Name:              "p",
-		Path:              "upsert.org/dir/p",
-		Synopsis:          "This is a package synopsis",
-		Licenses:          sample.LicenseMetadata,
-		DocumentationHTML: testconversions.MakeHTMLForTest("This is the documentation HTML"),
-	}
-	sample.AddPackage(m, p)
+
+	m := sample.Module("upsert.org", "v1.2.3", "dir/p")
 
 	// Insert the module.
-	if err := testDB.InsertModule(ctx, m); err != nil {
-		t.Fatal(err)
-	}
+	MustInsertModule(ctx, t, testDB, m)
 	// Change the module, and re-insert.
 	m.IsRedistributable = !m.IsRedistributable
-	m.Licenses[0].Contents = append(m.Licenses[0].Contents, " and more"...)
-	// TODO(golang/go#38513): uncomment line below once we start displaying
-	// READMEs for directories instead of the top-level module.
-	// m.Directories[0].Readme.Contents += " and more"
-	m.LegacyPackages[0].Synopsis = "New synopsis"
-	if err := testDB.InsertModule(ctx, m); err != nil {
-		t.Fatal(err)
-	}
+	lic := *m.Licenses[0]
+	lic.Contents = append(lic.Contents, " and more"...)
+	sample.ReplaceLicense(m, &lic)
+	m.Units[0].Readme.Contents += " and more"
 
+	MustInsertModule(ctx, t, testDB, m)
 	// The changes should have been saved.
-	checkModule(ctx, t, m)
+	checkModule(ctx, t, testDB, m)
 }
 
 func TestInsertModuleErrors(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout*2)
-	defer cancel()
+	t.Parallel()
+	ctx := context.Background()
 
 	testCases := []struct {
 		name string
@@ -229,24 +264,67 @@ func TestInsertModuleErrors(t *testing.T) {
 			}(),
 			wantVersion:    sample.VersionString,
 			wantModulePath: sample.ModulePath,
-			wantWriteErr:   derrors.DBModuleInsertInvalid,
+			wantWriteErr:   derrors.BadModule,
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			defer ResetTestDB(testDB, t)
-			if err := testDB.InsertModule(ctx, tc.module); !errors.Is(err, tc.wantWriteErr) {
-				t.Errorf("error: %v, want write error: %v", err, tc.wantWriteErr)
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			testDB, release := acquire(t)
+			defer release()
+
+			if _, err := testDB.InsertModule(ctx, test.module); !errors.Is(err, test.wantWriteErr) {
+				t.Errorf("error: %v, want write error: %v", err, test.wantWriteErr)
 			}
 		})
 	}
 }
 
+func TestInsertModuleNewCoverage(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	m := sample.DefaultModule()
+	newCoverage := licensecheck.Coverage{
+		Percent: 100,
+		Match:   []licensecheck.Match{{ID: "New", Start: 1, End: 10}},
+	}
+	m.Licenses = []*licenses.License{
+		{
+			Metadata: &licenses.Metadata{
+				Types:    []string{sample.LicenseType},
+				FilePath: sample.LicenseFilePath,
+				Coverage: newCoverage,
+			},
+			Contents: []byte(`Lorem Ipsum`),
+		},
+	}
+	MustInsertModule(ctx, t, testDB, m)
+	u, err := testDB.GetUnit(ctx, newUnitMeta(m.ModulePath, m.ModulePath, m.Version), internal.AllFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := u.LicenseContents[0].Metadata
+	want := &licenses.Metadata{
+		Types:    []string{"MIT"},
+		FilePath: sample.LicenseFilePath,
+		Coverage: newCoverage,
+	}
+	if !cmp.Equal(got, want) {
+		t.Errorf("\ngot  %+v\nwant %+v", got, want)
+	}
+
+}
+
 func TestPostgres_ReadAndWriteModuleOtherColumns(t *testing.T) {
+	t.Parallel()
 	// Verify that InsertModule correctly populates the columns in the versions
-	// table that are not in the LegacyModuleInfo struct.
-	defer ResetTestDB(testDB, t)
+	// table that are not in the ModuleInfo struct.
+	testDB, release := acquire(t)
+	defer release()
 	ctx := context.Background()
 
 	type other struct {
@@ -259,9 +337,7 @@ func TestPostgres_ReadAndWriteModuleOtherColumns(t *testing.T) {
 		seriesPath:  "github.com/user/repo/path",
 	}
 
-	if err := testDB.InsertModule(ctx, v); err != nil {
-		t.Fatal(err)
-	}
+	MustInsertModule(ctx, t, testDB, v)
 	query := `
 	SELECT
 		sort_version, series_path
@@ -279,17 +355,133 @@ func TestPostgres_ReadAndWriteModuleOtherColumns(t *testing.T) {
 	}
 }
 
+func TestLatestVersion(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+
+	for _, mod := range []struct {
+		version    string
+		modulePath string
+	}{
+		{
+			version:    "v1.5.2",
+			modulePath: sample.ModulePath,
+		},
+		{
+			version:    "v2.0.0+incompatible",
+			modulePath: sample.ModulePath,
+		},
+		{
+			version:    "v2.0.1",
+			modulePath: sample.ModulePath + "/v2",
+		},
+		{
+			version:    "v3.0.1-rc9.0.20200212222136-a4a89636720b",
+			modulePath: sample.ModulePath + "/v3",
+		},
+		{
+			version:    "v3.0.1-rc9",
+			modulePath: sample.ModulePath + "/v3",
+		},
+	} {
+		m := sample.DefaultModule()
+		m.Version = mod.version
+		m.ModulePath = mod.modulePath
+
+		MustInsertModule(ctx, t, testDB, m)
+	}
+
+	for _, test := range []struct {
+		name        string
+		modulePath  string
+		wantVersion string
+	}{
+		{
+			name:        "test v1 version",
+			modulePath:  sample.ModulePath,
+			wantVersion: "v1.5.2",
+		},
+		{
+			name:        "test v2 version",
+			modulePath:  sample.ModulePath + "/v2",
+			wantVersion: "v2.0.1",
+		},
+		{
+			name:        "test v3 version - prefer prerelease over pseudo",
+			modulePath:  sample.ModulePath + "/v3",
+			wantVersion: "v3.0.1-rc9",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isLatest, err := isLatestVersion(ctx, testDB.db, test.modulePath, test.wantVersion)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !isLatest {
+				t.Errorf("%s is not the latest version", test.wantVersion)
+			}
+		})
+	}
+}
+
+func TestLatestVersion_PreferIncompatibleOverPrerelease(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+
+	for _, mod := range []struct {
+		version    string
+		modulePath string
+	}{
+		{
+			version:    "v0.0.0-20201007032633-0806396f153e",
+			modulePath: sample.ModulePath,
+		},
+		{
+			version:    "v2.0.0+incompatible",
+			modulePath: sample.ModulePath,
+		},
+	} {
+		m := sample.DefaultModule()
+		m.Version = mod.version
+		m.ModulePath = mod.modulePath
+
+		MustInsertModule(ctx, t, testDB, m)
+	}
+
+	for _, test := range []struct {
+		modulePath string
+		want       string
+	}{
+		{
+			modulePath: sample.ModulePath,
+			want:       "v2.0.0+incompatible",
+		},
+	} {
+		isLatest, err := isLatestVersion(ctx, testDB.db, test.modulePath, test.want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !isLatest {
+			t.Errorf("%s is not the latest version", test.want)
+		}
+	}
+}
+
 func TestDeleteModule(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	defer ResetTestDB(testDB, t)
 
 	v := sample.DefaultModule()
 
-	if err := testDB.InsertModule(ctx, v); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testDB.LegacyGetModuleInfo(ctx, v.ModulePath, v.Version); err != nil {
+	MustInsertModule(ctx, t, testDB, v)
+	if _, err := testDB.GetModuleInfo(ctx, v.ModulePath, v.Version); err != nil {
 		t.Fatal(err)
 	}
 
@@ -304,7 +496,7 @@ func TestDeleteModule(t *testing.T) {
 	if err := testDB.DeleteModule(ctx, v.ModulePath, v.Version); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testDB.LegacyGetModuleInfo(ctx, v.ModulePath, v.Version); !errors.Is(err, derrors.NotFound) {
+	if _, err := testDB.GetModuleInfo(ctx, v.ModulePath, v.Version); !errors.Is(err, derrors.NotFound) {
 		t.Errorf("got %v, want NotFound", err)
 	}
 
@@ -324,37 +516,44 @@ func TestDeleteModule(t *testing.T) {
 }
 
 func TestPostgres_NewerAlternative(t *testing.T) {
+	t.Parallel()
 	// Verify that packages are not added to search_documents if the module has a newer
 	// alternative version.
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	defer ResetTestDB(testDB, t)
 
 	const (
-		modulePath = "example.com/Mod"
 		altVersion = "v1.2.0"
 		okVersion  = "v1.0.0"
 	)
 
-	err := testDB.UpsertModuleVersionState(ctx, modulePath, altVersion, "appVersion", time.Now(),
-		derrors.ToStatus(derrors.AlternativeModule), "example.com/mod", derrors.AlternativeModule, nil)
-	if err != nil {
+	mvs := &ModuleVersionStateForUpsert{
+		ModulePath: "example.com/Mod",
+		Version:    altVersion,
+		AppVersion: "appVersion",
+		Timestamp:  time.Now(),
+		Status:     derrors.ToStatus(derrors.AlternativeModule),
+		GoModPath:  "example.com/mod",
+		FetchErr:   derrors.AlternativeModule,
+	}
+	if err := testDB.UpsertModuleVersionState(ctx, mvs); err != nil {
 		t.Fatal(err)
 	}
-	m := sample.Module(modulePath, okVersion, "p")
-	if err := testDB.InsertModule(ctx, m); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, found := GetFromSearchDocuments(ctx, t, testDB, m.LegacyPackages[0].Path); found {
+	m := sample.Module(mvs.ModulePath, okVersion, "p")
+	MustInsertModule(ctx, t, testDB, m)
+	if _, _, found := GetFromSearchDocuments(ctx, t, testDB, m.Packages()[0].Path); found {
 		t.Fatal("found package after inserting")
 	}
 }
 
 func TestMakeValidUnicode(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-
-	defer ResetTestDB(testDB, t)
 
 	db := testDB.Underlying()
 
@@ -389,11 +588,13 @@ func TestMakeValidUnicode(t *testing.T) {
 }
 
 func TestLock(t *testing.T) {
+	t.Parallel()
 	// Verify that two transactions cannot both hold the same lock, but that every one
 	// that wants the lock eventually gets it.
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	defer ResetTestDB(testDB, t)
 
 	db := testDB.Underlying()
 

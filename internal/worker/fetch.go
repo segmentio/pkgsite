@@ -6,15 +6,19 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.opencensus.io/trace"
 	"golang.org/x/mod/semver"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/cache"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/experiment"
 	"golang.org/x/pkgsite/internal/fetch"
@@ -22,12 +26,7 @@ import (
 	"golang.org/x/pkgsite/internal/postgres"
 	"golang.org/x/pkgsite/internal/proxy"
 	"golang.org/x/pkgsite/internal/source"
-)
-
-const (
-	// Indicates that although we have a valid module, some packages could not be processed.
-	hasIncompletePackagesCode = 290
-	hasIncompletePackagesDesc = "incomplete packages"
+	"golang.org/x/pkgsite/internal/stdlib"
 )
 
 // ProxyRemoved is a set of module@version that have been removed from the proxy,
@@ -40,28 +39,61 @@ type fetchTask struct {
 	timings map[string]time.Duration
 }
 
+// A Fetcher holds state for fetching modules.
+type Fetcher struct {
+	ProxyClient  *proxy.Client
+	SourceClient *source.Client
+	DB           *postgres.DB
+	Cache        *cache.Cache
+}
+
 // FetchAndUpdateState fetches and processes a module version, and then updates
 // the module_version_states table according to the result. It returns an HTTP
 // status code representing the result of the fetch operation, and a non-nil
 // error if this status code is not 200.
-func FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion string, proxyClient *proxy.Client, sourceClient *source.Client, db *postgres.DB, appVersionLabel string) (_ int, err error) {
-	defer derrors.Wrap(&err, "FetchAndUpdateState(%q, %q)", modulePath, requestedVersion)
-
+func (f *Fetcher) FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion, appVersionLabel string) (_ int, resolvedVersion string, err error) {
+	defer derrors.Wrap(&err, "FetchAndUpdateState(%q, %q, %q)", modulePath, requestedVersion, appVersionLabel)
 	tctx, span := trace.StartSpan(ctx, "FetchAndUpdateState")
 	ctx = experiment.NewContext(tctx, experiment.FromContext(ctx).Active()...)
 	ctx = log.NewContextWithLabel(ctx, "fetch", modulePath+"@"+requestedVersion)
+	if !utf8.ValidString(modulePath) {
+		log.Errorf(ctx, "module path %q is not valid UTF-8", modulePath)
+	}
+	if !utf8.ValidString(requestedVersion) {
+		log.Errorf(ctx, "requested version %q is not valid UTF-8", requestedVersion)
+	}
 	span.AddAttributes(
 		trace.StringAttribute("modulePath", modulePath),
 		trace.StringAttribute("version", requestedVersion))
 	defer span.End()
 
-	ft := fetchAndInsertModule(ctx, modulePath, requestedVersion, proxyClient, sourceClient, db)
+	ft := f.fetchAndInsertModule(ctx, modulePath, requestedVersion)
 	span.AddAttributes(trace.Int64Attribute("numPackages", int64(len(ft.PackageVersionStates))))
+
+	// Whenever we fetch a module successfully -- even if the module itself is
+	// bad in some way -- make sure its latest information is up to date in the
+	// DB.
+	if ft.Status < 500 {
+		if err := f.FetchAndUpdateLatest(ctx, modulePath); err != nil {
+			// Internal errors are serious, but others aren't.
+			if derrors.ToStatus(err) >= 500 {
+				// Do not overwrite an error from insertion.
+				if ft.Error == nil {
+					ft.Error = err
+					ft.Status = http.StatusInternalServerError
+				}
+				log.Errorf(ctx, "%v", err)
+			} else {
+				log.Infof(ctx, "%v", err)
+			}
+		}
+	}
 
 	// If there were any errors processing the module then we didn't insert it.
 	// Delete it in case we are reprocessing an existing module.
-	if ft.Status >= 400 {
-		if err := deleteModule(ctx, db, ft); err != nil {
+	// However, don't delete if the error was internal, or we are shedding load.
+	if ft.Status >= 400 && ft.Status < 500 {
+		if err := deleteModule(ctx, f.DB, ft); err != nil {
 			log.Error(ctx, err)
 			ft.Error = err
 			ft.Status = http.StatusInternalServerError
@@ -71,7 +103,7 @@ func FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion strin
 	}
 	// Regardless of what the status code is, insert the result into
 	// version_map, so that a response can be returned for frontend_fetch.
-	if err := updateVersionMap(ctx, db, ft); err != nil {
+	if err := updateVersionMap(ctx, f.DB, ft); err != nil {
 		log.Error(ctx, err)
 		if ft.Status != http.StatusInternalServerError {
 			ft.Error = err
@@ -86,7 +118,7 @@ func FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion strin
 		// resolvedVersion. This fetch request does not need to be recorded in
 		// module_version_states, since that table is only used to track
 		// modules that have been published to index.golang.org.
-		return ft.Status, ft.Error
+		return ft.Status, ft.ResolvedVersion, ft.Error
 	}
 
 	// Update the module_version_states table with the new status of
@@ -96,8 +128,17 @@ func FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion strin
 	// TODO(golang/go#39628): Split UpsertModuleVersionState into
 	// InsertModuleVersionState and UpdateModuleVersionState.
 	start := time.Now()
-	err = db.UpsertModuleVersionState(ctx, ft.ModulePath, ft.ResolvedVersion, appVersionLabel,
-		time.Time{}, ft.Status, ft.GoModPath, ft.Error, ft.PackageVersionStates)
+	mvs := &postgres.ModuleVersionStateForUpsert{
+		ModulePath:           ft.ModulePath,
+		Version:              ft.ResolvedVersion,
+		AppVersion:           appVersionLabel,
+		Status:               ft.Status,
+		HasGoMod:             ft.HasGoMod,
+		GoModPath:            ft.GoModPath,
+		FetchErr:             ft.Error,
+		PackageVersionStates: ft.PackageVersionStates,
+	}
+	err = f.DB.UpsertModuleVersionState(ctx, mvs)
 	ft.timings["db.UpsertModuleVersionState"] = time.Since(start)
 	if err != nil {
 		log.Error(ctx, err)
@@ -106,20 +147,16 @@ func FetchAndUpdateState(ctx context.Context, modulePath, requestedVersion strin
 			ft.Error = fmt.Errorf("db.UpsertModuleVersionState: %v, original error: %v", err, ft.Error)
 		}
 		logTaskResult(ctx, ft, "Failed to update module version state")
-		return http.StatusInternalServerError, ft.Error
+		return http.StatusInternalServerError, ft.ResolvedVersion, ft.Error
 	}
 	logTaskResult(ctx, ft, "Updated module version state")
-	return ft.Status, ft.Error
+	return ft.Status, ft.ResolvedVersion, ft.Error
 }
 
 // fetchAndInsertModule fetches the given module version from the module proxy
 // or (in the case of the standard library) from the Go repo and writes the
 // resulting data to the database.
-//
-// The given parentCtx is used for tracing, but fetches actually execute in a
-// detached context with fixed timeout, so that fetches are allowed to complete
-// even for short-lived requests.
-func fetchAndInsertModule(ctx context.Context, modulePath, requestedVersion string, proxyClient *proxy.Client, sourceClient *source.Client, db *postgres.DB) *fetchTask {
+func (f *Fetcher) fetchAndInsertModule(ctx context.Context, modulePath, requestedVersion string) *fetchTask {
 	ft := &fetchTask{
 		FetchResult: fetch.FetchResult{
 			ModulePath:       modulePath,
@@ -141,7 +178,7 @@ func fetchAndInsertModule(ctx context.Context, modulePath, requestedVersion stri
 		return ft
 	}
 
-	exc, err := db.IsExcluded(ctx, modulePath)
+	exc, err := f.DB.IsExcluded(ctx, modulePath)
 	if err != nil {
 		ft.Error = err
 		return ft
@@ -151,25 +188,59 @@ func fetchAndInsertModule(ctx context.Context, modulePath, requestedVersion stri
 		return ft
 	}
 
-	start := time.Now()
-	fr := fetch.FetchModule(ctx, modulePath, requestedVersion, proxyClient, sourceClient)
-	if fr == nil {
-		panic("fetch.FetchModule should never return a nil FetchResult")
-	}
-	ft.FetchResult = *fr
-	ft.timings["fetch.FetchModule"] = time.Since(start)
+	// Fetch the module, and the current @main and @master version of this module.
+	// The @main and @master version will be used to update the version_map
+	// target if applicable.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		start := time.Now()
+		fr := fetch.FetchModule(ctx, modulePath, requestedVersion, f.ProxyClient, f.SourceClient)
+		if fr == nil {
+			panic("fetch.FetchModule should never return a nil FetchResult")
+		}
+		defer fr.Defer()
+		ft.FetchResult = *fr
+		ft.timings["fetch.FetchModule"] = time.Since(start)
+	}()
+	// Do not resolve the @main and @master version if proxy fetch is disabled.
+	var main string
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !f.ProxyClient.FetchDisabled() {
+			main = resolvedVersion(ctx, modulePath, internal.MainVersion, f.ProxyClient)
+		}
+	}()
+	var master string
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !f.ProxyClient.FetchDisabled() {
+			master = resolvedVersion(ctx, modulePath, internal.MasterVersion, f.ProxyClient)
+		}
+	}()
+	wg.Wait()
+	ft.MainVersion = main
+	ft.MasterVersion = master
+
+	// There was an error fetching this module.
 	if ft.Error != nil {
-		logf := log.Errorf
-		if ft.Status < 500 {
-			logf = log.Infof
+		logf := log.Infof
+		if ft.Status == http.StatusServiceUnavailable {
+			logf = log.Warningf
+		} else if ft.Status >= 500 && ft.Status != derrors.ToStatus(derrors.ProxyTimedOut) {
+			logf = log.Errorf
 		}
 		logf(ctx, "Error executing fetch: %v (code %d)", ft.Error, ft.Status)
 		return ft
 	}
-	log.Infof(ctx, "fetch.FetchVersion succeeded for %s@%s", ft.ModulePath, ft.RequestedVersion)
 
-	start = time.Now()
-	err = db.InsertModule(ctx, ft.Module)
+	// The module was successfully fetched.
+	log.Infof(ctx, "fetch.FetchModule succeeded for %s@%s", ft.ModulePath, ft.RequestedVersion)
+	start := time.Now()
+	isLatest, err := f.DB.InsertModule(ctx, ft.Module)
 	ft.timings["db.InsertModule"] = time.Since(start)
 	if err != nil {
 		log.Error(ctx, err)
@@ -179,7 +250,66 @@ func fetchAndInsertModule(ctx context.Context, modulePath, requestedVersion stri
 		return ft
 	}
 	log.Infof(ctx, "db.InsertModule succeeded for %s@%s", ft.ModulePath, ft.RequestedVersion)
+	// Invalidate the cache if we just processed the latest version of a module.
+	if isLatest {
+		if err := f.invalidateCache(ctx, ft.ModulePath); err != nil {
+			// Failure to invalidate the cache is not that serious; at worst it means some pages will be stale.
+			// (Cache TTLs for details pages configured in internal/frontend/server.go must not be too long,
+			// to account for this possibility.)
+			log.Errorf(ctx, "failed to invalidate cache for %s: %v", ft.ModulePath, err)
+		} else {
+			log.Infof(ctx, "invalidated cache for %s", ft.ModulePath)
+		}
+	}
 	return ft
+}
+
+// invalidateCache deletes the series path for modulePath, as well as any
+// possible URL path of which it is a componentwise prefix. That is, it deletes
+// example.com/mod, example.com/mod@v1.2.3 and example.com/mod/pkg, but not the
+// unrelated example.com/module.
+//
+// We delete the series path, not the module path, because adding a v2 module
+// can affect v1 pages. For example, the first v2 module will add a "higher
+// major version" banner to all v1 pages. While adding a v1 version won't
+// currently affect v2 pages, that could change some day (for instance, if we
+// decide to provide history). So it's better to be safe and delete all paths in
+// the series.
+func (f *Fetcher) invalidateCache(ctx context.Context, modulePath string) error {
+	if f.Cache == nil {
+		return nil
+	}
+	var errs []error
+	seriesPath := internal.SeriesPathForModule(modulePath)
+	// All cache keys are request URLs, so they begin with "/".
+	if err := f.Cache.Delete(ctx, "/"+seriesPath); err != nil {
+		errs = append(errs, err)
+	}
+	// Delete all suffixes of the series path followed by a character that marks its end.
+	for _, end := range "/@?#" {
+		if err := f.Cache.DeletePrefix(ctx, fmt.Sprintf("/%s%c", seriesPath, end)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%d errors, first is %w", len(errs), errs[0])
+	}
+	return nil
+}
+
+func resolvedVersion(ctx context.Context, modulePath, requestedVersion string, proxyClient *proxy.Client) string {
+	if modulePath == stdlib.ModulePath && requestedVersion == internal.MainVersion {
+		return ""
+	}
+	info, err := fetch.GetInfo(ctx, modulePath, requestedVersion, proxyClient)
+	if err != nil {
+		if !errors.Is(err, derrors.NotFound) {
+			// If an error occurs, log it and insert the module as normal.
+			log.Errorf(ctx, "fetch.GetInfo(ctx, %q, %q, f.ProxyClient, false): %v", modulePath, requestedVersion, err)
+		}
+		return ""
+	}
+	return info.Version
 }
 
 func updateVersionMap(ctx context.Context, db *postgres.DB, ft *fetchTask) (err error) {
@@ -196,16 +326,29 @@ func updateVersionMap(ctx context.Context, db *postgres.DB, ft *fetchTask) (err 
 	if ft.Error != nil {
 		errMsg = ft.Error.Error()
 	}
-	vm := &internal.VersionMap{
-		ModulePath:       ft.ModulePath,
-		RequestedVersion: ft.RequestedVersion,
-		ResolvedVersion:  ft.ResolvedVersion,
-		Status:           ft.Status,
-		GoModPath:        ft.GoModPath,
-		Error:            errMsg,
+
+	// If the resolved version for the this module version is also the resolved
+	// version for @main or @master, update version_map to match.
+	requestedVersions := []string{ft.RequestedVersion}
+	if ft.MainVersion == ft.ResolvedVersion {
+		requestedVersions = append(requestedVersions, internal.MainVersion)
 	}
-	if err := db.UpsertVersionMap(ctx, vm); err != nil {
-		return err
+	if ft.MasterVersion == ft.ResolvedVersion {
+		requestedVersions = append(requestedVersions, internal.MasterVersion)
+	}
+	for _, v := range requestedVersions {
+		v := v
+		vm := &internal.VersionMap{
+			ModulePath:       ft.ModulePath,
+			RequestedVersion: v,
+			ResolvedVersion:  ft.ResolvedVersion,
+			Status:           ft.Status,
+			GoModPath:        ft.GoModPath,
+			Error:            errMsg,
+		}
+		if err := db.UpsertVersionMap(ctx, vm); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -254,4 +397,32 @@ func logTaskResult(ctx context.Context, ft *fetchTask, prefix string) {
 	}
 	logf(ctx, "%s for %s@%s: code=%d, num_packages=%d, err=%v; timings: %s",
 		prefix, ft.ModulePath, ft.ResolvedVersion, ft.Status, len(ft.PackageVersionStates), ft.Error, msg)
+}
+
+// FetchAndUpdateLatest fetches information about the latest versions from the proxy,
+// and updates the database if the version has changed.
+func (f *Fetcher) FetchAndUpdateLatest(ctx context.Context, modulePath string) (err error) {
+	defer derrors.Wrap(&err, "FetchAndUpdateLatest(%q)", modulePath)
+	if modulePath == stdlib.ModulePath {
+		return nil
+	}
+	lmv, err := fetch.LatestModuleVersions(ctx, modulePath, f.ProxyClient, func(v string) (bool, error) {
+		modinfo, err := f.DB.GetModuleInfo(ctx, modulePath, v)
+		if err != nil {
+			return false, err
+		}
+		return modinfo.HasGoMod, nil
+	})
+	if err != nil {
+		if err2 := f.DB.UpdateLatestModuleVersionsStatus(ctx, modulePath, derrors.ToStatus(err)); err2 != nil {
+			log.Errorf(ctx, "failed to update latest_module_versions status for %s: %v", modulePath, err2)
+		}
+		return err
+	}
+	// There may be no version information for the module, even if it exists.
+	// In that case, lmv will be nil and we insert a 404 into the DB.
+	if lmv == nil {
+		return f.DB.UpdateLatestModuleVersionsStatus(ctx, modulePath, 404)
+	}
+	return f.DB.UpdateLatestModuleVersions(ctx, lmv)
 }

@@ -6,150 +6,20 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/experiment"
 	"golang.org/x/pkgsite/internal/source"
 	"golang.org/x/pkgsite/internal/stdlib"
 	"golang.org/x/pkgsite/internal/testing/sample"
 )
 
-func TestPostgres_GetTaggedAndPseudoVersions(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	var (
-		modulePath1 = "path.to/foo"
-		modulePath2 = "path.to/foo/v2"
-		modulePath3 = "path.to/some/thing"
-		testModules = []*internal.Module{
-			sample.Module(modulePath3, "v3.0.0", "else"),
-			sample.Module(modulePath1, "v1.0.0-alpha.1", "bar"),
-			sample.Module(modulePath1, "v1.0.0", "bar"),
-			sample.Module(modulePath2, "v2.0.1-beta", "bar"),
-			sample.Module(modulePath2, "v2.1.0", "bar"),
-		}
-	)
-
-	testCases := []struct {
-		name, path, modulePath string
-		numPseudo              int
-		modules                []*internal.Module
-		wantTaggedVersions     []*internal.ModuleInfo
-	}{
-		{
-			name:       "want_releases_and_prereleases_only",
-			path:       "path.to/foo/bar",
-			modulePath: modulePath1,
-			numPseudo:  12,
-			modules:    testModules,
-			wantTaggedVersions: []*internal.ModuleInfo{
-				{
-					ModulePath: modulePath2,
-					Version:    "v2.1.0",
-					CommitTime: sample.CommitTime,
-				},
-				{
-					ModulePath: modulePath2,
-					Version:    "v2.0.1-beta",
-					CommitTime: sample.CommitTime,
-				},
-				{
-					ModulePath: modulePath1,
-					Version:    "v1.0.0",
-					CommitTime: sample.CommitTime,
-				},
-				{
-					ModulePath: modulePath1,
-					Version:    "v1.0.0-alpha.1",
-					CommitTime: sample.CommitTime,
-				},
-			},
-		},
-		{
-			name:       "want_zero_results_in_non_empty_db",
-			path:       "not.a/real/path",
-			modulePath: "not.a/real/path",
-			modules:    testModules,
-		},
-		{
-			name:       "want_zero_results_in_empty_db",
-			path:       "not.a/real/path",
-			modulePath: "not.a/real/path",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			defer ResetTestDB(testDB, t)
-
-			var wantPseudoVersions []*internal.ModuleInfo
-			for i := 0; i < tc.numPseudo; i++ {
-
-				pseudo := fmt.Sprintf("v0.0.0-201806111833%02d-d8887717615a", i+1)
-				m := sample.Module(modulePath1, pseudo, "bar")
-				if err := testDB.InsertModule(ctx, m); err != nil {
-					t.Fatal(err)
-				}
-
-				// LegacyGetPsuedoVersions should only return the 10 most recent pseudo versions,
-				// if there are more than 10 in the database
-				if i < 10 {
-					wantPseudoVersions = append(wantPseudoVersions, &internal.ModuleInfo{
-						ModulePath: modulePath1,
-						Version:    fmt.Sprintf("v0.0.0-201806111833%02d-d8887717615a", tc.numPseudo-i),
-						CommitTime: sample.CommitTime,
-					})
-				}
-			}
-
-			for _, m := range tc.modules {
-				if err := testDB.InsertModule(ctx, m); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			got, err := testDB.LegacyGetPsuedoVersionsForPackageSeries(ctx, tc.path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(wantPseudoVersions, got, cmp.AllowUnexported(source.Info{})); diff != "" {
-				t.Errorf("testDB.LegacyGetPsuedoVersionsForPackageSeries(%q) mismatch (-want +got):\n%s", tc.path, diff)
-			}
-
-			got, err = testDB.LegacyGetTaggedVersionsForPackageSeries(ctx, tc.path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(tc.wantTaggedVersions, got, cmp.AllowUnexported(source.Info{})); diff != "" {
-				t.Errorf("testDB.LegacyGetTaggedVersionsForPackageSeries(%q) mismatch (-want +got):\n%s", tc.path, diff)
-			}
-
-			got, err = testDB.LegacyGetPsuedoVersionsForModule(ctx, tc.modulePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(wantPseudoVersions, got, cmp.AllowUnexported(source.Info{})); diff != "" {
-				t.Errorf("testDB.LegacyGetPsuedoVersionsForModule(%q) mismatch (-want +got):\n%s", tc.path, diff)
-			}
-
-			got, err = testDB.LegacyGetTaggedVersionsForModule(ctx, tc.modulePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(tc.wantTaggedVersions, got, cmp.AllowUnexported(source.Info{})); diff != "" {
-				t.Errorf("testDB.LegacyGetTaggedVersionsForModule(%q) mismatch (-want +got):\n%s", tc.path, diff)
-			}
-		})
-	}
-}
-
 func TestGetVersions(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
+	t.Parallel()
 	var (
 		taggedAndPseudoModule = "path.to/foo"
 		taggedModuleV2        = "path.to/foo/v2"
@@ -187,12 +57,19 @@ func TestGetVersions(t *testing.T) {
 		testModules = append(testModules, sample.Module(pseudoModule, fmt.Sprintf("v0.0.0-202001011200%02d-000000000000", i), "blog"))
 	}
 
-	defer ResetTestDB(testDB, t)
+	testDB, release := acquire(t)
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
 	for _, m := range testModules {
-		if err := testDB.InsertModule(ctx, m); err != nil {
-			t.Fatal(err)
-		}
+		MustInsertModule(ctx, t, testDB, m)
 	}
+	// Add latest version info for rootModule.
+	addLatest(ctx, t, testDB, rootModule, "v1.1.0", `
+		module golang.org/foo/bar // Deprecated: use other
+		retract v1.0.3 // security flaw
+    `)
 
 	stdModuleVersions := []*internal.ModuleInfo{
 		{
@@ -290,11 +167,11 @@ func TestGetVersions(t *testing.T) {
 			want: []*internal.ModuleInfo{
 				{
 					ModulePath: incompatibleModule,
-					Version:    "v2.0.0+incompatible",
+					Version:    "v0.0.0",
 				},
 				{
 					ModulePath: incompatibleModule,
-					Version:    "v0.0.0",
+					Version:    "v2.0.0+incompatible",
 				},
 			},
 		},
@@ -311,26 +188,38 @@ func TestGetVersions(t *testing.T) {
 					Version:    "v1.0.3",
 				},
 				{
-					ModulePath: rootModule,
-					Version:    "v1.0.3",
+					ModulePath:          rootModule,
+					Version:             "v1.0.3",
+					Deprecated:          true,
+					DeprecationComment:  "use other",
+					Retracted:           true,
+					RetractionRationale: "security flaw",
 				},
 				{
-					ModulePath: rootModule,
-					Version:    "v0.11.6",
+					ModulePath:         rootModule,
+					Version:            "v0.11.6",
+					Deprecated:         true,
+					DeprecationComment: "use other",
 				},
 			},
 		},
 		{
-			name: "root_module_path",
+			name: "root module path",
 			path: "golang.org/foo/bar",
 			want: []*internal.ModuleInfo{
 				{
-					ModulePath: rootModule,
-					Version:    "v1.0.3",
+					ModulePath:          rootModule,
+					Version:             "v1.0.3",
+					Deprecated:          true,
+					DeprecationComment:  "use other",
+					Retracted:           true,
+					RetractionRationale: "security flaw",
 				},
 				{
-					ModulePath: rootModule,
-					Version:    "v0.11.6",
+					ModulePath:         rootModule,
+					Version:            "v0.11.6",
+					Deprecated:         true,
+					DeprecationComment: "use other",
 				},
 			},
 		},
@@ -340,21 +229,379 @@ func TestGetVersions(t *testing.T) {
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			var want []*internal.ModuleInfo
-			for _, w := range tc.want {
+	ctx = experiment.NewContext(ctx, internal.ExperimentRetractions)
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			for _, w := range test.want {
 				mod := sample.ModuleInfo(w.ModulePath, w.Version)
-				want = append(want, mod)
+				w.CommitTime = mod.CommitTime
+				w.IsRedistributable = mod.IsRedistributable
+				w.HasGoMod = mod.HasGoMod
+				w.SourceInfo = mod.SourceInfo
 			}
 
-			got, err := testDB.GetVersionsForPath(ctx, tc.path)
+			got, err := testDB.GetVersionsForPath(ctx, test.path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(want, got, cmp.AllowUnexported(source.Info{})); diff != "" {
-				t.Errorf("testDB.GetVersionsForPath(%q) mismatch (-want +got):\n%s", tc.path, diff)
+			if diff := cmp.Diff(test.want, got, cmp.AllowUnexported(source.Info{})); diff != "" {
+				t.Errorf("testDB.GetVersionsForPath(%q) mismatch (-want +got):\n%s", test.path, diff)
 			}
 		})
+	}
+}
+
+func TestGetLatestInfo(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	for _, m := range []*internal.Module{
+		sample.Module("a.com/M", "v1.1.1", "all", "most", "some", "one", "D/other"),
+		sample.Module("a.com/M", "v1.2.0", "all", "most"),
+		sample.Module("a.com/M", "v99.0.0+incompatible", "all", "most"),
+		sample.Module("a.com/M/v2", "v2.0.5", "all", "most"),
+		sample.Module("a.com/M/v3", "v3.0.1", "all", "some"),
+		sample.Module("a.com/M/D", "v1.3.0", "other"),
+		sample.Module("b.com/M/v9", "v9.0.0", ""),
+		sample.Module("b.com/M/v10", "v10.0.0", ""),
+	} {
+		MustInsertModule(ctx, t, testDB, m)
+	}
+
+	for _, test := range []struct {
+		unit, module string
+		want         internal.LatestInfo
+	}{
+		{
+			// A unit that is the module.
+			"a.com/M", "a.com/M",
+
+			internal.LatestInfo{
+				MinorVersion:      "v1.2.0",
+				MinorModulePath:   "a.com/M",
+				UnitExistsAtMinor: true,
+				MajorModulePath:   "a.com/M/v3",
+				MajorUnitPath:     "a.com/M/v3",
+			},
+		},
+		{
+			// A unit that exists in all versions of the module.
+			"a.com/M/all", "a.com/M",
+
+			internal.LatestInfo{
+				MinorVersion:      "v1.2.0",
+				MinorModulePath:   "a.com/M",
+				UnitExistsAtMinor: true,
+				MajorModulePath:   "a.com/M/v3",
+				MajorUnitPath:     "a.com/M/v3/all",
+			},
+		},
+		{
+			// A unit that exists in most versions, but not the latest major.
+			"a.com/M/most", "a.com/M",
+
+			internal.LatestInfo{
+				MinorVersion:      "v1.2.0",
+				MinorModulePath:   "a.com/M",
+				UnitExistsAtMinor: true,
+				MajorModulePath:   "a.com/M/v3",
+				MajorUnitPath:     "a.com/M/v3",
+			},
+		},
+		{
+			// A unit that does not exist at the latest minor version, but does at the latest major.
+			"a.com/M/some", "a.com/M",
+
+			internal.LatestInfo{
+				MinorVersion:      "v1.1.1",
+				MinorModulePath:   "a.com/M",
+				UnitExistsAtMinor: false,
+				MajorModulePath:   "a.com/M/v3",
+				MajorUnitPath:     "a.com/M/v3/some",
+			},
+		},
+		{
+			// A unit that does not exist at the latest minor or major versions.
+			"a.com/M/one", "a.com/M",
+
+			internal.LatestInfo{
+				MinorVersion:      "v1.1.1",
+				MinorModulePath:   "a.com/M",
+				UnitExistsAtMinor: false,
+				MajorModulePath:   "a.com/M/v3",
+				MajorUnitPath:     "a.com/M/v3",
+			},
+		},
+		{
+			// A unit whose latest minor version is in a different module.
+			"a.com/M/D/other", "a.com/M",
+
+			internal.LatestInfo{
+				MinorVersion:      "v1.3.0",
+				MinorModulePath:   "a.com/M/D",
+				UnitExistsAtMinor: false,
+				MajorModulePath:   "a.com/M/v3",
+				MajorUnitPath:     "a.com/M/v3",
+			},
+		},
+		{
+			// A module with v9 and v10 versions.
+			"b.com/M/v9", "b.com/M/v9",
+			internal.LatestInfo{
+				MinorVersion:      "v9.0.0",
+				MinorModulePath:   "b.com/M/v9",
+				UnitExistsAtMinor: true,
+				MajorModulePath:   "b.com/M/v10",
+				MajorUnitPath:     "b.com/M/v10",
+			},
+		},
+	} {
+		t.Run(test.unit, func(t *testing.T) {
+			got, err := testDB.GetLatestInfo(ctx, test.unit, test.module)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(test.want, got); diff != "" {
+				t.Errorf("mismatch (-want, +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestShouldUpdateRawLatest(t *testing.T) {
+	for _, test := range []struct {
+		new, cur string
+		want     bool
+	}{
+		{"v1.2.0", "v1.0.0", true},
+		{"v1.2.0", "v1.2.0", false},
+		{"v1.2.0", "v1.3.0", false},
+		{"v1.0.0", "v1.9.9-pre", true},          // release beats prerelease
+		{"v1.0.0", "v2.3.4+incompatible", true}, // compatible beats incompatible
+	} {
+		got := shouldUpdateRawLatest(test.new, test.cur)
+		if got != test.want {
+			t.Errorf("shouldUpdateRawLatest(%q, %q) = %t, want %t", test.new, test.cur, got, test.want)
+		}
+	}
+}
+
+func addLatest(ctx context.Context, t *testing.T, db *DB, modulePath, version, modFile string) {
+	info, err := internal.NewLatestModuleVersions(modulePath, version, version, "", []byte(modFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateLatestModuleVersions(ctx, info); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetLatestGoodVersion(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+
+	const (
+		modulePath = "example.com/m"
+		modFile    = `
+			module example.com/m
+			retract v1.3.0
+		`
+	)
+
+	lmv, err := internal.NewLatestModuleVersions(modulePath, "", "", "", []byte(modFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"v2.0.0+incompatible", "v1.4.0-pre", "v1.3.0", "v1.2.0", "v1.1.0"} {
+		MustInsertModule(ctx, t, testDB, sample.Module(modulePath, v, "pkg"))
+	}
+
+	for _, test := range []struct {
+		name   string
+		cooked string // cooked latest version
+		want   string
+	}{
+		{
+			name:   "compatible",
+			cooked: "v1.3.0",
+			want:   "v1.2.0", // v1.3.0 is retracted
+		},
+		{
+			name:   "incompatible",
+			cooked: "v2.0.0+incompatible",
+			want:   "v2.0.0+incompatible",
+		},
+		{
+			name:   "bad", // cooked version not in modules table
+			cooked: "v1.4.0",
+			want:   "v1.2.0",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lmv.CookedVersion = test.cooked
+			got, err := getLatestGoodVersion(ctx, testDB.db, lmv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Errorf("got %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLatestModuleVersions(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+
+	const (
+		modulePath = "example.com/m"
+		modFile    = `
+			module example.com/m
+			retract v1.3.0
+		`
+		incompatible = "v2.0.0+incompatible"
+	)
+	modBytes := []byte(modFile)
+
+	for _, v := range []string{incompatible, "v1.4.0-pre", "v1.3.0", "v1.2.0", "v1.1.0"} {
+		MustInsertModule(ctx, t, testDB, sample.Module(modulePath, v, "pkg"))
+	}
+
+	type versions struct {
+		raw, cooked, good string
+	}
+	// These tests form a sequence. Each test's want versions are in the DB for the next test.
+	for _, test := range []struct {
+		name     string
+		in, want versions
+	}{
+		{
+			name: "initial",
+			in:   versions{"v1.3.0", "v1.2.0", ""}, // in good isn't used
+			want: versions{"v1.3.0", "v1.2.0", "v1.2.0"},
+		},
+		{
+			name: "older", // older incoming info doesn't cause an update
+			in:   versions{"v1.2.0", "v1.2.0", ""},
+			want: versions{"v1.3.0", "v1.2.0", "v1.2.0"},
+		},
+		{
+			name: "newer bad", // a newer version, not in modules table
+			in:   versions{"v1.4.0", "v1.4.0", ""},
+			want: versions{"v1.4.0", "v1.4.0", "v1.2.0"},
+		},
+		{
+			name: "incompatible",
+			in:   versions{incompatible, incompatible, ""},
+			want: versions{incompatible, incompatible, incompatible},
+		},
+		{
+			name: "compatible", // "downgrade" from incompatible to compatible will update
+			in:   versions{"v1.3.0", "v1.2.0", ""},
+			want: versions{"v1.3.0", "v1.2.0", "v1.2.0"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			vNew, err := internal.NewLatestModuleVersions(modulePath, test.in.raw, test.in.cooked, "", modBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := testDB.UpdateLatestModuleVersions(ctx, vNew); err != nil {
+				t.Fatal(err)
+			}
+			vGot, err := testDB.GetLatestModuleVersions(ctx, modulePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if vGot == nil {
+				t.Fatal("got nothing")
+			}
+			got := versions{vGot.RawVersion, vGot.CookedVersion, vGot.GoodVersion}
+			if got != test.want {
+				t.Fatalf("got %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLatestModuleVersionsBadStatus(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+
+	const modulePath = "example.com/m"
+
+	getStatus := func() int {
+		var s int
+		err := testDB.db.QueryRow(ctx, `
+				SELECT status
+				FROM latest_module_versions l
+				INNER JOIN paths p ON (p.id=l.module_path_id)
+				WHERE p.path = $1`,
+			modulePath).Scan(&s)
+		if err != nil && err != sql.ErrNoRows {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	// Insert a failure status.
+	newStatus := 410
+	if err := testDB.UpdateLatestModuleVersionsStatus(ctx, modulePath, newStatus); err != nil {
+		t.Fatal(err)
+	}
+	if got := getStatus(); got != newStatus {
+		t.Errorf("got %d, want %d", got, newStatus)
+	}
+
+	// GetLatestModuleVersions should return nil.
+	got, err := testDB.GetLatestModuleVersions(ctx, modulePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("got %v, want nil", got)
+	}
+
+	// A new failure status should overwrite.
+	newStatus = 404
+	if err := testDB.UpdateLatestModuleVersionsStatus(ctx, modulePath, newStatus); err != nil {
+		t.Fatal(err)
+	}
+	if got := getStatus(); got != newStatus {
+		t.Errorf("got %d, want %d", got, newStatus)
+	}
+
+	// Good information overwrites.
+	lmv, err := internal.NewLatestModuleVersions(modulePath, "v1.2.3", "v1.2.3", "", []byte(`module example.com/m`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testDB.UpdateLatestModuleVersions(ctx, lmv); err != nil {
+		t.Fatal(err)
+	}
+	if got := getStatus(); got != 200 {
+		t.Errorf("got %d, want %d", got, 200)
+	}
+
+	// Once we have good information, a bad status won't remove it.
+	if err := testDB.UpdateLatestModuleVersionsStatus(ctx, modulePath, 500); err != nil {
+		t.Fatal(err)
+	}
+	got, err = testDB.GetLatestModuleVersions(ctx, modulePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Error("got nil, want non-nil")
 	}
 }

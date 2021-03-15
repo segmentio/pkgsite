@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// The fetch command runs a server that fetches modules from a proxy and writes
-// them to the discovery database.
+// The worker command runs a service with the primary job of fetching modules
+// from a proxy and writing them to the database.
 package main
 
 import (
@@ -12,37 +12,34 @@ import (
 	"flag"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"cloud.google.com/go/errorreporting"
 	"cloud.google.com/go/profiler"
-	"github.com/go-redis/redis/v7"
+	"github.com/go-redis/redis/v8"
 	"github.com/google/safehtml/template"
-	"golang.org/x/pkgsite/internal"
+	_ "github.com/jackc/pgx/v4/stdlib" // for pgx driver
+	"golang.org/x/pkgsite/cmd/internal/cmdconfig"
 	"golang.org/x/pkgsite/internal/config"
-	"golang.org/x/pkgsite/internal/database"
 	"golang.org/x/pkgsite/internal/dcensus"
+	"golang.org/x/pkgsite/internal/fetch"
 	"golang.org/x/pkgsite/internal/index"
-	"golang.org/x/pkgsite/internal/queue"
-	"golang.org/x/pkgsite/internal/source"
-	"golang.org/x/pkgsite/internal/worker"
-
 	"golang.org/x/pkgsite/internal/log"
 	"golang.org/x/pkgsite/internal/middleware"
 	"golang.org/x/pkgsite/internal/postgres"
 	"golang.org/x/pkgsite/internal/proxy"
-
-	"contrib.go.opencensus.io/integrations/ocsql"
+	"golang.org/x/pkgsite/internal/queue"
+	"golang.org/x/pkgsite/internal/source"
+	"golang.org/x/pkgsite/internal/worker"
 )
 
 var (
-	timeout   = config.GetEnv("GO_DISCOVERY_WORKER_TIMEOUT_MINUTES", "10")
+	timeout   = config.GetEnvInt("GO_DISCOVERY_WORKER_TIMEOUT_MINUTES", 10)
 	queueName = config.GetEnv("GO_DISCOVERY_WORKER_TASK_QUEUE", "")
 	workers   = flag.Int("workers", 10, "number of concurrent requests to the fetch service, when running locally")
 	// flag used in call to safehtml/template.TrustedSourceFromFlag
-	_ = flag.String("static", "content/static", "path to folder containing static files served")
+	_                  = flag.String("static", "content/static", "path to folder containing static files served")
+	bypassLicenseCheck = flag.Bool("bypass_license_check", false, "insert all data into the DB, even for non-redistributable paths")
 )
 
 func main() {
@@ -54,7 +51,9 @@ func main() {
 	if err != nil {
 		log.Fatal(ctx, err)
 	}
-	cfg.Dump(os.Stderr)
+	cfg.Dump(os.Stdout)
+
+	log.SetLevel(cfg.LogLevel)
 
 	if cfg.UseProfiler {
 		if err := profiler.Start(profiler.Config{}); err != nil {
@@ -64,16 +63,10 @@ func main() {
 
 	readProxyRemoved(ctx)
 
-	// Wrap the postgres driver with OpenCensus instrumentation.
-	driverName, err := ocsql.Register("postgres", ocsql.WithAllTraceOptions())
+	db, err := cmdconfig.OpenDB(ctx, cfg, *bypassLicenseCheck)
 	if err != nil {
-		log.Fatalf(ctx, "unable to register the ocsql driver: %v\n", err)
+		log.Fatalf(ctx, "%v", err)
 	}
-	ddb, err := database.Open(driverName, cfg.DBConnInfo(), cfg.InstanceID)
-	if err != nil {
-		log.Fatalf(ctx, "database.Open: %v", err)
-	}
-	db := postgres.New(ddb)
 	defer db.Close()
 
 	populateExcluded(ctx, db)
@@ -87,28 +80,36 @@ func main() {
 		log.Fatal(ctx, err)
 	}
 	sourceClient := source.NewClient(config.SourceTimeout)
-	fetchQueue, err := queue.New(ctx, cfg, queueName, *workers, db,
+	expg := cmdconfig.ExperimentGetter(ctx, cfg)
+	fetchQueue, err := queue.New(ctx, cfg, queueName, *workers, expg,
 		func(ctx context.Context, modulePath, version string) (int, error) {
-			return worker.FetchAndUpdateState(ctx, modulePath, version, proxyClient, sourceClient, db, cfg.AppVersionLabel())
+			f := &worker.Fetcher{
+				ProxyClient:  proxyClient,
+				SourceClient: sourceClient,
+				DB:           db,
+			}
+			code, _, err := f.FetchAndUpdateState(ctx, modulePath, version, cfg.AppVersionLabel())
+			return code, err
 		})
 	if err != nil {
 		log.Fatalf(ctx, "queue.New: %v", err)
 	}
 
-	reportingClient := reportingClient(ctx, cfg)
+	reportingClient := cmdconfig.ReportingClient(ctx, cfg)
 	redisHAClient := getHARedis(ctx, cfg)
 	redisCacheClient := getCacheRedis(ctx, cfg)
+	experimenter := cmdconfig.Experimenter(ctx, cfg, expg, reportingClient)
 	server, err := worker.NewServer(cfg, worker.ServerConfig{
-		DB:                   db,
-		IndexClient:          indexClient,
-		ProxyClient:          proxyClient,
-		SourceClient:         sourceClient,
-		RedisHAClient:        redisHAClient,
-		RedisCacheClient:     redisCacheClient,
-		Queue:                fetchQueue,
-		ReportingClient:      reportingClient,
-		TaskIDChangeInterval: config.TaskIDChangeIntervalWorker,
-		StaticPath:           template.TrustedSourceFromFlag(flag.Lookup("static").Value),
+		DB:               db,
+		IndexClient:      indexClient,
+		ProxyClient:      proxyClient,
+		SourceClient:     sourceClient,
+		RedisHAClient:    redisHAClient,
+		RedisCacheClient: redisCacheClient,
+		Queue:            fetchQueue,
+		ReportingClient:  reportingClient,
+		StaticPath:       template.TrustedSourceFromFlag(flag.Lookup("static").Value),
+		GetExperiments:   experimenter.Experiments,
 	})
 	if err != nil {
 		log.Fatal(ctx, err)
@@ -116,7 +117,13 @@ func main() {
 	router := dcensus.NewRouter(nil)
 	server.Install(router.Handle)
 
-	views := append(dcensus.ServerViews, worker.EnqueueResponseCount)
+	views := append(dcensus.ServerViews,
+		worker.EnqueueResponseCount,
+		worker.ProcessingLag,
+		fetch.FetchLatencyDistribution,
+		fetch.FetchResponseCount,
+		fetch.SheddedFetchCount,
+		fetch.FetchPackageCount)
 	if err := dcensus.Init(cfg, views...); err != nil {
 		log.Fatal(ctx, err)
 	}
@@ -130,19 +137,15 @@ func main() {
 		go http.ListenAndServe(cfg.DebugAddr("localhost:8001"), dcensusServer)
 	}
 
-	handlerTimeout, err := strconv.Atoi(timeout)
-	if err != nil {
-		log.Fatalf(ctx, "strconv.Atoi(%q): %v", timeout, err)
+	iap := middleware.Identity()
+	if aud := os.Getenv("GO_DISCOVERY_IAP_AUDIENCE"); aud != "" {
+		iap = middleware.ValidateIAPHeader(aud)
 	}
-	requestLogger := logger(ctx, cfg)
 
-	experimenter, err := middleware.NewExperimenter(ctx, 1*time.Minute, func(context.Context) internal.ExperimentSource { return db })
-	if err != nil {
-		log.Fatal(ctx, err)
-	}
 	mw := middleware.Chain(
-		middleware.RequestLog(requestLogger),
-		middleware.Timeout(time.Duration(handlerTimeout)*time.Minute),
+		middleware.RequestLog(cmdconfig.Logger(ctx, cfg, "worker-log")),
+		middleware.Timeout(time.Duration(timeout)*time.Minute),
+		iap,
 		middleware.Experiment(experimenter),
 	)
 	http.Handle("/", mw(router))
@@ -160,7 +163,7 @@ func getHARedis(ctx context.Context, cfg *config.Config) *redis.Client {
 }
 
 func getCacheRedis(ctx context.Context, cfg *config.Config) *redis.Client {
-	return getRedis(ctx, cfg.RedisCacheHost, cfg.RedisCachePort, 0, 0)
+	return getRedis(ctx, cfg.RedisCacheHost, cfg.RedisCachePort, 0, 6*time.Second)
 }
 
 func getRedis(ctx context.Context, host, port string, writeTimeout, readTimeout time.Duration) *redis.Client {
@@ -177,33 +180,6 @@ func getRedis(ctx context.Context, host, port string, writeTimeout, readTimeout 
 		WriteTimeout: writeTimeout,
 		ReadTimeout:  readTimeout,
 	})
-}
-
-func reportingClient(ctx context.Context, cfg *config.Config) *errorreporting.Client {
-	if !cfg.OnAppEngine() {
-		return nil
-	}
-	reporter, err := errorreporting.NewClient(ctx, cfg.ProjectID, errorreporting.Config{
-		ServiceName: cfg.ServiceID,
-		OnError: func(err error) {
-			log.Errorf(ctx, "Error reporting failed: %v", err)
-		},
-	})
-	if err != nil {
-		log.Fatal(ctx, err)
-	}
-	return reporter
-}
-
-func logger(ctx context.Context, cfg *config.Config) middleware.Logger {
-	if cfg.OnAppEngine() {
-		logger, err := log.UseStackdriver(ctx, cfg, "worker-log")
-		if err != nil {
-			log.Fatal(ctx, err)
-		}
-		return logger
-	}
-	return middleware.LocalLogger{}
 }
 
 // Read a file of module versions that we should ignore because
@@ -238,7 +214,7 @@ func populateExcluded(ctx context.Context, db *postgres.DB) {
 	}
 	user := os.Getenv("USER")
 	if user == "" {
-		user = "etl"
+		user = "worker"
 	}
 	for _, line := range lines {
 		var prefix, reason string

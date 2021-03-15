@@ -21,9 +21,16 @@ All issues related to x/pkgsite are labeled with the
 In particular, we would love your help on issues tagged with the
 [`help wanted` label](https://github.com/golang/go/issues?q=is%3Aissue+is%3Aopen+label%3Apkgsite+label%3A%22help+wanted%22+).
 
+If this is your first time contributing to x/pkgsite, take a look at the
+[`Suggested` issues](https://github.com/golang/go/issues?q=is%3Aissue+is%3Aopen+label%3Apkgsite+label%3A%22Suggested%22+label%3A%22help+wanted%22) for a good first issue.
+
 Before you begin working on an issue, please leave a comment that you are claiming it.
 
 ## Getting started
+
+We accept contributions through
+[Gerrit](https://golang.org/doc/contribute.html#sending_a_change_gerrit) or
+[GitHub PRs](https://golang.org/doc/contribute.html#sending_a_change_github). To get started:
 
 1. Complete the steps in the
    [Go Contribution Guide](https://golang.org/doc/contribute.html).
@@ -45,6 +52,16 @@ There are two ways to run pkg.go.dev locally.
 2. Use postgres as the datasource.
 
 See [doc/frontend.md](doc/frontend.md) for details.
+
+### Changing the log level
+
+You can use the `GO_DISCOVERY_LOG_LEVEL` environment variable to set the log level. All logs below the level that is set will not be printed.
+
+For example, setting `GO_DISCOVERY_LOG_LEVEL=info` will not print `Debug` logs, but it will print `Info`, `Error` and `Fatal` logs.
+
+The supported levels are `Debug`, `Info`, `Error` and `Fatal`.
+
+By default, logs for all levels will be printed.
 
 ## Before sending a CL for review
 

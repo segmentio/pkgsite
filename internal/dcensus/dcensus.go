@@ -15,6 +15,7 @@ import (
 	"contrib.go.opencensus.io/exporter/prometheus"
 	"contrib.go.opencensus.io/exporter/stackdriver"
 	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
 	"go.opencensus.io/trace"
@@ -24,6 +25,9 @@ import (
 	"golang.org/x/pkgsite/internal/log"
 	mrpb "google.golang.org/genproto/googleapis/api/monitoredres"
 )
+
+// KeyStatus is a tag key named "status".
+var KeyStatus = tag.MustNewKey("status")
 
 // RouteTagger is a func that can be used to derive a dynamic route tag for an
 // incoming request.
@@ -129,46 +133,62 @@ func exportToStackdriver(ctx context.Context, cfg *config.Config) {
 	}
 	view.RegisterExporter(viewExporter)
 
+	dte := &debugTraceExporter{}
 	// We want traces to be associated with the *app*, not the instance.
 	// TraceSpansBufferMaxBytes is increased from the default of 8MiB, though we
 	// can't increase *too* much because this is still running in GAE, which is
 	// relatively memory-constrained.
 	traceExporter, err := stackdriver.NewExporter(stackdriver.Options{
 		ProjectID:                cfg.ProjectID,
-		MonitoredResource:        (*monitoredResource)(cfg.AppMonitoredResource),
+		MonitoredResource:        (*monitoredResource)(cfg.MonitoredResource),
 		TraceSpansBufferMaxBytes: 32 * 1024 * 1024, // 32 MiB
+		DefaultMonitoringLabels:  stackdriverLabels(cfg),
+		OnError:                  dte.onError,
 	})
 	if err != nil {
 		log.Fatalf(ctx, "error creating trace exporter: %v", err)
 	}
-	trace.RegisterExporter(traceExporter)
+	dte.exp = traceExporter
+	trace.RegisterExporter(dte)
 }
 
 // NewViewExporter creates a StackDriver exporter for stats.
 func NewViewExporter(cfg *config.Config) (_ *stackdriver.Exporter, err error) {
 	defer derrors.Wrap(&err, "NewViewExporter()")
 
-	labels := &stackdriver.Labels{}
-	labels.Set("version", cfg.AppVersionLabel(), "Version label of the running binary")
-
 	// Views must be associated with the instance, else we run into overlapping
 	// timeseries problems. Note that generic_task is used because the
 	// gae_instance resource type is not supported for metrics:
 	// https://cloud.google.com/monitoring/custom-metrics/creating-metrics#which-resource
-	return stackdriver.NewExporter(stackdriver.Options{
-		ProjectID: cfg.ProjectID,
-		MonitoredResource: &monitoredResource{
-			Type: "generic_task",
-			Labels: map[string]string{
-				"project_id": cfg.ProjectID,
-				"location":   cfg.LocationID,
-				"job":        cfg.ServiceID,
-				"namespace":  "go-discovery",
-				"task_id":    cfg.InstanceID,
-			},
+	mr := &monitoredResource{
+		Type: "generic_task",
+		Labels: map[string]string{
+			"project_id": cfg.ProjectID,
+			"location":   cfg.LocationID,
+			"job":        cfg.ServiceID,
+			"namespace":  "go-discovery",
+			"task_id":    cfg.InstanceID,
 		},
-		DefaultMonitoringLabels: labels,
+	}
+	if cfg.OnGKE() {
+		mr = (*monitoredResource)(cfg.MonitoredResource)
+	}
+	return stackdriver.NewExporter(stackdriver.Options{
+		ProjectID:               cfg.ProjectID,
+		MonitoredResource:       mr,
+		DefaultMonitoringLabels: stackdriverLabels(cfg),
+		OnError: func(err error) {
+			log.Warningf(context.Background(), "Stackdriver view exporter: %v", err)
+		},
 	})
+}
+
+func stackdriverLabels(cfg *config.Config) *stackdriver.Labels {
+	labels := &stackdriver.Labels{}
+	labels.Set("version", cfg.AppVersionLabel(), "Version label of the running binary")
+	labels.Set("env", cfg.DeploymentEnvironment(), "deployment environment")
+	labels.Set("app", cfg.Application(), "application name")
+	return labels
 }
 
 // Customizations of ochttp views. Views are updated as follows:
@@ -213,3 +233,8 @@ var (
 		ServerResponseBytes,
 	}
 )
+
+// RecordWithTag is a convenience function for recording a single measurement with a single tag.
+func RecordWithTag(ctx context.Context, key tag.Key, val string, m stats.Measurement) {
+	stats.RecordWithTags(ctx, []tag.Mutator{tag.Upsert(key, val)}, m)
+}

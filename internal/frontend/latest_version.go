@@ -6,64 +6,28 @@ package frontend
 
 import (
 	"context"
-	"errors"
 
 	"golang.org/x/pkgsite/internal"
-	"golang.org/x/pkgsite/internal/derrors"
-	"golang.org/x/pkgsite/internal/experiment"
 	"golang.org/x/pkgsite/internal/log"
 )
 
-// LatestVersion returns the latest version of the package or module.
-// The linkable form of the version is returned.
-// It returns the empty string on error.
-// It is intended to be used as an argument to middleware.LatestVersion.
-func (s *Server) LatestVersion(ctx context.Context, packagePath, modulePath, pageType string) string {
+// GetLatestInfo returns various pieces of information about the latest
+// versions of a unit and module:
+// -  The linkable form of the minor version of the unit.
+// -  The latest module path and the full unit path of any major version found given the
+//    fullPath and the modulePath.
+// It returns empty strings on error.
+// It is intended to be used as an argument to middleware.LatestVersions.
+func (s *Server) GetLatestInfo(ctx context.Context, unitPath, modulePath string) internal.LatestInfo {
 	// It is okay to use a different DataSource (DB connection) than the rest of the
-	// request, because this makes a self-contained call on the DB.
-	v, err := latestVersion(ctx, s.getDataSource(ctx), packagePath, modulePath, pageType)
+	// request, because this makes self-contained calls on the DB.
+	ds := s.getDataSource(ctx)
+
+	latest, err := ds.GetLatestInfo(ctx, unitPath, modulePath)
 	if err != nil {
-		// We get NotFound errors from directories; they clutter the log.
-		if !errors.Is(err, derrors.NotFound) {
-			log.Errorf(ctx, "GetLatestVersion: %v", err)
-		}
-		return ""
+		log.Errorf(ctx, "Server.GetLatestInfo: %v", err)
+	} else {
+		latest.MinorVersion = linkVersion(latest.MinorVersion, latest.MinorModulePath)
 	}
-	return v
-}
-
-// TODO(https://github.com/golang/go/issues/40107): this is currently tested in server_test.go, but
-// we should add tests for this function.
-func latestVersion(ctx context.Context, ds internal.DataSource, packagePath, modulePath, pageType string) (_ string, err error) {
-	defer derrors.Wrap(&err, "latestVersion(ctx, %q, %q)", modulePath, packagePath)
-	if experiment.IsActive(ctx, internal.ExperimentUsePathInfo) {
-		fullPath := packagePath
-		if pageType == pageTypeModule || pageType == pageTypeStdLib {
-			fullPath = modulePath
-		}
-		modulePath, version, _, err := ds.GetPathInfo(ctx, fullPath, modulePath, internal.LatestVersion)
-		if err != nil {
-			return "", err
-		}
-		return linkVersion(version, modulePath), nil
-	}
-
-	var mi *internal.LegacyModuleInfo
-	switch pageType {
-	case pageTypeModule, pageTypeStdLib:
-		mi, err = ds.LegacyGetModuleInfo(ctx, modulePath, internal.LatestVersion)
-		if err != nil {
-			return "", err
-		}
-	case pageTypePackage, pageTypeCommand:
-		pkg, err := ds.LegacyGetPackage(ctx, packagePath, modulePath, internal.LatestVersion)
-		if err != nil {
-			return "", err
-		}
-		mi = &pkg.LegacyModuleInfo
-	default:
-		// For directories we don't have a well-defined latest version.
-		return "", nil
-	}
-	return linkVersion(mi.Version, modulePath), nil
+	return latest
 }

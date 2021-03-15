@@ -7,38 +7,51 @@ package frontend
 import (
 	"context"
 	"fmt"
+	"path"
+	"sort"
 	"strings"
 
-	"github.com/google/safehtml"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal/godoc"
+	"golang.org/x/pkgsite/internal/godoc/dochtml"
 	"golang.org/x/pkgsite/internal/log"
+	"golang.org/x/pkgsite/internal/middleware"
 	"golang.org/x/pkgsite/internal/stdlib"
 )
 
-// DocumentationDetails contains data for the doc template.
-type DocumentationDetails struct {
-	GOOS          string
-	GOARCH        string
-	Documentation safehtml.HTML
+func renderDocParts(ctx context.Context, u *internal.Unit, docPkg *godoc.Package) (_ *dochtml.Parts, err error) {
+	defer derrors.Wrap(&err, "renderDocParts")
+	defer middleware.ElapsedStat(ctx, "renderDocParts")()
+
+	modInfo := &godoc.ModuleInfo{
+		ModulePath:      u.ModulePath,
+		ResolvedVersion: u.Version,
+		ModulePackages:  nil, // will be provided by docPkg
+	}
+	var innerPath string
+	if u.ModulePath == stdlib.ModulePath {
+		innerPath = u.Path
+	} else if u.Path != u.ModulePath {
+		innerPath = u.Path[len(u.ModulePath)+1:]
+	}
+	return docPkg.RenderParts(ctx, innerPath, u.SourceInfo, modInfo)
 }
 
-// legacyFetchDocumentationDetails returns a DocumentationDetails constructed
-// from pkg.
-func legacyFetchDocumentationDetails(pkg *internal.LegacyVersionedPackage) *DocumentationDetails {
-	return &DocumentationDetails{
-		GOOS:          pkg.GOOS,
-		GOARCH:        pkg.GOARCH,
-		Documentation: pkg.DocumentationHTML,
+// sourceFiles returns the .go files for a package.
+func sourceFiles(u *internal.Unit, docPkg *godoc.Package) []*File {
+	var files []*File
+	for _, f := range docPkg.Files {
+		if strings.HasSuffix(f.Name, "_test.go") {
+			continue
+		}
+		files = append(files, &File{
+			Name: f.Name,
+			URL:  u.SourceInfo.FileURL(path.Join(internal.Suffix(u.Path, u.ModulePath), f.Name)),
+		})
 	}
-}
-
-// fetchDocumentationDetails returns a DocumentationDetails constructed from doc.
-func fetchDocumentationDetails(doc *internal.Documentation) *DocumentationDetails {
-	return &DocumentationDetails{
-		GOOS:          doc.GOOS,
-		GOARCH:        doc.GOARCH,
-		Documentation: doc.HTML,
-	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+	return files
 }
 
 // fileSource returns the original filepath in the module zip where the given

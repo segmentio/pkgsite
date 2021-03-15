@@ -8,8 +8,8 @@ For additional information on our architecture, see the
 
 ## Local development database
 
-1. Install PostgreSQL on your machine for local development.
-   It should use the default Postgres port of 5432.
+1. Install PostgreSQL (version 11 or higher) on your machine for local
+   development. It should use the default Postgres port of 5432.
 
    If you use a Mac, the easiest way to do that is through installing
    https://postgresapp.com.
@@ -62,7 +62,7 @@ Tests require a Postgres instance. If you followed the docker setup in step 1 in
 then you have one.
 
 When running `go test ./...`, database tests will not run if you don't have
-postgres running. To run these tests, set `GO_DISCOVERY_RUN_TESTDB=true`.
+postgres running. To run these tests, set `GO_DISCOVERY_TESTDB=true`.
 Alternatively, you can run `./all.bash`, which will run the database tests.
 
 Tests use the following environment variables:
@@ -117,6 +117,9 @@ The two migration files are used to migrate "up" to the specified version from
 the previous version, and to migrate "down" to the previous version. See
 [golang-migrate/migrate/MIGRATIONS.md](https://github.com/golang-migrate/migrate/blob/master/MIGRATIONS.md)
 for details.
+
+If your migration requires that data be transformed, or that all modules must be
+reprocessed, explain in the `up.sql` file how to carry out the data migration.
 
 ### Applying migrations for local development
 

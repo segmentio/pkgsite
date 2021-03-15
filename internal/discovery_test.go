@@ -6,10 +6,12 @@ package internal
 
 import (
 	"testing"
+
+	"golang.org/x/pkgsite/internal/stdlib"
 )
 
 func TestSeriesPathForModule(t *testing.T) {
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		modulePath, wantSeriesPath string
 	}{
 		{
@@ -29,9 +31,9 @@ func TestSeriesPathForModule(t *testing.T) {
 			wantSeriesPath: "gopkg.in/russross/blackfriday",
 		},
 	} {
-		t.Run(tc.modulePath, func(t *testing.T) {
-			if got := SeriesPathForModule(tc.modulePath); got != tc.wantSeriesPath {
-				t.Errorf("SeriesPathForModule(%q) = %q; want = %q", tc.modulePath, got, tc.wantSeriesPath)
+		t.Run(test.modulePath, func(t *testing.T) {
+			if got := SeriesPathForModule(test.modulePath); got != test.wantSeriesPath {
+				t.Errorf("SeriesPathForModule(%q) = %q; want = %q", test.modulePath, got, test.wantSeriesPath)
 			}
 		})
 	}
@@ -46,10 +48,14 @@ func TestV1Path(t *testing.T) {
 		{"mod.com/foo/v2", "bar", "mod.com/foo/bar"},
 		{"std", "bar/baz", "bar/baz"},
 	} {
-		got := V1Path(test.modulePath, test.suffix)
+		p := test.suffix
+		if test.modulePath != stdlib.ModulePath {
+			p = test.modulePath + "/" + test.suffix
+		}
+		got := V1Path(p, test.modulePath)
 		if got != test.want {
 			t.Errorf("V1Path(%q, %q) = %q, want %q",
-				test.modulePath, test.suffix, got, test.want)
+				test.modulePath, p, got, test.want)
 		}
 	}
 }

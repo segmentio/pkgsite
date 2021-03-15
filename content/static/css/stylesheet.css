@@ -21,6 +21,7 @@
   --turq-dark: #007d9c;
 
   --blue: #92e1f3;
+  --black: #000;
   --green: #00a29c;
   --pink: #ce3262;
   --purple: #542c7d;
@@ -39,16 +40,24 @@
 html,
 body {
   /**
-   * Prevent jitter when focusing within fixed elements on iOS.
+   * This is used to programatically detect whether overflow needs to be altered
+   * to prevent jitter when focusing within fixed elements on iOS.
+   * It also must be set to 'touch' for the fix to work.
    */
   -webkit-overflow-scrolling: touch;
   height: 100%;
-  overflow: auto;
 }
 body {
   color: var(--gray-1);
-  font-family: Roboto, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif,
+    'Apple Color Emoji', 'Segoe UI Emoji';
   margin: 0;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
 }
 a,
 a:link,
@@ -65,13 +74,17 @@ h3,
 h4,
 h5,
 h6 {
-  font-family: 'Work Sans', arial, sans-serif;
   word-break: break-word;
 }
 h1,
 h2,
 h3 {
-  font-weight: bold;
+  font-weight: 600;
+}
+h4,
+h5,
+h6 {
+  font-weight: 500;
 }
 h1 {
   font-size: 1.5rem;
@@ -101,9 +114,11 @@ p {
 .u-breakWord {
   word-break: break-word;
 }
-code {
+code,
+pre,
+.Documentation textarea {
   font-size: 1rem;
-  font-family: 'Source Code Pro', monospace;
+  font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
 }
 
 .Site {
@@ -115,8 +130,19 @@ code {
   flex: 1;
   padding: 0 1rem;
 }
+.Site--redesign.Site--wide .Site-content {
+  padding: 0;
+}
 .Site-footer {
   margin-top: 5rem;
+}
+@media only screen and (min-width: 57.7rem) {
+  .Site-content {
+    padding: 0 1.5rem;
+  }
+  .Site--redesign.Site--wide .Site-content {
+    padding: 0;
+  }
 }
 
 .FeedbackButton {
@@ -159,6 +185,12 @@ code {
   min-height: 2.5rem;
   padding: 0.5rem 1.5rem;
 }
+.Site--wide .Banner-inner {
+  max-width: none;
+}
+.Site--redesign .Banner-inner {
+  max-width: 98rem;
+}
 .Banner-message {
   color: #fff;
   margin-right: 1.25rem;
@@ -175,102 +207,21 @@ code {
   }
 }
 
-/* TODO: Remove deprecated Homepage styles after "new-homepage" launch */
-.SearchForm[aria-expanded='false'] .AutoComplete-list,
-.Header-searchForm[aria-expanded='false'] .AutoComplete-list {
-  display: none;
-}
-/* This class violates the style guide, because it set by autoComplete.js and
- * is non-trivial to override. */
-.autoComplete_highlighted {
-  font-weight: bold;
-}
-
-.SearchForm-container {
-  position: relative;
-  margin: 0 auto;
-  height: 3rem;
-  max-width: 38.25rem;
-}
-.SearchForm {
-  position: absolute;
-  left: 0;
-  right: 0;
-  border: 0.0625rem solid var(--gray-8);
-  border-radius: 1.4em;
-  background-color: white;
-  font-size: 1rem;
-  padding: 0.5rem 0.5rem 0.5rem 1rem;
-}
-.Experiment-autoComplete .SearchForm:hover,
-.Experiment-autoComplete .SearchForm:focus-within,
-.Experiment-autoComplete .Header-searchForm:hover,
-.Experiment-autoComplete .Header-searchForm:focus-within {
-  box-shadow: 0 0 0.1875rem rgba(0, 0, 0, 0.3);
-}
-.SearchForm-firstRow {
-  display: flex;
-  flex: 1;
-  min-height: 1.72rem;
-}
-.SearchForm-input {
-  border: none;
-  flex: 1;
-  font: inherit;
-  outline: none;
-  background-color: var(--white);
-  color: var(--black);
-}
-.SearchForm-input::placeholder {
-  color: var(--gray-5);
-}
-.SearchForm-submitIcon {
-  fill: var(--turq-med);
-  width: 23px;
-}
-.Search {
-  margin-top: 135px;
-}
-.Search-logo {
-  display: block;
-  height: 4.5rem;
-  margin: 0 auto 50px;
-  width: 194px;
-}
-.Homepage {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  margin: 2rem auto 5rem;
-  max-width: 38rem;
-}
-.Homepage-packages {
-  padding: 0 1rem;
-}
-.Homepage-packages ul {
-  list-style: none;
-  line-height: 1.4;
-  padding: 0;
-}
-/* Deprecated homepage styles end here. */
-
 .Header {
   margin: 0 auto;
   max-width: 75.75rem;
+}
+.Site--wide .Header {
+  max-width: none;
+}
+.Site--redesign .Header {
+  max-width: 98rem;
 }
 .Site-header {
   background: var(--turq-dark);
   box-shadow: 0 0.0625rem 0.125rem rgba(171, 171, 171, 0.3);
   width: 100%;
   z-index: 1;
-}
-:target::before {
-  content: ' ';
-  display: block;
-  height: 5.125rem;
-  margin-top: -5.125rem; /* Move hidden anchor content for deep linking with a sticky header. */
-  pointer-events: none;
-  visibility: hidden;
 }
 .Header-logoLink {
   margin-right: auto;
@@ -334,11 +285,11 @@ code {
 }
 .Header-menuItem--active a:link,
 .Header-menuItem--active a:visited {
-  border-top-color: var(--turq-med);
+  border-bottom-color: var(--turq-med);
   font-weight: bold;
 }
 .Header-menuItem a:hover {
-  border-top-color: var(--pink);
+  border-bottom-color: var(--white);
 }
 .Header-navOpen {
   background: no-repeat center/2rem url('/static/img/menu-24px-white.svg');
@@ -370,8 +321,8 @@ code {
   background-color: transparent;
   border: none;
   box-sizing: border-box;
+  color: transparent;
   flex: 1;
-  font: inherit;
   height: 100%;
   outline: none;
   position: absolute;
@@ -381,6 +332,7 @@ code {
   color: transparent;
 }
 .Header-searchForm:focus-within .Header-searchFormInput {
+  color: var(--gray-1);
   height: auto;
   position: relative;
   width: auto;
@@ -420,6 +372,7 @@ code {
     fill: var(--gray-4);
   }
   .Header-searchFormInput {
+    color: var(--gray-1);
     height: auto;
     position: relative;
     width: auto;
@@ -495,6 +448,13 @@ code {
 .DetailsHeader {
   margin-top: 0.75rem;
 }
+.DetailsHeader-infoIcon {
+  color: var(--gray-3);
+  flex-shrink: 0;
+  margin-left: 1rem;
+  margin-right: 0.7rem;
+  width: 1.3rem;
+}
 .DetailsHeader-breadcrumb {
   align-items: center;
   display: flex;
@@ -523,11 +483,42 @@ code {
   top: -0.125rem;
 }
 .DetailsHeader-badge--latest {
-  background: var(--blue);
+  background: var(--turq-dark);
 }
 .DetailsHeader-badge--latest a {
   display: none;
 }
+.DetailsHeader-badge--latest span.DetailsHeader-span--notAtLatest {
+  display: none;
+}
+
+.DetailsHeader-badge--notAtLatest {
+  background: var(--turq-dark);
+}
+.DetailsHeader-badge--notAtLatest a {
+  display: none;
+}
+.DetailsHeader-badge--notAtLatest span.DetailsHeader-span--latest {
+  display: none;
+}
+.DetailsHeader-badge--notAtLatest .UnitMetaDetails-icon {
+  z-index: 1;
+}
+.DetailsHeader-badge--notAtLatest .UnitMetaDetails-toggletipBubble {
+  color: black;
+  text-transform: none;
+}
+.DetailsHeader-span--notAtLatest .UnitMetaDetails-toggletip {
+  height: 0;
+}
+.DetailsHeader-span--notAtLatest .UnitMetaDetails-toggletip button {
+  height: 0.8125rem;
+  line-height: 0;
+}
+.DetailsHeader-span--notAtLatest .UnitMetaDetails-toggletip img {
+  vertical-align: middle;
+}
+
 .DetailsHeader-badge--goToLatest {
   background: var(--pink);
 }
@@ -645,6 +636,7 @@ code {
 .NotFound-gopher,
 .SearchResults-emptyContentGopher {
   display: block;
+  height: 15rem;
   margin: auto;
   padding: 1.25rem 0;
   width: 15rem;
@@ -689,8 +681,13 @@ code {
   font-size: 1.5rem;
 }
 .SearchSnippet-synopsis {
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   color: var(--gray-3);
+  display: -webkit-box;
   margin: 0 0 1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .SearchSnippet-infoLabel {
   font-size: 0.875rem;
@@ -781,6 +778,9 @@ code {
   margin: 0 auto;
   max-width: 60em;
 }
+.Site--wide .DetailsContent {
+  max-width: none;
+}
 
 .CopyToClipboardButton {
   background-color: transparent;
@@ -858,11 +858,6 @@ code {
 .DetailsNav [role='tab'] + [role='tab'] {
   margin-left: 1rem;
 }
-.DetailsNav [role='tab'][aria-disabled='true'],
-.DetailsNav [role='tab'][aria-disabled='true']:hover {
-  border-bottom: 2px solid var(--white);
-  color: var(--gray-5);
-}
 .DetailsNav [role='tab'],
 .DetailsNav [role='tab']:link,
 .DetailsNav [role='tab']:visited {
@@ -874,6 +869,12 @@ code {
 .DetailsNav [role='tab']:hover {
   border-bottom-color: var(--purple);
   text-decoration: none;
+}
+.DetailsNav [role='tab'][aria-disabled='true'],
+.DetailsNav [role='tab'][aria-disabled='true']:hover {
+  border-bottom-color: transparent;
+  color: var(--gray-5);
+  cursor: not-allowed;
 }
 .DetailsNav [role='tab'][aria-selected='true'] {
   border-bottom: 2px solid var(--turq-med);
@@ -951,6 +952,9 @@ code {
   padding: 0 0.5rem;
   position: relative;
 }
+.Site--wide .DetailsNavFixed-container {
+  max-width: none;
+}
 .DetailsNavFixed-logoLink {
   margin-right: 1rem;
 }
@@ -967,7 +971,9 @@ code {
   min-width: 0;
 }
 .DetailsNavFixed-title {
-  font: 600 1.125rem/1.5 'Work Sans', arial, sans-serif;
+  font-weight: 600;
+  font-size: 1.125rem;
+  line-height: 1.5rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -998,11 +1004,10 @@ code {
   color: var(--gray-2);
   font-size: 0.6875rem;
   position: relative;
-  text-transform: uppercase;
 }
 @media only screen and (min-width: 37.5rem) {
   .DetailsNavFixed-container {
-    padding: 0 0.5rem;
+    padding: 0 1rem 0 1.5rem;
   }
   .DetailsNavFixed-logo {
     height: 1.9541rem;
@@ -1053,6 +1058,12 @@ code {
 .DetailsNavFixed [role='tab'][aria-hidden='true'] {
   display: none;
 }
+.DetailsNavFixed [role='tab'][aria-disabled='true'],
+.DetailsNavFixed [role='tab'][aria-disabled='true']:hover {
+  border-bottom-color: transparent;
+  color: var(--gray-5);
+  cursor: not-allowed;
+}
 .DetailsNavFixed-overflowContainer {
   display: none;
   height: 1.5rem;
@@ -1099,6 +1110,9 @@ code {
   margin: 0 auto;
   max-width: 60em;
   position: relative;
+}
+.Site--wide .Container {
+  max-width: none;
 }
 .GodocButton,
 .GodocButton:link,
@@ -1153,7 +1167,8 @@ code {
   background-color: var(--gray-10);
   border: 0.0625rem solid var(--gray-8);
   border-radius: 3px;
-  font: 0.875rem/1.375rem 'Source Code Pro', monospace;
+  font-size: 0.875rem;
+  line-height: 1.375rem;
   margin: 0;
   overflow-x: auto;
   padding: 1.5rem;
@@ -1172,14 +1187,10 @@ code {
 .DocNavMobile {
   display: none;
 }
-/**
- * Some versions of the doc template have DocNav also on elements with these
- * classes, which we don’t want to hide unless the sidenav experiment is active.
- * TODO: Remove once HTML has been transitioned to use new markup.
- */
-.Documentation-nav.DocNav,
-.Documentation-toc.DocNav {
-  display: block;
+.DocNav-files {
+  /* This property will be removed once the documentation has been reprocessed
+     and "Package Files" is listed in the left side nav.*/
+  display: none;
 }
 
 .Documentation {
@@ -1198,6 +1209,7 @@ code {
 }
 .Documentation h2 a,
 .Documentation h3 a,
+.Documentation h4 a.Documentation-idLink,
 .Documentation summary a {
   opacity: 0;
 }
@@ -1209,6 +1221,7 @@ code {
 }
 .Documentation h2:hover a,
 .Documentation h3:hover a,
+.Documentation h4:hover a,
 .Documentation summary:hover a,
 .Documentation summary:focus a {
   opacity: 1;
@@ -1222,11 +1235,13 @@ code {
   padding-left: 2em;
 }
 .Documentation code,
-.Documentation pre {
+.Documentation pre,
+.Documentation textarea {
   background-color: var(--gray-10);
   border-radius: 0.3em;
-  border: 0.0625rem solid #ccc;
-  font: 0.875rem/1.375rem 'Source Code Pro', monospace;
+  border: 0.0625rem solid var(--gray-7);
+  font-size: 0.875rem;
+  line-height: 1.375rem;
   margin: 0;
   overflow-x: auto;
   padding: 0.625rem;
@@ -1235,6 +1250,12 @@ code {
 }
 .Documentation pre + pre {
   margin-top: 0.625rem;
+}
+
+.Documentation .Documentation-declarationLink + pre {
+  border-radius: 0 0 0.3em 0.3em;
+  border-top: 0.03125rem solid var(--gray-8);
+  margin-top: 0;
 }
 .Documentation pre .comment {
   color: #060;
@@ -1245,6 +1266,23 @@ code {
 .Documentation-index,
 .Documentation-examples {
   padding-bottom: 0;
+}
+.Documentation-empty {
+  color: var(--gray-3);
+  margin-top: -0.5rem;
+}
+@media only screen and (min-width: 64rem) {
+  .Documentation-toc {
+    columns: 2;
+    white-space: nowrap;
+  }
+}
+.Documentation-toc:empty {
+  display: none;
+}
+.Documentation-tocItem {
+  text-overflow: ellipsis;
+  overflow: hidden;
 }
 
 .Documentation-tocItem--constants,
@@ -1269,19 +1307,46 @@ code {
   margin-bottom: 0.5rem;
 }
 
+.Documentation-constants br:last-of-type,
+.Documentation-variables br:last-of-type {
+  display: none;
+}
+
 .Documentation-build {
   color: var(--gray-3);
   font-size: 0.875rem;
   padding-top: 1.5rem;
   text-align: right;
 }
+.Documentation-declaration pre {
+  scroll-padding-top: calc(var(--header-height) + 3.75rem);
+}
+@media only screen and (min-width: 64rem) {
+  .Documentation-declaration pre {
+    scroll-padding-top: calc(var(--header-height) + 0.75rem);
+  }
+}
+.Documentation-declaration + .Documentation-declaration {
+  margin-top: 0.625rem;
+}
+.Documentation-declarationLink {
+  display: block;
+  background-color: var(--gray-10);
+  border-radius: 0.3em 0.3em 0 0;
+  border: 0.0625rem solid var(--gray-7);
+  border-bottom: none;
+  font-size: 0.75rem;
+  padding: 0.375rem;
+  line-height: 0.5rem;
+  text-align: right;
+}
 .Documentation-exampleButtonsContainer {
   align-items: center;
-  /* This will change back to display: flex; when we enable playground buttons */
-  display: none;
+  display: flex;
   justify-content: flex-end;
+  margin-top: 0.5rem;
 }
-.Documentation-exampleButtonsContainer button {
+.Documentation-examplePlayButton {
   background-color: var(--white);
   border: 0.15rem solid var(--turq-med);
   color: var(--turq-med);
@@ -1290,8 +1355,40 @@ code {
   height: 2.5rem;
   width: 4.125rem;
 }
+.Documentation-exampleRunButton,
+.Documentation-exampleShareButton,
+.Documentation-exampleFormatButton {
+  border: 0.0625rem solid var(--turq-dark);
+  border-radius: 0.25rem;
+  cursor: pointer;
+  height: 2rem;
+  margin-left: 0.5rem;
+  padding: 0 1rem;
+}
+.Documentation-exampleRunButton {
+  background-color: var(--turq-dark);
+  color: var(--white);
+}
+.Documentation-exampleShareButton,
+.Documentation-exampleFormatButton {
+  background-color: var(--white);
+  color: var(--turq-dark);
+}
+.Documentation-exampleDetails {
+  margin-top: 1rem;
+}
 .Documentation-exampleDetailsBody pre {
-  margin: 1rem 0;
+  border-radius: 0 0 0.3rem 0.3rem;
+  margin-bottom: 1rem;
+  margin-top: -0.25rem;
+}
+.Documentation-exampleDetailsBody textarea {
+  border: 0.0625rem solid var(--gray-7);
+  height: 100%;
+  outline: none;
+  overflow: hidden;
+  resize: none;
+  width: 100%;
 }
 /**
  * We add another selector here to these two classes to increase CSS specificity,
@@ -1315,46 +1412,79 @@ code {
   outline: none;
   text-decoration: none;
 }
+.Documentation-exampleOutputLabel {
+  color: var(--gray-4);
+}
 .Documentation-exampleError {
   color: var(--pink);
   margin-right: 0.4rem;
   padding-right: 0.5rem;
 }
-.Documentation-files {
-  display: none;
+.Documentation-examplePlayButton::after {
+  background-image: url(/static/img/icon-launch.svg);
+  background-repeat: no-repeat;
+  background-size: 0.875rem 1.25rem;
+  content: '';
+  display: inline-block;
+  height: 1rem;
+  left: 0.3125rem;
+  position: relative;
+  top: 0.125rem;
+  width: 1rem;
 }
 .Documentation-filesList {
   column-count: 3;
   column-width: 12.5rem;
+  word-break: break-all;
+}
+/* See https://golang.org/issue/43368 for context. */
+.Documentation-function pre,
+.Documentation-typeFunc pre,
+.Documentation-typeMethod pre {
+  white-space: pre-wrap;
+  word-break: break-all;
+  word-wrap: break-word;
 }
 
-.Versions-list {
-  list-style: none;
-  padding-left: 1rem;
+.Unit-content .Versions {
+  margin-top: 1rem;
 }
-.Versions-list li {
-  font-size: 1.125rem;
-  margin-bottom: 0.5rem;
-  line-height: 1.5rem;
-  padding-left: 1rem;
+.Versions table {
+  border-spacing: 0;
 }
-.Versions-item {
-  margin-left: 1rem;
+.Versions th {
+  text-align: left;
+}
+.Versions td {
+  padding-bottom: 1rem;
+}
+.Versions td:nth-child(1) {
+  padding-right: 3rem;
+  vertical-align: top;
+}
+.Versions td:nth-child(2) {
+  border-right: 1px solid var(--gray-8);
+  padding-right: 1rem;
+  text-align: right;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.Versions td:nth-child(3) {
+  padding-left: 1rem;
 }
 .Versions-commitTime {
   color: var(--gray-3);
   font-weight: 400;
   font-size: 1rem;
 }
-.Versions-modulePath {
-  color: var(--gray-3);
-  font-size: 1rem;
-  font-family: Roboto, Arial, sans-serif;
-  font-weight: normal;
+.Versions-major {
+  font-weight: 600;
 }
-.Versions-separator {
-  border-bottom: 0.0625rem solid var(--gray-8);
-  margin: 2rem 0;
+.Versions-symbolChild {
+  padding-left: 2rem;
+}
+.Versions-symbolBuilds {
+  font-size: 0.75rem;
 }
 
 .Imports-list {
@@ -1394,8 +1524,9 @@ table.Directories {
   max-width: 800px;
 }
 .Directories td {
-  padding: 0.75rem 0;
   border-bottom: 0.0625rem solid var(--gray-8);
+  max-width: 30rem;
+  padding: 0.75rem 0;
   padding-right: 1rem;
 }
 .Directories th {
@@ -1403,6 +1534,13 @@ table.Directories {
   border-bottom: 0.0625rem solid var(--gray-8);
   padding-right: 1rem;
   padding-bottom: 0.5rem;
+}
+.Directories-moduleTag {
+  background-color: var(--blue);
+  border-radius: 0.15rem;
+  color: var(--gray-1);
+  font-size: 0.74rem;
+  padding: 0.2rem 0.4rem;
 }
 .Directory-header {
   margin-bottom: 2rem;
@@ -1434,7 +1572,6 @@ table.Directories {
   border: 0.0625rem solid var(--gray-8);
   border-radius: 0.25rem;
   color: var(--gray-4);
-  font-family: inherit;
   height: 3rem;
   padding: 0 2rem 0 0.75rem;
   text-overflow: ellipsis;
@@ -1446,6 +1583,7 @@ table.Directories {
 .Badge-clickToCopy {
   background: var(--gray-10) url('/static/img/copy-click.svg') right no-repeat;
   background-position: right 0.75rem center;
+  cursor: pointer;
 }
 .Badge-submitButton {
   border: none;
@@ -1453,7 +1591,6 @@ table.Directories {
   background-color: var(--turq-dark);
   color: var(--white);
   cursor: pointer;
-  font-family: inherit;
   height: 2.75rem;
   width: 7.125rem;
 }
@@ -1477,9 +1614,12 @@ table.Directories {
 
 .Dialog {
   padding: 0;
+  position: fixed;
   border: 0.0625rem solid rgba(0, 0, 0, 0.2);
   border-radius: 6px;
   box-shadow: 0 0.3125rem 0.9375rem rgba(0, 0, 0, 0.5);
+  top: 50%;
+  transform: translate(0, -50%);
 }
 .Dialog-title {
   font-size: 1.125rem;
@@ -1553,7 +1693,6 @@ table.Directories {
 
 .Site-footer {
   background-color: var(--slate);
-  border-top: 0.0625rem solid var(--gray-8);
   color: var(--white);
   font-size: 0.875rem;
 }
@@ -1647,391 +1786,3 @@ a.Footer-link--primary {
   margin: 0;
   max-width: none;
 }
-
-/* ---------- */
-/*
-/* The CSS classes below are generated using content/static/css/main.go
-/* To update, delete the contents below and and run go run content/static/css/main.go
-/*
-/* ---------- */
-
-.Overview-readmeContent details {
-  display: block;
-}
-.Overview-readmeContent summary {
-  display: list-item;
-}
-.Overview-readmeContent a {
-  background-color: initial;
-}
-.Overview-readmeContent a:active,
-.Overview-readmeContent a:hover {
-  outline-width: 0;
-}
-.Overview-readmeContent strong {
-  font-weight: inherit;
-  font-weight: bolder;
-}
-.Overview-readmeContent h1 {
-  font-size: 2em;
-  margin: 0.67em 0;
-}
-.Overview-readmeContent img {
-  border-style: none;
-}
-.Overview-readmeContent code,
-.Overview-readmeContent kbd,
-.Overview-readmeContent pre {
-  font-family: monospace, monospace;
-  font-size: 1em;
-}
-.Overview-readmeContent hr {
-  box-sizing: initial;
-  height: 0;
-  overflow: visible;
-}
-.Overview-readmeContent input {
-  font: inherit;
-  margin: 0;
-}
-.Overview-readmeContent input {
-  overflow: visible;
-}
-.Overview-readmeContent [type='checkbox'] {
-  box-sizing: border-box;
-  padding: 0;
-}
-.Overview-readmeContent * {
-  box-sizing: border-box;
-}
-.Overview-readmeContent input {
-  font-family: inherit;
-  font-size: inherit;
-  line-height: inherit;
-}
-.Overview-readmeContent a {
-  color: #0366d6;
-  text-decoration: none;
-}
-.Overview-readmeContent a:hover {
-  text-decoration: underline;
-}
-.Overview-readmeContent strong {
-  font-weight: 600;
-}
-.Overview-readmeContent hr {
-  height: 0;
-  margin: 15px 0;
-  overflow: hidden;
-  background: transparent;
-  border: 0;
-  border-bottom: 1px solid #dfe2e5;
-}
-.Overview-readmeContent hr:after,
-.Overview-readmeContent hr:before {
-  display: table;
-  content: '';
-}
-.Overview-readmeContent hr:after {
-  clear: both;
-}
-.Overview-readmeContent table {
-  border-spacing: 0;
-  border-collapse: collapse;
-}
-.Overview-readmeContent td,
-.Overview-readmeContent th {
-  padding: 0;
-}
-.Overview-readmeContent details summary {
-  cursor: pointer;
-}
-.Overview-readmeContent kbd {
-  display: inline-block;
-  padding: 3px 5px;
-  font: 11px SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
-  line-height: 10px;
-  color: #444d56;
-  vertical-align: middle;
-  background-color: #fafbfc;
-  border: 1px solid #d1d5da;
-  border-radius: 3px;
-  box-shadow: inset 0 -1px 0 #d1d5da;
-}
-.Overview-readmeContent h1,
-.Overview-readmeContent h2,
-.Overview-readmeContent h3,
-.Overview-readmeContent h4,
-.Overview-readmeContent h5,
-.Overview-readmeContent h6 {
-  margin-top: 0;
-  margin-bottom: 0;
-}
-.Overview-readmeContent h1 {
-  font-size: 32px;
-}
-.Overview-readmeContent h1,
-.Overview-readmeContent h2 {
-  font-weight: 600;
-}
-.Overview-readmeContent h2 {
-  font-size: 24px;
-}
-.Overview-readmeContent h3 {
-  font-size: 20px;
-}
-.Overview-readmeContent h3,
-.Overview-readmeContent h4 {
-  font-weight: 600;
-}
-.Overview-readmeContent h4 {
-  font-size: 16px;
-}
-.Overview-readmeContent h5 {
-  font-size: 14px;
-}
-.Overview-readmeContent h5,
-.Overview-readmeContent h6 {
-  font-weight: 600;
-}
-.Overview-readmeContent h6 {
-  font-size: 12px;
-}
-.Overview-readmeContent p {
-  margin-top: 0;
-  margin-bottom: 10px;
-}
-.Overview-readmeContent blockquote {
-  margin: 0;
-}
-.Overview-readmeContent ol,
-.Overview-readmeContent ul {
-  padding-left: 0;
-  margin-top: 0;
-  margin-bottom: 0;
-}
-.Overview-readmeContent ol ol,
-.Overview-readmeContent ul ol {
-  list-style-type: lower-roman;
-}
-.Overview-readmeContent ol ol ol,
-.Overview-readmeContent ol ul ol,
-.Overview-readmeContent ul ol ol,
-.Overview-readmeContent ul ul ol {
-  list-style-type: lower-alpha;
-}
-.Overview-readmeContent dd {
-  margin-left: 0;
-}
-.Overview-readmeContent code,
-.Overview-readmeContent pre {
-  font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
-  font-size: 12px;
-}
-.Overview-readmeContent pre {
-  margin-top: 0;
-  margin-bottom: 0;
-}
-.Overview-readmeContent input::-webkit-inner-spin-button,
-.Overview-readmeContent input::-webkit-outer-spin-button {
-  margin: 0;
-  -webkit-appearance: none;
-  appearance: none;
-}
-.Overview-readmeContent :checked + .radio-label {
-  position: relative;
-  z-index: 1;
-  border-color: #0366d6;
-}
-.Overview-readmeContent hr {
-  border-bottom-color: #eee;
-}
-.Overview-readmeContent kbd {
-  display: inline-block;
-  padding: 3px 5px;
-  font: 11px SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
-  line-height: 10px;
-  color: #444d56;
-  vertical-align: middle;
-  background-color: #fafbfc;
-  border: 1px solid #d1d5da;
-  border-radius: 3px;
-  box-shadow: inset 0 -1px 0 #d1d5da;
-}
-.Overview-readmeContent a:not([href]) {
-  color: inherit;
-  text-decoration: none;
-}
-.Overview-readmeContent blockquote,
-.Overview-readmeContent details,
-.Overview-readmeContent dl,
-.Overview-readmeContent ol,
-.Overview-readmeContent p,
-.Overview-readmeContent pre,
-.Overview-readmeContent table,
-.Overview-readmeContent ul {
-  margin-top: 0;
-  margin-bottom: 16px;
-}
-.Overview-readmeContent hr {
-  height: 0.25em;
-  padding: 0;
-  margin: 24px 0;
-  background-color: #e1e4e8;
-  border: 0;
-}
-.Overview-readmeContent blockquote {
-  padding: 0 1em;
-  color: #6a737d;
-  border-left: 0.25em solid #dfe2e5;
-}
-.Overview-readmeContent blockquote > :first-child {
-  margin-top: 0;
-}
-.Overview-readmeContent blockquote > :last-child {
-  margin-bottom: 0;
-}
-.Overview-readmeContent h1,
-.Overview-readmeContent h2,
-.Overview-readmeContent h3,
-.Overview-readmeContent h4,
-.Overview-readmeContent h5,
-.Overview-readmeContent h6 {
-  margin-top: 24px;
-  margin-bottom: 16px;
-  font-weight: 600;
-  line-height: 1.25;
-}
-.Overview-readmeContent h1 {
-  font-size: 2em;
-}
-.Overview-readmeContent h1,
-.Overview-readmeContent h2 {
-  padding-bottom: 0.3em;
-  border-bottom: 1px solid #eaecef;
-}
-.Overview-readmeContent h2 {
-  font-size: 1.5em;
-}
-.Overview-readmeContent h3 {
-  font-size: 1.25em;
-}
-.Overview-readmeContent h4 {
-  font-size: 1em;
-}
-.Overview-readmeContent h5 {
-  font-size: 0.875em;
-}
-.Overview-readmeContent h6 {
-  font-size: 0.85em;
-  color: #6a737d;
-}
-.Overview-readmeContent ol,
-.Overview-readmeContent ul {
-  padding-left: 2em;
-}
-.Overview-readmeContent ol ol,
-.Overview-readmeContent ol ul,
-.Overview-readmeContent ul ol,
-.Overview-readmeContent ul ul {
-  margin-top: 0;
-  margin-bottom: 0;
-}
-.Overview-readmeContent li {
-  word-wrap: break-all;
-}
-.Overview-readmeContent li > p {
-  margin-top: 16px;
-}
-.Overview-readmeContent li + li {
-  margin-top: 0.25em;
-}
-.Overview-readmeContent dl {
-  padding: 0;
-}
-.Overview-readmeContent dl dt {
-  padding: 0;
-  margin-top: 16px;
-  font-size: 1em;
-  font-style: italic;
-  font-weight: 600;
-}
-.Overview-readmeContent dl dd {
-  padding: 0 16px;
-  margin-bottom: 16px;
-}
-.Overview-readmeContent table {
-  display: block;
-  width: 100%;
-  overflow: auto;
-}
-.Overview-readmeContent table th {
-  font-weight: 600;
-}
-.Overview-readmeContent table td,
-.Overview-readmeContent table th {
-  padding: 6px 13px;
-  border: 1px solid #dfe2e5;
-}
-.Overview-readmeContent table tr {
-  background-color: #fff;
-  border-top: 1px solid #c6cbd1;
-}
-.Overview-readmeContent table tr:nth-child(2n) {
-  background-color: #f6f8fa;
-}
-.Overview-readmeContent img {
-  max-width: 100%;
-  box-sizing: initial;
-  background-color: #fff;
-}
-.Overview-readmeContent img[align='right'] {
-  padding-left: 20px;
-}
-.Overview-readmeContent img[align='left'] {
-  padding-right: 20px;
-}
-.Overview-readmeContent code {
-  padding: 0.2em 0.4em;
-  margin: 0;
-  font-size: 85%;
-  background-color: rgba(27, 31, 35, 0.05);
-  border-radius: 3px;
-}
-.Overview-readmeContent pre {
-  word-wrap: normal;
-}
-.Overview-readmeContent pre > code {
-  padding: 0;
-  margin: 0;
-  font-size: 100%;
-  word-break: normal;
-  white-space: pre;
-  background: transparent;
-  border: 0;
-}
-.Overview-readmeContent pre {
-  padding: 16px;
-  overflow: auto;
-  font-size: 85%;
-  line-height: 1.45;
-  background-color: #f6f8fa;
-  border-radius: 3px;
-}
-.Overview-readmeContent pre code {
-  display: inline;
-  max-width: auto;
-  padding: 0;
-  margin: 0;
-  overflow: visible;
-  line-height: inherit;
-  word-wrap: normal;
-  background-color: initial;
-  border: 0;
-}
-
-/* ---------- */
-/*
-/* End output from content/static/css/main.go.
-/*
-/* ---------- */

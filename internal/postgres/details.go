@@ -13,119 +13,62 @@ import (
 	"reflect"
 	"regexp"
 
-	"github.com/google/safehtml"
-	"github.com/google/safehtml/uncheckedconversions"
-	"github.com/lib/pq"
 	"golang.org/x/pkgsite/internal"
-	"golang.org/x/pkgsite/internal/database"
 	"golang.org/x/pkgsite/internal/derrors"
-	"golang.org/x/pkgsite/internal/experiment"
+	"golang.org/x/pkgsite/internal/middleware"
 )
 
-// LegacyGetPackagesInModule returns packages contained in the module version
-// specified by modulePath and version. The returned packages will be sorted
-// by their package path.
-func (db *DB) LegacyGetPackagesInModule(ctx context.Context, modulePath, version string) (_ []*internal.LegacyPackage, err error) {
-	query := `SELECT
-		path,
-		name,
-		synopsis,
-		v1_path,
-		license_types,
-		license_paths,
-		redistributable,
-		documentation,
-		goos,
-		goarch
-	FROM
-		packages
-	WHERE
-		module_path = $1
-		AND version = $2
-	ORDER BY path;`
+// GetNestedModules returns the latest major version of all nested modules
+// given a modulePath path prefix with or without major version.
+func (db *DB) GetNestedModules(ctx context.Context, modulePath string) (_ []*internal.ModuleInfo, err error) {
+	defer derrors.WrapStack(&err, "GetNestedModules(ctx, %v)", modulePath)
+	defer middleware.ElapsedStat(ctx, "GetNestedModules")()
 
-	var packages []*internal.LegacyPackage
+	query := `
+		SELECT DISTINCT ON (series_path)
+			m.module_path,
+			m.version,
+			m.commit_time,
+			m.redistributable,
+			m.has_go_mod,
+			m.deprecated_comment,
+			m.source_info
+		FROM
+			modules m
+		WHERE
+			m.module_path LIKE $1 || '/%'
+		ORDER BY
+			m.series_path,
+			m.incompatible,
+			m.version_type = 'release' DESC,
+			m.sort_version DESC;
+	`
+
+	var modules []*internal.ModuleInfo
 	collect := func(rows *sql.Rows) error {
-		var (
-			p                          internal.LegacyPackage
-			licenseTypes, licensePaths []string
-			docHTML                    string
-		)
-		if err := rows.Scan(&p.Path, &p.Name, &p.Synopsis, &p.V1Path, pq.Array(&licenseTypes),
-			pq.Array(&licensePaths), &p.IsRedistributable, database.NullIsEmpty(&docHTML),
-			&p.GOOS, &p.GOARCH); err != nil {
-			return fmt.Errorf("row.Scan(): %v", err)
+		mi, err := scanModuleInfo(rows.Scan)
+		if err != nil {
+			return fmt.Errorf("rows.Scan(): %v", err)
 		}
-		lics, err := zipLicenseMetadata(licenseTypes, licensePaths)
+		isExcluded, err := db.IsExcluded(ctx, mi.ModulePath)
 		if err != nil {
 			return err
 		}
-		p.Licenses = lics
-		p.DocumentationHTML = convertDocumentation(docHTML)
-		packages = append(packages, &p)
-		return nil
-	}
-
-	if err := db.db.RunQuery(ctx, query, collect, modulePath, version); err != nil {
-		return nil, fmt.Errorf("DB.LegacyGetPackagesInModule(ctx, %q, %q): %w", modulePath, version, err)
-	}
-	return packages, nil
-}
-
-// GetImports fetches and returns all of the imports for the package with
-// pkgPath, modulePath and version.
-//
-// The returned error may be checked with derrors.IsInvalidArgument to
-// determine if it resulted from an invalid package path or version.
-func (db *DB) GetImports(ctx context.Context, pkgPath, modulePath, version string) (paths []string, err error) {
-	defer derrors.Wrap(&err, "DB.GetImports(ctx, %q, %q, %q)", pkgPath, modulePath, version)
-
-	if pkgPath == "" || version == "" || modulePath == "" {
-		return nil, fmt.Errorf("pkgPath, modulePath and version must all be non-empty: %w", derrors.InvalidArgument)
-	}
-
-	var query string
-	if experiment.IsActive(ctx, internal.ExperimentUsePackageImports) {
-		query = `
-		SELECT to_path
-		FROM package_imports i
-		INNER JOIN paths p
-		ON p.id = i.path_id
-		INNER JOIN modules m
-		ON m.id = p.module_id
-		WHERE
-			p.path = $1
-			AND m.version = $2
-			AND m.module_path = $3
-		ORDER BY
-			to_path;`
-	} else {
-		query = `
-		SELECT to_path
-		FROM imports
-		WHERE
-			from_path = $1
-			AND from_version = $2
-			AND from_module_path = $3
-		ORDER BY
-			to_path;`
-	}
-
-	var (
-		toPath  string
-		imports []string
-	)
-	collect := func(rows *sql.Rows) error {
-		if err := rows.Scan(&toPath); err != nil {
-			return fmt.Errorf("row.Scan(): %v", err)
+		if !isExcluded {
+			modules = append(modules, mi)
 		}
-		imports = append(imports, toPath)
 		return nil
 	}
-	if err := db.db.RunQuery(ctx, query, collect, pkgPath, version, modulePath); err != nil {
+	seriesPath := internal.SeriesPathForModule(modulePath)
+	if err := db.db.RunQuery(ctx, query, collect, seriesPath); err != nil {
 		return nil, err
 	}
-	return imports, nil
+
+	if err := populateLatestInfos(ctx, db, modules); err != nil {
+		return nil, err
+	}
+
+	return modules, nil
 }
 
 // GetImportedBy fetches and returns all of the packages that import the
@@ -135,7 +78,9 @@ func (db *DB) GetImports(ctx context.Context, pkgPath, modulePath, version strin
 //
 // Instead of supporting pagination, this query runs with a limit.
 func (db *DB) GetImportedBy(ctx context.Context, pkgPath, modulePath string, limit int) (paths []string, err error) {
-	defer derrors.Wrap(&err, "GetImportedBy(ctx, %q, %q)", pkgPath, modulePath)
+	defer derrors.WrapStack(&err, "GetImportedBy(ctx, %q, %q)", pkgPath, modulePath)
+	defer middleware.ElapsedStat(ctx, "GetImportedBy")()
+
 	if pkgPath == "" {
 		return nil, fmt.Errorf("pkgPath cannot be empty: %w", derrors.InvalidArgument)
 	}
@@ -152,100 +97,69 @@ func (db *DB) GetImportedBy(ctx context.Context, pkgPath, modulePath string, lim
 			from_path
 		LIMIT $3`
 
-	var importedby []string
-	collect := func(rows *sql.Rows) error {
-		var fromPath string
-		if err := rows.Scan(&fromPath); err != nil {
-			return fmt.Errorf("row.Scan(): %v", err)
-		}
-		importedby = append(importedby, fromPath)
-		return nil
+	return collectStrings(ctx, db.db, query, pkgPath, modulePath, limit)
+}
+
+// GetImportedByCount returns the number of packages that import pkgPath.
+func (db *DB) GetImportedByCount(ctx context.Context, pkgPath, modulePath string) (_ int, err error) {
+	defer derrors.WrapStack(&err, "GetImportedByCount(ctx, %q, %q)", pkgPath, modulePath)
+	defer middleware.ElapsedStat(ctx, "GetImportedByCount")()
+
+	if pkgPath == "" {
+		return 0, fmt.Errorf("pkgPath cannot be empty: %w", derrors.InvalidArgument)
 	}
-	if err := db.db.RunQuery(ctx, query, collect, pkgPath, modulePath, limit); err != nil {
-		return nil, err
+	query := `
+		SELECT imported_by_count
+		FROM
+			search_documents
+		WHERE
+			package_path = $1
+	`
+	var n int
+	err = db.db.QueryRow(ctx, query, pkgPath).Scan(&n)
+	switch err {
+	case sql.ErrNoRows:
+		return 0, nil
+	case nil:
+		return n, nil
+	default:
+		return 0, err
 	}
-	return importedby, nil
 }
 
 // GetModuleInfo fetches a module version from the database with the primary key
 // (module_path, version).
-func (db *DB) GetModuleInfo(ctx context.Context, modulePath, version string) (_ *internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "GetModuleInfo(ctx, %q, %q)", modulePath, version)
+func (db *DB) GetModuleInfo(ctx context.Context, modulePath, resolvedVersion string) (_ *internal.ModuleInfo, err error) {
+	defer derrors.WrapStack(&err, "GetModuleInfo(ctx, %q, %q)", modulePath, resolvedVersion)
 
 	query := `
 		SELECT
 			module_path,
 			version,
 			commit_time,
-			version_type,
-			source_info,
 			redistributable,
-			has_go_mod
+			has_go_mod,
+			deprecated_comment,
+			source_info
 		FROM
 			modules
 		WHERE
 			module_path = $1
 			AND version = $2;`
 
-	var mi internal.ModuleInfo
-	row := db.db.QueryRow(ctx, query, modulePath, version)
-	if err := row.Scan(&mi.ModulePath, &mi.Version, &mi.CommitTime, &mi.VersionType,
-		jsonbScanner{&mi.SourceInfo}, &mi.IsRedistributable, &mi.HasGoMod); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, derrors.NotFound
-		}
+	row := db.db.QueryRow(ctx, query, modulePath, resolvedVersion)
+	mi, err := scanModuleInfo(row.Scan)
+	if err == sql.ErrNoRows {
+		return nil, derrors.NotFound
+	}
+	if err != nil {
 		return nil, fmt.Errorf("row.Scan(): %v", err)
 	}
-	return &mi, nil
-}
 
-// LegacyGetModuleInfo fetches a module version from the database with the primary key
-// (module_path, version).
-func (db *DB) LegacyGetModuleInfo(ctx context.Context, modulePath string, version string) (_ *internal.LegacyModuleInfo, err error) {
-	defer derrors.Wrap(&err, "LegacyGetModuleInfo(ctx, %q, %q)", modulePath, version)
-
-	query := `
-		SELECT
-			module_path,
-			version,
-			commit_time,
-			readme_file_path,
-			readme_contents,
-			version_type,
-			source_info,
-			redistributable,
-			has_go_mod
-		FROM
-			modules`
-
-	args := []interface{}{modulePath}
-	if version == internal.LatestVersion {
-		query += `
-			WHERE module_path = $1
-			ORDER BY
-				-- Order the versions by release then prerelease.
-				-- The default version should be the first release
-				-- version available, if one exists.
-				version_type = 'release' DESC,
-				sort_version DESC
-			LIMIT 1;`
-	} else {
-		query += `
-			WHERE module_path = $1 AND version = $2;`
-		args = append(args, version)
+	if err := populateLatestInfo(ctx, db, mi); err != nil {
+		return nil, err
 	}
-
-	var mi internal.LegacyModuleInfo
-	row := db.db.QueryRow(ctx, query, args...)
-	if err := row.Scan(&mi.ModulePath, &mi.Version, &mi.CommitTime,
-		database.NullIsEmpty(&mi.LegacyReadmeFilePath), database.NullIsEmpty(&mi.LegacyReadmeContents), &mi.VersionType,
-		jsonbScanner{&mi.SourceInfo}, &mi.IsRedistributable, &mi.HasGoMod); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("module version %s@%s: %w", modulePath, version, derrors.NotFound)
-		}
-		return nil, fmt.Errorf("row.Scan(): %v", err)
-	}
-	return &mi, nil
+	return mi, nil
 }
 
 // jsonbScanner scans a jsonb value into a Go value.
@@ -277,19 +191,22 @@ func (s jsonbScanner) Scan(value interface{}) (err error) {
 	return nil
 }
 
-// convertDocumentation takes a string that was read from the database and
-// converts it to a safehtml.HTML.
-func convertDocumentation(doc string) safehtml.HTML {
-	if addDocQueryParam {
-		doc = hackUpDocumentation(doc)
+// scanModuleInfo constructs an *internal.ModuleInfo from the given scanner.
+func scanModuleInfo(scan func(dest ...interface{}) error) (*internal.ModuleInfo, error) {
+	var (
+		mi         internal.ModuleInfo
+		depComment *string
+	)
+	if err := scan(&mi.ModulePath, &mi.Version, &mi.CommitTime,
+		&mi.IsRedistributable, &mi.HasGoMod, &depComment, jsonbScanner{&mi.SourceInfo}); err != nil {
+		return nil, err
 	}
-	// We trust the data in our database and the transformation done by hackUpDocumentation.
-	return uncheckedconversions.HTMLFromStringKnownToSatisfyTypeContract(doc)
+	if depComment != nil {
+		mi.Deprecated = true
+		mi.DeprecationComment = *depComment
+	}
+	return &mi, nil
 }
-
-// addDocQueryParam controls whether to use a regexp replacement to append
-// ?tab=doc to urls linking to package identifiers within the documentation.
-const addDocQueryParam = true
 
 // packageLinkRegexp matches cross-package identifier links that have been
 // generated by the dochtml package. At the time this hack was added, these
@@ -300,12 +217,16 @@ const addDocQueryParam = true
 //
 // The packageLinkRegexp mutates these links as follows:
 //   - remove the now unnecessary '/pkg' path prefix
-//   - add an explicit ?tab=doc after the path.
 var packageLinkRegexp = regexp.MustCompile(`(<a href="/)pkg/([^?#"]+)((?:#[^"]*)?">.*?</a>)`)
 
-// hackUpDocumentation rewrites anchor hrefs to add a tab=doc query parameter.
-// It preserves the safety of its argument. That is, if docHTML is safe
-// from XSS attacks, so is hackUpDocumentation(docHTML).
-func hackUpDocumentation(docHTML string) string {
-	return packageLinkRegexp.ReplaceAllString(docHTML, `$1$2?tab=doc$3`)
+// removePkgPrefix removes the /pkg path prefix from links in docHTML.
+// See documentation for packageLinkRegexp for explanation and
+// TestRemovePkgPrefix for examples. It preserves the safety of its argument.
+// That is, if docHTML is safe from XSS attacks, so is
+// removePkgPrefix(docHTML).
+//
+// Although we don't add "/pkg" to links after https://golang.org/cl/259101,
+// do not remove this function until all databases have been reprocessed.
+func removePkgPrefix(docHTML string) string {
+	return packageLinkRegexp.ReplaceAllString(docHTML, `$1$2$3`)
 }

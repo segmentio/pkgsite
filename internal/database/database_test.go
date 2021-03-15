@@ -17,18 +17,22 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/stdlib"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/testing/dbtest"
 )
 
 const testTimeout = 5 * time.Second
 
+const testDBName = "discovery_postgres_test"
+
 var testDB *DB
 
 func TestMain(m *testing.M) {
-	const dbName = "discovery_postgres_test"
 
-	if err := dbtest.CreateDBIfNotExists(dbName); err != nil {
+	if err := dbtest.CreateDBIfNotExists(testDBName); err != nil {
 		if errors.Is(err, derrors.NotFound) && os.Getenv("GO_DISCOVERY_TESTDB") != "true" {
 			log.Printf("SKIPPING: could not connect to DB (see doc/postgres.md to set up): %v", err)
 			return
@@ -36,21 +40,26 @@ func TestMain(m *testing.M) {
 		log.Fatal(err)
 	}
 	var err error
-	testDB, err = Open("postgres", dbtest.DBConnURI(dbName), "test")
-	if err != nil {
-		log.Fatalf("Open: %v %[1]T", err)
+	for _, driver := range []string{"postgres", "pgx"} {
+		log.Printf("with driver %q", driver)
+		testDB, err = Open(driver, dbtest.DBConnURI(testDBName), "test")
+		if err != nil {
+			log.Fatalf("Open: %v %[1]T", err)
+		}
+		code := m.Run()
+		if err := testDB.Close(); err != nil {
+			log.Fatal(err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	}
-	code := m.Run()
-	if err := testDB.Close(); err != nil {
-		log.Fatal(err)
-	}
-	os.Exit(code)
 }
 
 func TestBulkInsert(t *testing.T) {
 	table := "test_bulk_insert"
 
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		name           string
 		columns        []string
 		values         []interface{}
@@ -126,7 +135,7 @@ func TestBulkInsert(t *testing.T) {
 			wantCount:      1,
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 			defer cancel()
 
@@ -147,10 +156,10 @@ func TestBulkInsert(t *testing.T) {
 
 			var err error
 			var returned []string
-			if tc.wantReturned == nil {
-				err = testDB.BulkInsert(ctx, table, tc.columns, tc.values, tc.conflictAction)
+			if test.wantReturned == nil {
+				err = testDB.BulkInsert(ctx, table, test.columns, test.values, test.conflictAction)
 			} else {
-				err = testDB.BulkInsertReturning(ctx, table, tc.columns, tc.values, tc.conflictAction,
+				err = testDB.BulkInsertReturning(ctx, table, test.columns, test.values, test.conflictAction,
 					[]string{"colA"}, func(rows *sql.Rows) error {
 						var r string
 						if err := rows.Scan(&r); err != nil {
@@ -160,13 +169,13 @@ func TestBulkInsert(t *testing.T) {
 						return nil
 					})
 			}
-			if tc.wantErr && err == nil || !tc.wantErr && err != nil {
-				t.Errorf("got error %v, wantErr %t", err, tc.wantErr)
+			if test.wantErr && err == nil || !test.wantErr && err != nil {
+				t.Errorf("got error %v, wantErr %t", err, test.wantErr)
 			}
 			if err != nil {
 				return
 			}
-			if tc.wantCount != 0 {
+			if test.wantCount != 0 {
 				var count int
 				query := "SELECT COUNT(*) FROM " + table
 				row := testDB.QueryRow(ctx, query)
@@ -174,14 +183,14 @@ func TestBulkInsert(t *testing.T) {
 				if err != nil {
 					t.Fatalf("testDB.queryRow(%q): %v", query, err)
 				}
-				if count != tc.wantCount {
-					t.Errorf("testDB.queryRow(%q) = %d; want = %d", query, count, tc.wantCount)
+				if count != test.wantCount {
+					t.Errorf("testDB.queryRow(%q) = %d; want = %d", query, count, test.wantCount)
 				}
 			}
-			if tc.wantReturned != nil {
+			if test.wantReturned != nil {
 				sort.Strings(returned)
-				if !cmp.Equal(returned, tc.wantReturned) {
-					t.Errorf("returned: got %v, want %v", returned, tc.wantReturned)
+				if !cmp.Equal(returned, test.wantReturned) {
+					t.Errorf("returned: got %v, want %v", returned, test.wantReturned)
 				}
 			}
 		})
@@ -438,4 +447,40 @@ func TestTransactSerializable(t *testing.T) {
 		sum[r.Class-1] += r.Value
 	}
 
+}
+
+func TestCopyDoesNotUpsert(t *testing.T) {
+	// This test verifies that copying rows into a table will not overwrite existing rows.
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	conn, err := testDB.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS test_copy`,
+		`CREATE TABLE test_copy (i  INTEGER PRIMARY KEY)`,
+		`INSERT INTO test_copy (i) VALUES (1)`,
+	} {
+		if _, err := testDB.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = conn.Raw(func(c interface{}) error {
+		stdConn, ok := c.(*stdlib.Conn)
+		if !ok {
+			t.Skip("DB driver is not pgx")
+		}
+		rows := [][]interface{}{{1}, {2}}
+		_, err = stdConn.Conn().CopyFrom(ctx, []string{"test_copy"}, []string{"i"}, pgx.CopyFromRows(rows))
+		return err
+	})
+
+	const constraintViolationCode = "23505"
+	var gerr *pgconn.PgError
+	if !errors.As(err, &gerr) || gerr.Code != constraintViolationCode {
+		t.Errorf("got %v, wanted code %s", gerr, constraintViolationCode)
+	}
 }

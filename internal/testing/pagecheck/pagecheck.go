@@ -12,99 +12,161 @@ import (
 	"path"
 	"regexp"
 
-	"golang.org/x/pkgsite/internal/stdlib"
 	"golang.org/x/pkgsite/internal/testing/htmlcheck"
 )
 
 // Page describes a discovery site web page for a package, module or directory.
 type Page struct {
-	ModulePath       string
-	Suffix           string // package or directory path after module path; empty for a module
-	Version          string
-	FormattedVersion string
-	Title            string
-	LicenseType      string
-	LicenseFilePath  string
-	IsLatest         bool   // is this the latest version of this module?
-	LatestLink       string // href of "Go to latest" link
-	PackageURLFormat string // the relative package URL, with one %s for "@version"; also used for dirs
-	ModuleURL        string // the relative module URL
-}
+	// ModulePath is the module path for the unit page.
+	ModulePath string
 
-// Overview describes the contents of the overview tab.
-type Overview struct {
-	ModuleLink     string // relative link to module page
-	ModuleLinkText string
-	RepoURL        string
-	PackageURL     string
-	ReadmeContent  string
-	ReadmeSource   string
+	// Suffix is the unit path element after module path; empty for a module
+	Suffix string
+
+	// Version is the full version of the module, or the go tag if it is the
+	// stdlib.
+	Version string
+
+	// FormattedVersion is the version of the module, or go tag if it is the
+	// stdlib. The version string may be truncated if it is a pseudoversion.
+	FormattedVersion string
+
+	// Title is output of frontend.pageTitle.
+	Title string
+
+	// LicenseType is name of the license.
+	LicenseType string
+
+	// LicenseFilePath is the path of the license relative to the module directory.
+	LicenseFilePath string
+
+	// IsLatestMinor is the latest minor version of this module.
+	IsLatestMinor bool
+
+	// MissingInMinor says that the unit is missing in the latest minor version of this module.
+	MissingInMinor bool
+
+	// IsLatestMajor is the latest major version of this series.
+	IsLatestMajor bool
+
+	// LatestLink is the href of "Go to latest" link.
+	LatestLink string
+
+	// LatestMajorVersion is the suffix of the latest major version, empty if
+	// v0 or v1.
+	LatestMajorVersion string
+
+	// LatestMajorVersionLink is the link to the latest major version of the
+	// unit. If the unit does not exist at the latest major version, it is a
+	// link to the latest major version of the module.
+	LatestMajorVersionLink string
+
+	// UnitURLFormat is the relative unit URL, with one %s for "@version".
+	UnitURLFormat string
+
+	// ModuleURL is the relative module URL.
+	ModuleURL string
+
+	// CommitTime is the output of frontend.absoluteTime for the commit time.
+	CommitTime string
 }
 
 var (
-	in                 = htmlcheck.In
-	inAll              = htmlcheck.InAll
-	text               = htmlcheck.HasText
-	exactText          = htmlcheck.HasExactText
-	exactTextCollapsed = htmlcheck.HasExactTextCollapsed
-	attr               = htmlcheck.HasAttr
-	href               = htmlcheck.HasHref
+	in        = htmlcheck.In
+	text      = htmlcheck.HasText
+	exactText = htmlcheck.HasExactText
+	attr      = htmlcheck.HasAttr
+	href      = htmlcheck.HasHref
 )
 
-// PackageHeader checks a details page header for a package.
-func PackageHeader(p *Page, versionedURL bool) htmlcheck.Checker {
-	fv := p.FormattedVersion
-	if fv == "" {
-		fv = p.Version
-	}
+// UnitHeader checks a main page header for a unit.
+func UnitHeader(p *Page, versionedURL bool, isPackage bool) htmlcheck.Checker {
+	urlPath := unitURLPath(p, versionedURL)
 	curBreadcrumb := path.Base(p.Suffix)
 	if p.Suffix == "" {
 		curBreadcrumb = p.ModulePath
 	}
-	return in("",
-		in("span.DetailsHeader-breadcrumbCurrent", exactText(curBreadcrumb)),
-		in("h1.DetailsHeader-title", exactTextCollapsed(p.Title)),
-		in("div.DetailsHeader-version", exactText(fv)),
+	licenseText := p.LicenseType
+	licenseLink := urlPath + "?tab=licenses"
+	if p.LicenseType == "" {
+		licenseText = "not legal advice"
+		licenseLink = "/license-policy"
+	}
+
+	importsDetails := in("",
+		in(`[data-test-id="UnitHeader-imports"]`,
+			in("a",
+				href(urlPath+"?tab=imports"),
+				text(`[0-9]+\+? Imports`))),
+		in(`[data-test-id="UnitHeader-importedby"]`,
+			in("a",
+				href(urlPath+"?tab=importedby"),
+				text(`[0-9]+\+? Imported by`))))
+	if !isPackage {
+		importsDetails = nil
+	}
+
+	var majorVersionBanner htmlcheck.Checker
+	if p.IsLatestMajor {
+		majorVersionBanner = htmlcheck.NotIn(`[data-test-id="UnitHeader-majorVersionBanner"]`)
+	} else {
+		majorVersionBanner = in(`[data-test-id="UnitHeader-majorVersionBanner"]`,
+			in("span",
+				text("The highest tagged major version is "),
+				in("a",
+					href(p.LatestMajorVersionLink),
+					exactText(p.LatestMajorVersion),
+				),
+			),
+		)
+	}
+	return in("header.UnitHeader",
 		versionBadge(p),
-		licenseInfo(p, packageURLPath(p, versionedURL)),
-		packageTabLinks(p, versionedURL),
-		moduleInHeader(p, versionedURL))
+		in(`[data-test-id="UnitHeader-breadcrumbCurrent"]`, text(curBreadcrumb)),
+		in(`[data-test-id="UnitHeader-title"]`, text(p.Title)),
+		majorVersionBanner,
+		in(`[data-test-id="UnitHeader-version"]`,
+			in("a",
+				href("?tab=versions"),
+				exactText("Version "+p.FormattedVersion))),
+		in(`[data-test-id="UnitHeader-commitTime"]`,
+			text(p.CommitTime)),
+		in(`[data-test-id="UnitHeader-licenses"]`,
+			in("a",
+				href(licenseLink),
+				text(licenseText))),
+		importsDetails)
 }
 
-// ModuleHeader checks a details page header for a module.
-func ModuleHeader(p *Page, versionedURL bool) htmlcheck.Checker {
-	fv := p.FormattedVersion
-	if fv == "" {
-		fv = p.Version
-	}
-	curBreadcrumb := p.ModulePath
-	if p.ModulePath == stdlib.ModulePath {
-		curBreadcrumb = "Standard library"
-	}
-	return in("",
-		in("span.DetailsHeader-breadcrumbCurrent", exactText(curBreadcrumb)),
-		in("h1.DetailsHeader-title", exactTextCollapsed(p.Title)),
-		in("div.DetailsHeader-version", exactText(fv)),
-		versionBadge(p),
-		licenseInfo(p, moduleURLPath(p, versionedURL)),
-		moduleTabLinks(p, versionedURL))
+// UnitReadme checks the readme section of the main page.
+func UnitReadme() htmlcheck.Checker {
+	return in(".UnitReadme",
+		in(`[data-test-id="Unit-readmeContent"]`, text("readme")),
+	)
 }
 
-// DirectoryHeader checks a details page header for a directory.
-func DirectoryHeader(p *Page, versionedURL bool) htmlcheck.Checker {
-	fv := p.FormattedVersion
-	if fv == "" {
-		fv = p.Version
+// UnitDoc checks the doc section of the main page.
+func UnitDoc() htmlcheck.Checker {
+	return in(".Documentation", text(`Overview`))
+}
+
+// UnitDirectories checks the directories section of the main page.
+// If firstHref isn't empty, it and firstText should exactly match
+// href and text of the first link in the Directories table.
+func UnitDirectories(firstHref, firstText string) htmlcheck.Checker {
+	var link htmlcheck.Checker
+	if firstHref != "" {
+		link = in(`[data-test-id="UnitDirectories-table"] a`, href(firstHref), exactText(firstText))
 	}
 	return in("",
-		in("span.DetailsHeader-breadcrumbCurrent", exactText(path.Base(p.Suffix))),
-		in("h1.DetailsHeader-title", exactTextCollapsed(p.Title)),
-		in("div.DetailsHeader-version", exactText(fv)),
-		// directory pages don't show a header badge
-		in("div.DetailsHeader-badge", in(".DetailsHeader-badge--unknown")),
-		licenseInfo(p, packageURLPath(p, versionedURL)),
-		// directory module links are always versioned (see b/144217401)
-		moduleInHeader(p, true))
+		in("th:nth-child(1)", text("^Path$")),
+		in("th:nth-child(2)", text("^Synopsis$")),
+		link)
+}
+
+// CanonicalURLPath checks the canonical url for the unit on the page.
+func CanonicalURLPath(path string) htmlcheck.Checker {
+	return in(".js-canonicalURLPath", attr("data-canonical-url-path", path))
 }
 
 // SubdirectoriesDetails checks the detail section of a subdirectories tab.
@@ -136,82 +198,26 @@ func LicenseDetails(ltype, bodySubstring, source string) htmlcheck.Checker {
 			exactText("Source: "+source)))
 }
 
-// OverviewDetails checks the details section of an overview tab.
-func OverviewDetails(ov *Overview) htmlcheck.Checker {
-	var pkg htmlcheck.Checker
-	if ov.PackageURL != "" {
-		pkg = in(".Overview-sourceCodeLink a:nth-of-type(2)",
-			href(ov.PackageURL),
-			exactText(ov.PackageURL))
-	}
-	return in("",
-		in("div.Overview-module > a",
-			href(ov.ModuleLink),
-			exactText(ov.ModuleLinkText)),
-		in(".Overview-sourceCodeLink a:nth-of-type(1)",
-			href(ov.RepoURL),
-			exactText(ov.RepoURL)),
-		pkg,
-		in(".Overview-readmeContent", text(ov.ReadmeContent)),
-		in(".Overview-readmeSource", exactText("Source: "+ov.ReadmeSource)))
-}
-
 // versionBadge checks the latest-version badge on a header.
 func versionBadge(p *Page) htmlcheck.Checker {
 	class := "DetailsHeader-badge"
-	if p.IsLatest {
+	switch {
+	case p.MissingInMinor:
+		class += "--notAtLatest"
+	case p.IsLatestMinor:
 		class += "--latest"
-	} else {
+	default:
 		class += "--goToLatest"
 	}
-	return in("div.DetailsHeader-badge",
+	return in(`[data-test-id="UnitHeader-minorVersionBanner"]`,
 		attr("class", `\b`+regexp.QuoteMeta(class)+`\b`), // the badge has this class too
 		in("a", href(p.LatestLink), exactText("Go to latest")))
 }
 
-// licenseInfo checks the license part of the info label in the header.
-func licenseInfo(p *Page, urlPath string) htmlcheck.Checker {
-	if p.LicenseType == "" {
-		return in("[data-test-id=DetailsHeader-infoLabelLicense]", text("None detected"))
-	}
-	return in("[data-test-id=DetailsHeader-infoLabelLicense] a",
-		href(fmt.Sprintf("%s?tab=licenses#lic-0", urlPath)),
-		exactText(p.LicenseType))
-}
-
-// moduleInHeader checks the module part of the info label in the header.
-func moduleInHeader(p *Page, versionedURL bool) htmlcheck.Checker {
-	modURL := moduleURLPath(p, versionedURL)
-	text := p.ModulePath
-	if p.ModulePath == stdlib.ModulePath {
-		text = "Standard library"
-	}
-	return in("a[data-test-id=DetailsHeader-infoLabelModule]", href(modURL), exactText(text))
-}
-
-// Check that all the navigation tabs link to the same package at the same version.
-func packageTabLinks(p *Page, versionedURL bool) htmlcheck.Checker {
-	return inAll("a.DetailsNav-link[href]",
-		attr("href", "^"+regexp.QuoteMeta(packageURLPath(p, versionedURL))))
-}
-
-// Check that all the navigation tabs link to the same module at the same version.
-func moduleTabLinks(p *Page, versionedURL bool) htmlcheck.Checker {
-	return inAll("a.DetailsNav-link[href]",
-		attr("href", "^"+regexp.QuoteMeta(moduleURLPath(p, versionedURL))))
-}
-
-func packageURLPath(p *Page, versioned bool) string {
+func unitURLPath(p *Page, versioned bool) string {
 	v := ""
 	if versioned {
 		v = "@" + p.Version
 	}
-	return fmt.Sprintf(p.PackageURLFormat, v)
-}
-
-func moduleURLPath(p *Page, versioned bool) string {
-	if versioned {
-		return p.ModuleURL + "@" + p.Version
-	}
-	return p.ModuleURL
+	return fmt.Sprintf(p.UnitURLFormat, v)
 }

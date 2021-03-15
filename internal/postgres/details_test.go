@@ -8,25 +8,143 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sort"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/google/safehtml"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
-	"golang.org/x/pkgsite/internal/experiment"
-	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/source"
 	"golang.org/x/pkgsite/internal/testing/sample"
 )
 
-func TestPostgres_GetModuleInfo(t *testing.T) {
+func TestGetNestedModules(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	for _, test := range []struct {
+		name            string
+		path            string
+		modules         []*internal.Module
+		wantModulePaths []string
+	}{
+		{
+			name: "Nested Modules in cloud.google.com/go that have the same module prefix path",
+			path: "cloud.google.com/go",
+			modules: []*internal.Module{
+				sample.Module("cloud.google.com/go", "v0.46.2", "storage", "spanner", "pubsub"),
+				sample.Module("cloud.google.com/go/storage", "v1.10.0", sample.Suffix),
+				sample.Module("cloud.google.com/go/spanner", "v1.9.0", sample.Suffix),
+				sample.Module("cloud.google.com/go/pubsub", "v1.6.1", sample.Suffix),
+			},
+			wantModulePaths: []string{
+				"cloud.google.com/go/pubsub",
+				"cloud.google.com/go/spanner",
+				"cloud.google.com/go/storage",
+			},
+		},
+		{
+			name: "Nested Modules in cloud.google.com/go that have multiple major versions",
+			path: "cloud.google.com/go",
+			modules: []*internal.Module{
+				sample.Module("cloud.google.com/go", "v0.46.2", "storage", "spanner", "pubsub"),
+				sample.Module("cloud.google.com/go/storage", "v1.10.0", sample.Suffix),
+				sample.Module("cloud.google.com/go/storage/v9", "v9.0.0", sample.Suffix),
+				sample.Module("cloud.google.com/go/storage/v11", "v11.0.0", sample.Suffix),
+			},
+			wantModulePaths: []string{
+				"cloud.google.com/go/storage/v11",
+			},
+		},
+		{
+			name: "Nested Modules in golang.org/x/tools/v2 that have the same module prefix path",
+			path: "golang.org/x/tools/v2",
+			modules: []*internal.Module{
+				sample.Module("golang.org/x/tools", "v0.0.1", sample.Suffix),
+				sample.Module("golang.org/x/tools/gopls", "v0.5.1", sample.Suffix),
+			},
+			wantModulePaths: []string{
+				"golang.org/x/tools/gopls",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testDB, release := acquire(t)
+			defer release()
+
+			for _, v := range test.modules {
+				MustInsertModule(ctx, t, testDB, v)
+			}
+
+			gotModules, err := testDB.GetNestedModules(ctx, test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotModulePaths []string
+			for _, mod := range gotModules {
+				gotModulePaths = append(gotModulePaths, mod.ModulePath)
+			}
+
+			if diff := cmp.Diff(test.wantModulePaths, gotModulePaths); diff != "" {
+				t.Errorf("mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGetNestedModules_Excluded(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	defer ResetTestDB(testDB, t)
+	test := struct {
+		name            string
+		path            string
+		modules         []*internal.Module
+		wantModulePaths []string
+	}{
+		name: "Nested Modules in cloud.google.com/go that have the same module prefix path",
+		path: "cloud.google.com/go",
+		modules: []*internal.Module{
+			sample.Module("cloud.google.com/go", "v0.46.2", "storage", "spanner", "pubsub"),
+			// cloud.google.com/storage will be excluded below.
+			sample.Module("cloud.google.com/go/storage", "v1.10.0", sample.Suffix),
+			sample.Module("cloud.google.com/go/pubsub", "v1.6.1", sample.Suffix),
+			sample.Module("cloud.google.com/go/spanner", "v1.9.0", sample.Suffix),
+		},
+		wantModulePaths: []string{
+			"cloud.google.com/go/pubsub",
+			"cloud.google.com/go/spanner",
+		},
+	}
+	for _, m := range test.modules {
+		MustInsertModule(ctx, t, testDB, m)
+	}
+	if err := testDB.InsertExcludedPrefix(ctx, "cloud.google.com/go/storage", "postgres", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	gotModules, err := testDB.GetNestedModules(ctx, "cloud.google.com/go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotModulePaths []string
+	for _, mod := range gotModules {
+		gotModulePaths = append(gotModulePaths, mod.ModulePath)
+	}
+	if diff := cmp.Diff(test.wantModulePaths, gotModulePaths); diff != "" {
+		t.Errorf("mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestPostgres_GetModuleInfo(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
 
 	testCases := []struct {
 		name, path, version string
@@ -64,28 +182,26 @@ func TestPostgres_GetModuleInfo(t *testing.T) {
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, v := range tc.modules {
-				if err := testDB.InsertModule(ctx, v); err != nil {
-					t.Error(err)
-				}
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			for _, v := range test.modules {
+				MustInsertModule(ctx, t, testDB, v)
 			}
 
-			gotVI, err := testDB.GetModuleInfo(ctx, tc.path, tc.version)
+			gotVI, err := testDB.GetModuleInfo(ctx, test.path, test.version)
 			if err != nil {
-				if tc.wantErr == nil {
+				if test.wantErr == nil {
 					t.Fatalf("got unexpected error %v", err)
 				}
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("got error %v, want Is(%v)", err, tc.wantErr)
+				if !errors.Is(err, test.wantErr) {
+					t.Fatalf("got error %v, want Is(%v)", err, test.wantErr)
 				}
 				return
 			}
-			if tc.wantIndex >= len(tc.modules) {
+			if test.wantIndex >= len(test.modules) {
 				t.Fatal("wantIndex too large")
 			}
-			wantVI := &tc.modules[tc.wantIndex].ModuleInfo
+			wantVI := &test.modules[test.wantIndex].ModuleInfo
 			if diff := cmp.Diff(wantVI, gotVI, cmpopts.EquateEmpty(), cmp.AllowUnexported(source.Info{})); diff != "" {
 				t.Errorf("mismatch (-want +got):\n%s", diff)
 			}
@@ -93,94 +209,25 @@ func TestPostgres_GetModuleInfo(t *testing.T) {
 	}
 }
 
-func TestPostgres_GetVersionInfo_Latest(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
+func TestGetImportedBy(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
 
-	defer ResetTestDB(testDB, t)
-
-	testCases := []struct {
-		name, path string
-		modules    []*internal.Module
-		wantIndex  int // index into versions
-		wantErr    error
-	}{
-		{
-			name: "largest release",
-			path: "mod.1",
-			modules: []*internal.Module{
-				sample.Module("mod.1", "v1.1.0-alpha.1", sample.Suffix),
-				sample.Module("mod.1", "v1.0.0", sample.Suffix),
-				sample.Module("mod.1", "v1.0.0-20190311183353-d8887717615a", sample.Suffix),
-			},
-			wantIndex: 1,
-		},
-		{
-			name: "largest prerelease",
-			path: "mod.2",
-			modules: []*internal.Module{
-				sample.Module("mod.2", "v1.1.0-beta.10", sample.Suffix),
-				sample.Module("mod.2", "v1.1.0-beta.2", sample.Suffix),
-				sample.Module("mod.2", "v1.0.0-20190311183353-d8887717615a", sample.Suffix),
-			},
-			wantIndex: 0,
-		},
-		{
-			name:    "no versions",
-			path:    "mod3",
-			wantErr: derrors.NotFound,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, v := range tc.modules {
-				if err := testDB.InsertModule(ctx, v); err != nil {
-					t.Error(err)
-				}
-			}
-
-			gotVI, err := testDB.LegacyGetModuleInfo(ctx, tc.path, internal.LatestVersion)
-			if err != nil {
-				if tc.wantErr == nil {
-					t.Fatalf("got unexpected error %v", err)
-				}
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("got error %v, want Is(%v)", err, tc.wantErr)
-				}
-				return
-			}
-			if tc.wantIndex >= len(tc.modules) {
-				t.Fatal("wantIndex too large")
-			}
-			wantVI := &tc.modules[tc.wantIndex].LegacyModuleInfo
-			if diff := cmp.Diff(wantVI, gotVI, cmpopts.EquateEmpty(), cmp.AllowUnexported(source.Info{})); diff != "" {
-				t.Errorf("mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestPostgres_GetImportsAndImportedBy(t *testing.T) {
 	var (
 		m1          = sample.Module("path.to/foo", "v1.1.0", "bar")
 		m2          = sample.Module("path2.to/foo", "v1.2.0", "bar2")
 		m3          = sample.Module("path3.to/foo", "v1.3.0", "bar3")
 		testModules = []*internal.Module{m1, m2, m3}
 
-		pkg1 = m1.LegacyPackages[0]
-		pkg2 = m2.LegacyPackages[0]
-		pkg3 = m3.LegacyPackages[0]
+		pkg1 = m1.Packages()[0]
+		pkg2 = m2.Packages()[0]
+		pkg3 = m3.Packages()[0]
 	)
-
 	pkg1.Imports = nil
 	pkg2.Imports = []string{pkg1.Path}
 	pkg3.Imports = []string{pkg2.Path, pkg1.Path}
-	m1.Directories[1].Package.Imports = pkg1.Imports
-	m2.Directories[1].Package.Imports = pkg2.Imports
-	m3.Directories[1].Package.Imports = pkg3.Imports
 
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		name, path, modulePath, version string
 		wantImports                     []string
 		wantImportedBy                  []string
@@ -218,90 +265,27 @@ func TestPostgres_GetImportsAndImportedBy(t *testing.T) {
 			wantImportedBy: []string{pkg3.Path},
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			defer ResetTestDB(testDB, t)
-
-			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-			defer cancel()
+		t.Run(test.name, func(t *testing.T) {
+			testDB, release := acquire(t)
+			defer release()
 
 			for _, v := range testModules {
-				if err := testDB.InsertModule(ctx, v); err != nil {
-					t.Error(err)
-				}
+				MustInsertModule(ctx, t, testDB, v)
 			}
-			t.Run("use-package-imports", func(t *testing.T) {
-				testGetImports(ctx, t, tc.path, tc.modulePath, tc.version, tc.wantImports, internal.ExperimentUsePackageImports)
-			})
-			t.Run("use-imports", func(t *testing.T) {
-				testGetImports(ctx, t, tc.path, tc.modulePath, tc.version, tc.wantImports)
-			})
 
-			gotImportedBy, err := testDB.GetImportedBy(ctx, tc.path, tc.modulePath, 100)
+			gotImportedBy, err := testDB.GetImportedBy(ctx, test.path, test.modulePath, 100)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(tc.wantImportedBy, gotImportedBy); diff != "" {
-				t.Errorf("testDB.GetImportedBy(%q, %q) mismatch (-want +got):\n%s", tc.path, tc.modulePath, diff)
-			}
-		})
-	}
-}
-
-func testGetImports(ctx context.Context, t *testing.T, path, modulePath, version string, wantImports []string, experimentNames ...string) {
-	t.Helper()
-	ctx = experiment.NewContext(ctx, experimentNames...)
-	got, err := testDB.GetImports(ctx, path, modulePath, version)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sort.Strings(wantImports)
-	if diff := cmp.Diff(wantImports, got); diff != "" {
-		t.Errorf("testDB.GetImports(%q, %q) mismatch (-want +got):\n%s", path, version, diff)
-	}
-}
-
-func TestGetPackagesInVersion(t *testing.T) {
-	testVersion := sample.Module("test.module", "v1.2.3", "", "foo")
-
-	for _, tc := range []struct {
-		name, pkgPath string
-		module        *internal.Module
-	}{
-		{
-			name:    "version with multiple packages",
-			pkgPath: "test.module",
-			module:  testVersion,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			defer ResetTestDB(testDB, t)
-			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-			defer cancel()
-
-			if err := testDB.InsertModule(ctx, tc.module); err != nil {
-				t.Error(err)
-			}
-
-			got, err := testDB.LegacyGetPackagesInModule(ctx, tc.pkgPath, tc.module.Version)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			opts := []cmp.Option{
-				cmpopts.IgnoreFields(internal.LegacyPackage{}, "Imports"),
-				// The packages table only includes partial license information; it omits the Coverage field.
-				cmpopts.IgnoreFields(licenses.Metadata{}, "Coverage"),
-				cmp.AllowUnexported(safehtml.HTML{}),
-			}
-			if diff := cmp.Diff(tc.module.LegacyPackages, got, opts...); diff != "" {
-				t.Errorf("testDB.GetPackageInVersion(ctx, %q, %q) mismatch (-want +got):\n%s", tc.pkgPath, tc.module.Version, diff)
+			if diff := cmp.Diff(test.wantImportedBy, gotImportedBy); diff != "" {
+				t.Errorf("testDB.GetImportedBy(%q, %q) mismatch (-want +got):\n%s", test.path, test.modulePath, diff)
 			}
 		})
 	}
 }
 
 func TestJSONBScanner(t *testing.T) {
+	t.Parallel()
 	type S struct{ A int }
 
 	want := &S{1}
@@ -329,36 +313,46 @@ func TestJSONBScanner(t *testing.T) {
 	}
 }
 
-func TestHackUpDocumentation(t *testing.T) {
+func TestRemovePkgPrefix(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		body string
 		want string
 	}{
-		{"nothing burger", "nothing burger"},
-		{`<a href="/pkg/foo">foo</a>`, `<a href="/foo?tab=doc">foo</a>`},
-		{`<a href="/pkg/foo"`, `<a href="/pkg/foo"`},
+		// Cases where /pkg is expected to be removed.
+		{`<a href="/pkg/foo">foo</a>`, `<a href="/foo">foo</a>`},
 		{
 			`<a href="/pkg/foo"><a href="/pkg/bar">bar</a></a>`,
-			`<a href="/foo?tab=doc"><a href="/pkg/bar">bar</a></a>`,
+			`<a href="/foo"><a href="/pkg/bar">bar</a></a>`,
 		},
 		{
 			`<a href="/pkg/foo">foo</a>
 		   <a href="/pkg/bar">bar</a>`,
-			`<a href="/foo?tab=doc">foo</a>
-		   <a href="/bar?tab=doc">bar</a>`,
+			`<a href="/foo">foo</a>
+		   <a href="/bar">bar</a>`,
 		},
-		{`<ahref="/pkg/foo">foo</a>`, `<ahref="/pkg/foo">foo</a>`},
-		{`<allhref="/pkg/foo">foo</a>`, `<allhref="/pkg/foo">foo</a>`},
-		{`<a nothref="/pkg/foo">foo</a>`, `<a nothref="/pkg/foo">foo</a>`},
-		{`<a href="/pkg/foo#identifier">foo</a>`, `<a href="/foo?tab=doc#identifier">foo</a>`},
-		{`<a href="#identifier">foo</a>`, `<a href="#identifier">foo</a>`},
+		{`<a href="/pkg/foo#identifier">foo</a>`, `<a href="/foo#identifier">foo</a>`},
 		{`<span id="Indirect.Type"></span>func (in <a href="#Indirect">Indirect</a>) Type() <a href="/pkg/reflect">reflect</a>.<a href="/pkg/reflect#Type">Type</a>`,
-			`<span id="Indirect.Type"></span>func (in <a href="#Indirect">Indirect</a>) Type() <a href="/reflect?tab=doc">reflect</a>.<a href="/reflect?tab=doc#Type">Type</a>`},
+			`<span id="Indirect.Type"></span>func (in <a href="#Indirect">Indirect</a>) Type() <a href="/reflect">reflect</a>.<a href="/reflect#Type">Type</a>`},
 	}
 
 	for _, test := range tests {
-		if got := hackUpDocumentation(test.body); got != test.want {
-			t.Errorf("hackUpDocumentation(%s) = %s, want %s", test.body, got, test.want)
+		if got := removePkgPrefix(test.body); got != test.want {
+			t.Errorf("removePkgPrefix(%s) = %s, want %s", test.body, got, test.want)
+		}
+	}
+
+	// Cases where no change is expected.
+	for _, test := range []string{
+		"nothing burger",
+		`<ahref="/pkg/foo">foo</a>`,
+		`<allhref="/pkg/foo">foo</a>`,
+		`<a nothref="/pkg/foo">foo</a>`,
+		`<a href="/pkg/foo"`,
+		`<a href="#identifier">foo</a>`,
+	} {
+		if got := removePkgPrefix(test); got != test {
+			t.Errorf("removePkgPrefix(%s) = %s, want %s", test, got, test)
 		}
 	}
 }

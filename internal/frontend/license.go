@@ -36,22 +36,12 @@ type LicenseMetadata struct {
 
 // fetchLicensesDetails fetches license data for the package version specified by
 // path and version from the database and returns a LicensesDetails.
-func fetchLicensesDetails(ctx context.Context, ds internal.DataSource, fullPath, modulePath, resolvedVersion string) (*LicensesDetails, error) {
-	dsLicenses, err := ds.GetLicenses(ctx, fullPath, modulePath, resolvedVersion)
+func fetchLicensesDetails(ctx context.Context, ds internal.DataSource, um *internal.UnitMeta) (*LicensesDetails, error) {
+	u, err := ds.GetUnit(ctx, um, internal.WithLicenses)
 	if err != nil {
 		return nil, err
 	}
-	return &LicensesDetails{Licenses: transformLicenses(modulePath, resolvedVersion, dsLicenses)}, nil
-}
-
-// legacyFetchPackageLicensesDetails fetches license data for the package version specified by
-// path and version from the database and returns a LicensesDetails.
-func legacyFetchPackageLicensesDetails(ctx context.Context, ds internal.DataSource, pkgPath, modulePath, resolvedVersion string) (*LicensesDetails, error) {
-	dsLicenses, err := ds.LegacyGetPackageLicenses(ctx, pkgPath, modulePath, resolvedVersion)
-	if err != nil {
-		return nil, err
-	}
-	return &LicensesDetails{Licenses: transformLicenses(modulePath, resolvedVersion, dsLicenses)}, nil
+	return &LicensesDetails{Licenses: transformLicenses(um.ModulePath, um.Version, u.LicenseContents)}, nil
 }
 
 // transformLicenses transforms licenses.License into a License
@@ -112,13 +102,4 @@ func licenseAnchors(paths []string) []safehtml.Identifier {
 		ids[index[p]] = safehtml.IdentifierFromConstantPrefix("lic", strconv.Itoa(i))
 	}
 	return ids
-}
-
-// licensesToMetadatas converts a slice of Licenses to a slice of Metadatas.
-func licensesToMetadatas(lics []*licenses.License) []*licenses.Metadata {
-	var ms []*licenses.Metadata
-	for _, l := range lics {
-		ms = append(ms, l.Metadata)
-	}
-	return ms
 }

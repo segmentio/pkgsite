@@ -16,10 +16,12 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/safehtml/template"
 	"go.opencensus.io/trace"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/config"
 	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal/godoc/dochtml"
 	"golang.org/x/pkgsite/internal/index"
 	"golang.org/x/pkgsite/internal/postgres"
 	"golang.org/x/pkgsite/internal/proxy"
@@ -28,15 +30,18 @@ import (
 	"golang.org/x/pkgsite/internal/testing/sample"
 )
 
-const testTimeout = 60 * time.Second
+const testTimeout = 120 * time.Second
 
 var (
-	testDB     *postgres.DB
-	httpClient *http.Client
+	testDB      *postgres.DB
+	httpClient  *http.Client
+	testModules []*proxy.Module
 )
 
 func TestMain(m *testing.M) {
 	httpClient = &http.Client{Transport: fakeTransport{}}
+	dochtml.LoadTemplates(template.TrustedSourceFromConstant("../../content/static/html/doc"))
+	testModules = proxy.LoadTestModules("../proxy/testdata")
 	postgres.RunDBTests("discovery_worker_test", m, &testDB)
 }
 
@@ -89,8 +94,10 @@ func TestWorker(t *testing.T) {
 		}
 		state = func(version *internal.IndexVersion, code, tryCount, numPackages int) *internal.ModuleVersionState {
 			goModPath := version.Path
+			hasGoMod := true
 			if code == 0 || code >= 300 {
 				goModPath = ""
+				hasGoMod = false
 			}
 			var n *int
 			if code != 0 && code != http.StatusNotFound {
@@ -102,6 +109,7 @@ func TestWorker(t *testing.T) {
 				Status:         code,
 				TryCount:       tryCount,
 				Version:        version.Version,
+				HasGoMod:       hasGoMod,
 				GoModPath:      goModPath,
 				NumPackages:    n,
 			}
@@ -168,24 +176,23 @@ func TestWorker(t *testing.T) {
 			indexClient, teardownIndex := index.SetupTestIndex(t, test.index)
 			defer teardownIndex()
 
-			proxyClient, teardownProxy := proxy.SetupTestProxy(t, test.proxy)
+			proxyClient, teardownProxy := proxy.SetupTestClient(t, test.proxy)
 			defer teardownProxy()
-			sourceClient := source.NewClient(sourceTimeout)
-
 			defer postgres.ResetTestDB(testDB, t)
+			f := &Fetcher{proxyClient, source.NewClient(sourceTimeout), testDB, nil}
 
 			// Use 10 workers to have parallelism consistent with the worker binary.
 			q := queue.NewInMemory(ctx, 10, nil, func(ctx context.Context, mpath, version string) (int, error) {
-				return FetchAndUpdateState(ctx, mpath, version, proxyClient, sourceClient, testDB, "")
+				code, _, err := f.FetchAndUpdateState(ctx, mpath, version, "")
+				return code, err
 			})
 
 			s, err := NewServer(&config.Config{}, ServerConfig{
-				DB:                   testDB,
-				IndexClient:          indexClient,
-				ProxyClient:          proxyClient,
-				SourceClient:         sourceClient,
-				Queue:                q,
-				TaskIDChangeInterval: 10 * time.Minute,
+				DB:           testDB,
+				IndexClient:  indexClient,
+				ProxyClient:  proxyClient,
+				SourceClient: f.SourceClient,
+				Queue:        q,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -318,6 +325,31 @@ func TestParseModulePathAndVersion(t *testing.T) {
 					u, m, v, err, test.module, test.version, test.err)
 			}
 		})
+	}
+}
+
+func TestShouldDisableProxyFetch(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   bool
+	}{
+		{200, false},
+		{490, false},
+		{500, false},
+		{520, true},
+		{542, true},
+		{580, false},
+	} {
+
+		got := shouldDisableProxyFetch(&internal.ModuleVersionState{
+			ModulePath: "m",
+			Version:    "v1.2.3",
+			Status:     test.status,
+		})
+		if got != test.want {
+			t.Errorf("status %d: got %t, want %t", test.status, got, test.want)
+		}
+
 	}
 }
 

@@ -10,8 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,24 +20,39 @@ import (
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
 	"golang.org/x/pkgsite/internal/fetch"
-	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/proxy"
 	"golang.org/x/pkgsite/internal/source"
-	"golang.org/x/pkgsite/internal/stdlib"
-	"golang.org/x/pkgsite/internal/version"
 )
 
 var _ internal.DataSource = (*DataSource)(nil)
 
 // New returns a new direct proxy datasource.
 func New(proxyClient *proxy.Client) *DataSource {
+	return newDataSource(proxyClient, source.NewClient(1*time.Minute))
+}
+
+func NewForTesting(proxyClient *proxy.Client) *DataSource {
+	return newDataSource(proxyClient, source.NewClientForTesting())
+}
+
+func newDataSource(proxyClient *proxy.Client, sourceClient *source.Client) *DataSource {
 	return &DataSource{
 		proxyClient:          proxyClient,
-		sourceClient:         source.NewClient(1 * time.Minute),
+		sourceClient:         sourceClient,
 		versionCache:         make(map[versionKey]*versionEntry),
 		modulePathToVersions: make(map[string][]string),
 		packagePathToModules: make(map[string][]string),
+		bypassLicenseCheck:   false,
 	}
+}
+
+// NewBypassingLicenseCheck returns a new direct proxy datasource that bypasses
+// license checks. That means all data will be returned for non-redistributable
+// modules, packages and directories.
+func NewBypassingLicenseCheck(c *proxy.Client) *DataSource {
+	ds := New(c)
+	ds.bypassLicenseCheck = true
+	return ds
 }
 
 // DataSource implements the frontend.DataSource interface, by querying a
@@ -55,6 +70,7 @@ type DataSource struct {
 	// map of package path -> modules paths containing it, with module paths
 	// sorted by descending length
 	packagePathToModules map[string][]string
+	bypassLicenseCheck   bool
 }
 
 type versionKey struct {
@@ -65,207 +81,6 @@ type versionKey struct {
 type versionEntry struct {
 	module *internal.Module
 	err    error
-}
-
-// LegacyGetDirectory returns packages contained in the given subdirectory of a module version.
-func (ds *DataSource) LegacyGetDirectory(ctx context.Context, dirPath, modulePath, version string, _ internal.FieldSet) (_ *internal.LegacyDirectory, err error) {
-	defer derrors.Wrap(&err, "LegacyGetDirectory(%q, %q, %q)", dirPath, modulePath, version)
-
-	var info *proxy.VersionInfo
-	if modulePath == internal.UnknownModulePath {
-		modulePath, info, err = ds.findModule(ctx, dirPath, version)
-		if err != nil {
-			return nil, err
-		}
-		version = info.Version
-	}
-	v, err := ds.getModule(ctx, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	return &internal.LegacyDirectory{
-		LegacyModuleInfo: internal.LegacyModuleInfo{ModuleInfo: v.ModuleInfo},
-		Path:             dirPath,
-		Packages:         v.LegacyPackages,
-	}, nil
-}
-
-// GetDirectory returns information about a directory at a path.
-func (ds *DataSource) GetDirectory(ctx context.Context, dirPath, modulePath, version string) (_ *internal.VersionedDirectory, err error) {
-	m, err := ds.getModule(ctx, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	return &internal.VersionedDirectory{
-		ModuleInfo: m.ModuleInfo,
-		Directory: internal.Directory{
-			DirectoryMeta: internal.DirectoryMeta{
-				Path:   dirPath,
-				V1Path: internal.V1Path(modulePath, strings.TrimPrefix(dirPath, modulePath+"/")),
-			},
-		},
-	}, nil
-}
-
-// GetImports returns package imports as extracted from the module zip.
-func (ds *DataSource) GetImports(ctx context.Context, pkgPath, modulePath, version string) (_ []string, err error) {
-	defer derrors.Wrap(&err, "GetImports(%q, %q, %q)", pkgPath, modulePath, version)
-	vp, err := ds.LegacyGetPackage(ctx, pkgPath, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	return vp.Imports, nil
-}
-
-// GetLicenses return licenses at path for the given module path and version.
-func (ds *DataSource) GetLicenses(ctx context.Context, fullPath, modulePath, resolvedVersion string) (_ []*licenses.License, err error) {
-	defer derrors.Wrap(&err, "GetLicenses(%q, %q, %q)", fullPath, modulePath, resolvedVersion)
-	v, err := ds.getModule(ctx, modulePath, resolvedVersion)
-	if err != nil {
-		return nil, err
-	}
-
-	var lics []*licenses.License
-
-	// ds.getModule() returns all licenses for the module version. We need to
-	// filter the licenses that applies to the specified fullPath, i.e.
-	// A license in the current or any parent directory of the specified
-	// fullPath applies to it.
-	for _, license := range v.Licenses {
-		licensePath := path.Join(modulePath, path.Dir(license.FilePath))
-		if strings.HasPrefix(fullPath, licensePath) {
-			lics = append(lics, license)
-		}
-	}
-
-	if len(lics) == 0 {
-		return nil, fmt.Errorf("path %s is missing from module %s: %w", fullPath, modulePath, derrors.NotFound)
-	}
-	return lics, nil
-}
-
-// LegacyGetModuleLicenses returns root-level licenses detected within the module zip
-// for modulePath and version.
-func (ds *DataSource) LegacyGetModuleLicenses(ctx context.Context, modulePath, version string) (_ []*licenses.License, err error) {
-	defer derrors.Wrap(&err, "LegacyGetModuleLicenses(%q, %q)", modulePath, version)
-	v, err := ds.getModule(ctx, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	var filtered []*licenses.License
-	for _, lic := range v.Licenses {
-		if !strings.Contains(lic.FilePath, "/") {
-			filtered = append(filtered, lic)
-		}
-	}
-	return filtered, nil
-}
-
-// LegacyGetPackage returns a LegacyVersionedPackage for the given pkgPath and version. If
-// such a package exists in the cache, it will be returned without querying the
-// proxy. Otherwise, the proxy is queried to find the longest module path at
-// that version containing the package.
-func (ds *DataSource) LegacyGetPackage(ctx context.Context, pkgPath, modulePath, version string) (_ *internal.LegacyVersionedPackage, err error) {
-	defer derrors.Wrap(&err, "LegacyGetPackage(%q, %q)", pkgPath, version)
-
-	var m *internal.Module
-	if modulePath != internal.UnknownModulePath {
-		m, err = ds.getModule(ctx, modulePath, version)
-	} else {
-		m, err = ds.getPackageVersion(ctx, pkgPath, version)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return packageFromVersion(pkgPath, m)
-}
-
-// LegacyGetPackageLicenses returns the Licenses that apply to pkgPath within the
-// module version specified by modulePath and version.
-func (ds *DataSource) LegacyGetPackageLicenses(ctx context.Context, pkgPath, modulePath, version string) (_ []*licenses.License, err error) {
-	defer derrors.Wrap(&err, "LegacyGetPackageLicenses(%q, %q, %q)", pkgPath, modulePath, version)
-	v, err := ds.getModule(ctx, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	for _, p := range v.LegacyPackages {
-		if p.Path == pkgPath {
-			var lics []*licenses.License
-			for _, lmd := range p.Licenses {
-				// lmd is just license metadata, the version has the actual licenses.
-				for _, lic := range v.Licenses {
-					if lic.FilePath == lmd.FilePath {
-						lics = append(lics, lic)
-						break
-					}
-				}
-			}
-			return lics, nil
-		}
-	}
-	return nil, fmt.Errorf("package %s is missing from module %s: %w", pkgPath, modulePath, derrors.NotFound)
-}
-
-// LegacyGetPackagesInModule returns LegacyPackages contained in the module zip corresponding to modulePath and version.
-func (ds *DataSource) LegacyGetPackagesInModule(ctx context.Context, modulePath, version string) (_ []*internal.LegacyPackage, err error) {
-	defer derrors.Wrap(&err, "LegacyGetPackagesInModule(%q, %q)", modulePath, version)
-	v, err := ds.getModule(ctx, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	return v.LegacyPackages, nil
-}
-
-// LegacyGetPsuedoVersionsForModule returns versions from the the proxy /list
-// endpoint, if they are pseudoversions. Otherwise, it returns an empty slice.
-func (ds *DataSource) LegacyGetPsuedoVersionsForModule(ctx context.Context, modulePath string) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "LegacyGetPsuedoVersionsForModule(%q)", modulePath)
-	return ds.listModuleVersions(ctx, modulePath, true)
-}
-
-// LegacyGetPsuedoVersionsForPackageSeries finds the longest module path containing
-// pkgPath, and returns its versions from the proxy /list endpoint, if they are
-// pseudoversions. Otherwise, it returns an empty slice.
-func (ds *DataSource) LegacyGetPsuedoVersionsForPackageSeries(ctx context.Context, pkgPath string) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "LegacyGetPsuedoVersionsForPackageSeries(%q)", pkgPath)
-	return ds.listPackageVersions(ctx, pkgPath, true)
-}
-
-// LegacyGetTaggedVersionsForModule returns versions from the the proxy /list
-// endpoint, if they are tagged versions. Otherwise, it returns an empty slice.
-func (ds *DataSource) LegacyGetTaggedVersionsForModule(ctx context.Context, modulePath string) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "LegacyGetTaggedVersionsForModule(%q)", modulePath)
-	return ds.listModuleVersions(ctx, modulePath, false)
-}
-
-// LegacyGetTaggedVersionsForPackageSeries finds the longest module path containing
-// pkgPath, and returns its versions from the proxy /list endpoint, if they are
-// tagged versions. Otherwise, it returns an empty slice.
-func (ds *DataSource) LegacyGetTaggedVersionsForPackageSeries(ctx context.Context, pkgPath string) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "LegacyGetTaggedVersionsForPackageSeries(%q)", pkgPath)
-	return ds.listPackageVersions(ctx, pkgPath, false)
-}
-
-// GetModuleInfo returns the ModuleInfo as fetched from the proxy for module
-// version specified by modulePath and version.
-func (ds *DataSource) GetModuleInfo(ctx context.Context, modulePath, version string) (_ *internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "GetModuleInfo(%q, %q)", modulePath, version)
-	m, err := ds.getModule(ctx, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	return &m.ModuleInfo, nil
-}
-
-// LegacyGetModuleInfo returns the LegacyModuleInfo as fetched from the proxy for module
-// version specified by modulePath and version.
-func (ds *DataSource) LegacyGetModuleInfo(ctx context.Context, modulePath, version string) (_ *internal.LegacyModuleInfo, err error) {
-	defer derrors.Wrap(&err, "LegacyGetModuleInfo(%q, %q)", modulePath, version)
-	m, err := ds.getModule(ctx, modulePath, version)
-	if err != nil {
-		return nil, err
-	}
-	return &m.LegacyModuleInfo, nil
 }
 
 // getModule retrieves a version from the cache, or failing that queries and
@@ -279,23 +94,36 @@ func (ds *DataSource) getModule(ctx context.Context, modulePath, version string)
 	if e, ok := ds.versionCache[key]; ok {
 		return e.module, e.err
 	}
-	v := version
-	if modulePath == stdlib.ModulePath {
-		if version == internal.LatestVersion {
-			// fetch.FetchModule does not support the latest endpoint for the
-			// standard library, but it is useful to look at these packages when
-			// developing with the proxydatasource. A hardcoded value is used here,
-			// so that the request won't fail.
-			v = "go1.14.4"
-		}
-		v = stdlib.VersionForTag(v)
-	}
-	res := fetch.FetchModule(ctx, modulePath, v, ds.proxyClient, ds.sourceClient)
+	res := fetch.FetchModule(ctx, modulePath, version, ds.proxyClient, ds.sourceClient)
+	defer res.Defer()
 	m := res.Module
-	ds.versionCache[key] = &versionEntry{module: m, err: err}
+	if m != nil {
+		if ds.bypassLicenseCheck {
+			m.IsRedistributable = true
+			for _, pkg := range m.Packages() {
+				pkg.IsRedistributable = true
+			}
+		} else {
+			m.RemoveNonRedistributableData()
+		}
+		// Use the go.mod file at the raw latest version to fill in deprecation
+		// and retraction information.
+		lmv, err := fetch.LatestModuleVersions(ctx, modulePath, ds.proxyClient, nil)
+		if err != nil {
+			res.Error = err
+		} else {
+			lmv.PopulateModuleInfo(&m.ModuleInfo)
+		}
+	}
+
 	if res.Error != nil {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			ds.versionCache[key] = &versionEntry{module: m, err: res.Error}
+		}
 		return nil, res.Error
 	}
+
+	ds.versionCache[key] = &versionEntry{module: m, err: err}
 
 	// Since we hold the lock and missed the cache, we can assume that we have
 	// never seen this module version. Therefore the following insert-and-sort
@@ -311,7 +139,7 @@ func (ds *DataSource) getModule(ctx context.Context, modulePath, version string)
 	// be a bit more careful and check that it is new. To do this, we can
 	// leverage the invariant that module paths in packagePathToModules are kept
 	// sorted in descending order of length.
-	for _, pkg := range m.LegacyPackages {
+	for _, pkg := range m.Packages() {
 		var (
 			i   int
 			mp  string
@@ -336,8 +164,8 @@ func (ds *DataSource) getModule(ctx context.Context, modulePath, version string)
 func (ds *DataSource) findModule(ctx context.Context, pkgPath string, version string) (_ string, _ *proxy.VersionInfo, err error) {
 	defer derrors.Wrap(&err, "findModule(%q, ...)", pkgPath)
 	pkgPath = strings.TrimLeft(pkgPath, "/")
-	for modulePath := pkgPath; modulePath != "" && modulePath != "."; modulePath = path.Dir(modulePath) {
-		info, err := ds.proxyClient.GetInfo(ctx, modulePath, version)
+	for _, modulePath := range internal.CandidateModulePaths(pkgPath) {
+		info, err := ds.proxyClient.Info(ctx, modulePath, version)
 		if errors.Is(err, derrors.NotFound) {
 			continue
 		}
@@ -349,143 +177,82 @@ func (ds *DataSource) findModule(ctx context.Context, pkgPath string, version st
 	return "", nil, fmt.Errorf("unable to find module: %w", derrors.NotFound)
 }
 
-// listPackageVersions finds the longest module corresponding to pkgPath, and
-// calls the proxy /list endpoint to list its versions. If pseudo is true, it
-// filters to pseudo versions.  If pseudo is false, it filters to tagged
-// versions.
-func (ds *DataSource) listPackageVersions(ctx context.Context, pkgPath string, pseudo bool) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "listPackageVersions(%q, %t)", pkgPath, pseudo)
-	ds.mu.RLock()
-	mods := ds.packagePathToModules[pkgPath]
-	ds.mu.RUnlock()
-	var modulePath string
-	if len(mods) > 0 {
-		// Since mods is kept sorted, the first element is the longest module.
-		modulePath = mods[0]
-	} else {
-		modulePath, _, err = ds.findModule(ctx, pkgPath, internal.LatestVersion)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return ds.listModuleVersions(ctx, modulePath, pseudo)
-}
-
-// listModuleVersions finds the longest module corresponding to pkgPath, and
-// calls the proxy /list endpoint to list its versions. If pseudo is true, it
-// filters to pseudo versions.  If pseudo is false, it filters to tagged
-// versions.
-func (ds *DataSource) listModuleVersions(ctx context.Context, modulePath string, pseudo bool) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "listModuleVersions(%q, %t)", modulePath, pseudo)
-	versions, err := ds.proxyClient.ListVersions(ctx, modulePath)
+// getUnit returns information about a unit.
+func (ds *DataSource) getUnit(ctx context.Context, fullPath, modulePath, version string) (_ *internal.Unit, err error) {
+	var m *internal.Module
+	m, err = ds.getModule(ctx, modulePath, version)
 	if err != nil {
 		return nil, err
 	}
-	var vis []*internal.ModuleInfo
-	ds.mu.RLock()
-	defer ds.mu.RUnlock()
-	for _, vers := range versions {
-		// In practice, the /list endpoint should only return either pseudo
-		// versions or tagged versions, but we filter here for maximum
-		// compatibility.
-		if version.IsPseudo(vers) != pseudo {
-			continue
-		}
-		if v, ok := ds.versionCache[versionKey{modulePath, vers}]; ok {
-			vis = append(vis, &v.module.ModuleInfo)
-		} else {
-			// In this case we can't produce ModuleInfo without fully processing
-			// the module zip, so we instead append a stub. We could further query
-			// for this version's /info endpoint to get commit time, but that is
-			// deferred as a potential future enhancement.
-			vis = append(vis, &internal.ModuleInfo{
-				ModulePath: modulePath,
-				Version:    vers,
-			})
+	for _, d := range m.Units {
+		if d.Path == fullPath {
+			return d, nil
 		}
 	}
-	sort.Slice(vis, func(i, j int) bool {
-		return semver.Compare(vis[i].Version, vis[j].Version) > 0
-	})
-	return vis, nil
+	return nil, fmt.Errorf("%q missing from module %s: %w", fullPath, m.ModulePath, derrors.NotFound)
 }
 
-// getPackageVersion finds a module at version that contains a package with
-// import path pkgPath. To do this, it first checks the cache for any module
-// satisfying this requirement, querying the proxy if none is found.
-func (ds *DataSource) getPackageVersion(ctx context.Context, pkgPath, version string) (_ *internal.Module, err error) {
-	defer derrors.Wrap(&err, "getPackageVersion(%q, %q)", pkgPath, version)
-	// First, try to retrieve this version from the cache, using our reverse
-	// indexes.
-	if modulePath, ok := ds.findModulePathForPackage(pkgPath, version); ok {
-		// This should hit the cache.
-		return ds.getModule(ctx, modulePath, version)
-	}
-	modulePath, info, err := ds.findModule(ctx, pkgPath, version)
+// GetLatestInfo returns latest information for unitPath and modulePath.
+func (ds *DataSource) GetLatestInfo(ctx context.Context, unitPath, modulePath string) (latest internal.LatestInfo, err error) {
+	defer derrors.Wrap(&err, "GetLatestInfo(ctx, %q, %q)", unitPath, modulePath)
+
+	um, err := ds.GetUnitMeta(ctx, unitPath, internal.UnknownModulePath, internal.LatestVersion)
 	if err != nil {
-		return nil, err
+		return latest, err
 	}
-	return ds.getModule(ctx, modulePath, info.Version)
+	latest.MinorVersion = um.Version
+	latest.MinorModulePath = um.ModulePath
+
+	latest.MajorModulePath, latest.MajorUnitPath, err = ds.getLatestMajorVersion(ctx, unitPath, modulePath)
+	if err != nil {
+		return latest, err
+	}
+	// Do not try to discover whether the unit is in the latest minor version; assume it is.
+	latest.UnitExistsAtMinor = true
+	return latest, nil
 }
 
-// findModulePathForPackage looks for an existing instance of a module at
-// version that contains a package with path pkgPath. The return bool reports
-// whether a valid module path was found.
-func (ds *DataSource) findModulePathForPackage(pkgPath, version string) (string, bool) {
-	ds.mu.RLock()
-	defer ds.mu.RUnlock()
-	for _, mp := range ds.packagePathToModules[pkgPath] {
-		for _, vers := range ds.modulePathToVersions[mp] {
-			if vers == version {
-				return mp, true
+// getLatestMajorVersion returns the latest module path and the full package path
+// of the latest version found in the proxy by iterating through vN versions.
+// This function does not attempt to find whether the full path exists
+// in the new major version.
+func (ds *DataSource) getLatestMajorVersion(ctx context.Context, fullPath, modulePath string) (_ string, _ string, err error) {
+	// We are checking if the full path is valid so that we can forward the error if not.
+	seriesPath := internal.SeriesPathForModule(modulePath)
+	info, err := ds.proxyClient.Info(ctx, seriesPath, internal.LatestVersion)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Converting version numbers to integers may cause an overflow, as version
+	// numbers need not fit into machine integers.
+	// While using Atoi is wrong, for it to fail, the version number must reach a
+	// value higher than at least 2^31, which is unlikely.
+	startVersion, err := strconv.Atoi(strings.TrimPrefix(semver.Major(info.Version), "v"))
+	if err != nil {
+		return "", "", err
+	}
+	startVersion++
+
+	// We start checking versions from "/v2" or higher, since v1 and v0 versions
+	// don't have a major version at the end of the modulepath.
+	if startVersion < 2 {
+		startVersion = 2
+	}
+
+	for v := startVersion; ; v++ {
+		query := fmt.Sprintf("%s/v%d", seriesPath, v)
+
+		_, err := ds.proxyClient.Info(ctx, query, internal.LatestVersion)
+		if errors.Is(err, derrors.NotFound) {
+			if v == 2 {
+				return modulePath, fullPath, nil
 			}
+			latestModulePath := fmt.Sprintf("%s/v%d", seriesPath, v-1)
+			return latestModulePath, latestModulePath, nil
 		}
-	}
-	return "", false
-}
-
-// packageFromVersion extracts the LegacyVersionedPackage for pkgPath from the
-// Version payload.
-func packageFromVersion(pkgPath string, m *internal.Module) (_ *internal.LegacyVersionedPackage, err error) {
-	defer derrors.Wrap(&err, "packageFromVersion(%q, ...)", pkgPath)
-	for _, p := range m.LegacyPackages {
-		if p.Path == pkgPath {
-			return &internal.LegacyVersionedPackage{
-				LegacyPackage:    *p,
-				LegacyModuleInfo: m.LegacyModuleInfo,
-			}, nil
-		}
-	}
-	return nil, fmt.Errorf("package missing from module %s: %w", m.ModulePath, derrors.NotFound)
-}
-
-// GetExperiments is unimplemented.
-func (*DataSource) GetExperiments(ctx context.Context) ([]*internal.Experiment, error) {
-	return nil, nil
-}
-
-// GetPathInfo returns information about the given path.
-func (ds *DataSource) GetPathInfo(ctx context.Context, path, inModulePath, inVersion string) (outModulePath, outVersion string, isPackage bool, err error) {
-	defer derrors.Wrap(&err, "GetPathInfo(%q, %q, %q)", path, inModulePath, inVersion)
-
-	var info *proxy.VersionInfo
-	if inModulePath == internal.UnknownModulePath {
-		inModulePath, info, err = ds.findModule(ctx, path, inVersion)
 		if err != nil {
-			return "", "", false, err
-		}
-		inVersion = info.Version
-	}
-	m, err := ds.getModule(ctx, inModulePath, inVersion)
-	if err != nil {
-		return "", "", false, err
-	}
-	isPackage = false
-	for _, p := range m.LegacyPackages {
-		if p.Path == path {
-			isPackage = true
-			break
+			return "", "", err
 		}
 	}
-	return m.ModulePath, m.Version, isPackage, nil
 }

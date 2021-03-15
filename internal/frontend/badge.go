@@ -7,14 +7,15 @@ package frontend
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
 type badgePage struct {
 	basePage
-	SiteURL string
-	Path    string
+	// LinkPath is the URL path of the badge will link to.
+	LinkPath string
+	// BadgePath is the URL path of the badge SVG.
+	BadgePath string
 }
 
 // badgeHandler serves a Go SVG badge image for requests to /badge/<path>
@@ -26,18 +27,18 @@ func (s *Server) badgeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The user may input a fully qualified URL (https://pkg.go.dev/net/http?tab=doc)
-	// or just a pathname (net/http). Using url.Parse we handle both cases.
-	inputURL := r.URL.Query().Get("path")
-	parsedURL, _ := url.Parse(inputURL)
-	if parsedURL != nil {
-		path = strings.TrimPrefix(parsedURL.RequestURI(), "/")
+	// The user may input a fully qualified URL (https://pkg.go.dev/net/http
+	// or https://github.com/my/module) or just a pathname (net/http).
+	path = strings.TrimPrefix(r.URL.Query().Get("path"), "https://pkg.go.dev/")
+	urlSchemeIdx := strings.Index(path, "://")
+	if urlSchemeIdx > -1 {
+		path = path[urlSchemeIdx+3:]
 	}
 
 	page := badgePage{
-		basePage: s.newBasePage(r, "Badge generation tool"),
-		SiteURL:  "https://" + r.Host,
-		Path:     path,
+		basePage:  s.newBasePage(r, "Badge generation tool"),
+		LinkPath:  path,
+		BadgePath: "badge/" + path + ".svg",
 	}
 	s.servePage(r.Context(), w, "badge.tmpl", page)
 }

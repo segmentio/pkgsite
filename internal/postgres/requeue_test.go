@@ -5,7 +5,9 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"fmt"
 	"net/http"
 	"sort"
@@ -21,17 +23,19 @@ import (
 )
 
 func TestGetNextModulesToFetchAndUpdateModuleVersionStatesForReprocessing(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	defer ResetTestDB(testDB, t)
 
 	type testData struct {
 		modulePath, version string
 		numPackages, status int
 	}
 	var (
-		latest    = "v1.2.0"
-		notLatest = "v1.0.0"
+		latest    = "v1.5.2"
+		notLatest = "v2.0.0+incompatible"
 		big       = 2000
 		small     = 100
 		versions  = []string{notLatest, latest}
@@ -39,8 +43,6 @@ func TestGetNextModulesToFetchAndUpdateModuleVersionStatesForReprocessing(t *tes
 		statuses  = []int{
 			http.StatusOK,
 			derrors.ToStatus(derrors.HasIncompletePackages),
-			derrors.ToStatus(derrors.AlternativeModule),
-			derrors.ToStatus(derrors.BadModule),
 			derrors.ToStatus(derrors.DBModuleInsertInvalid),
 			http.StatusInternalServerError,
 			http.StatusBadRequest,
@@ -78,6 +80,34 @@ func TestGetNextModulesToFetchAndUpdateModuleVersionStatesForReprocessing(t *tes
 		t.Fatal(err)
 	}
 
+	sortNum := func(m *internal.ModuleVersionState) int {
+		if m.Status == 0 {
+			return 0
+		}
+		var s int
+		switch m.Status {
+		case 503, 520, 521:
+			s = 1
+		case 540, 541, 542:
+			s = 2
+		default:
+			s = 5
+		}
+		if m.Version != latest && s < 5 {
+			s += 2
+		}
+		return s
+	}
+
+	mvLess := func(m1, m2 *internal.ModuleVersionState) bool {
+		n1 := sortNum(m1)
+		n2 := sortNum(m2)
+		if n1 != n2 {
+			return n1 < n2
+		}
+		return bytes.Compare(md5hash(m1), md5hash(m2)) < 0
+	}
+
 	checkNextToRequeue := func(wantData []*testData, limit int) {
 		t.Helper()
 		got, err := testDB.GetNextModulesToFetch(ctx, limit)
@@ -97,6 +127,7 @@ func TestGetNextModulesToFetchAndUpdateModuleVersionStatesForReprocessing(t *tes
 			}
 			want = append(want, m)
 		}
+		sort.Slice(want, func(i, j int) bool { return mvLess(want[i], want[j]) })
 		ignore := cmpopts.IgnoreFields(
 			internal.ModuleVersionState{},
 			"AppVersion",
@@ -112,14 +143,6 @@ func TestGetNextModulesToFetchAndUpdateModuleVersionStatesForReprocessing(t *tes
 			t.Fatalf("mismatch (-want, +got):\n%s", diff)
 		}
 	}
-	updateStates := func(wantData []*testData) {
-		for _, m := range wantData {
-			if err := upsertModuleVersionState(ctx, testDB.db, m.modulePath, m.version, "2020-04-29t14", &m.numPackages, now, m.status,
-				m.modulePath, derrors.FromStatus(m.status, "test string")); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
 
 	// All of the modules should have status = 0, so they should all be
 	// returned. At this point, we don't know the number of packages in each
@@ -130,12 +153,30 @@ func TestGetNextModulesToFetchAndUpdateModuleVersionStatesForReprocessing(t *tes
 		w.numPackages = 0
 	}
 	checkNextToRequeue(want, len(mods))
-	// Mark all modules for reprocessing.
+
 	for _, m := range mods {
-		if err := upsertModuleVersionState(ctx, testDB.db, m.modulePath, m.version, "2020-04-29t14", &m.numPackages, now, m.status, m.modulePath, derrors.FromStatus(m.status, "test string")); err != nil {
+		mvs := &ModuleVersionStateForUpsert{
+			ModulePath: m.modulePath,
+			Version:    m.version,
+			AppVersion: "2020-04-29t14",
+			Timestamp:  now,
+			Status:     m.status,
+			GoModPath:  m.modulePath,
+			FetchErr:   derrors.FromStatus(m.status, "test string"),
+		}
+		if err := upsertModuleVersionState(ctx, testDB.db, &m.numPackages, mvs); err != nil {
 			t.Fatal(err)
 		}
 	}
+
+	// Mark the latest version of all modules for reprocessing.
+	if err := testDB.UpdateModuleVersionStatesForReprocessingLatestOnly(ctx, "2020-04-30t14"); err != nil {
+		t.Fatal(err)
+	}
+	want = generateMods([]string{latest}, sizes, []int{200, 290})
+	checkNextToRequeue(want, len(mods))
+
+	// Mark all modules for reprocessing.
 	if err := testDB.UpdateModuleVersionStatesForReprocessing(ctx, "2020-04-30t14"); err != nil {
 		t.Fatal(err)
 	}
@@ -143,49 +184,26 @@ func TestGetNextModulesToFetchAndUpdateModuleVersionStatesForReprocessing(t *tes
 	// that for some modules, but we need to do it for all of them so that they all are candidates
 	// for GetNextModulesToFetch.
 	if _, err := testDB.db.Exec(ctx, `
-		UPDATE module_version_states
-		SET next_processed_after = CURRENT_TIMESTAMP
-	`); err != nil {
+			UPDATE module_version_states
+			SET next_processed_after = CURRENT_TIMESTAMP
+		`); err != nil {
 		t.Fatal(err)
 	}
 
-	// The first modules to requeue should be the latest version of not-large modules with errors
-	// ReprocessStatusOK ReprocessHasIncompletePackages, ReprocessAlternative, and ReprocessBadModule.
-	statuses = []int{200, 290, 480, 490, 491}
-	want = generateMods([]string{latest}, []int{small}, statuses)
-
-	// The next modules to requeue should be the small non-latest versions.
-	want = append(want, generateMods([]string{notLatest}, []int{small}, statuses)...)
-	// Next, latest large modules.
-	want = append(want, generateMods([]string{latest}, []int{big}, statuses)...)
-	// Lastly, not-latest large modules.
-	want = append(want, generateMods([]string{notLatest}, []int{big}, statuses)...)
-
-	want = append(want, generateMods([]string{latest, notLatest}, []int{small, big}, []int{500})...)
+	want = generateMods(versions, sizes, []int{200, 290, 480, 500})
 	checkNextToRequeue(want, len(mods))
-
-	// Take modules in groups by passing a limit.
-	const limit = 6
-	for i := 0; i < len(mods); i += limit {
-		end := i + limit
-		if end > len(want) {
-			end = len(want)
-		}
-		w := want[i:end]
-		checkNextToRequeue(w, limit)
-		updateStates(w)
-	}
-
-	// At this point, everything should have been queued except modules with
-	// status=400 and >= 500, and the latter have a next_processed_after time
-	// that is in the future.
-	checkNextToRequeue(nil, 5)
 }
 
+func md5hash(mv *internal.ModuleVersionState) []byte {
+	s := md5.Sum([]byte(mv.ModulePath + mv.Version))
+	return s[:]
+}
 func TestGetNextModulesToFetchOnlyPicksUpStatus0AndStatusGreaterThan500(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	defer ResetTestDB(testDB, t)
 
 	statuses := []int{
 		http.StatusOK,
@@ -205,8 +223,9 @@ func TestGetNextModulesToFetchOnlyPicksUpStatus0AndStatusGreaterThan500(t *testi
 				app_version,
 				index_timestamp,
 				status,
-				go_mod_path)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+				go_mod_path,
+				incompatible)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 			strconv.Itoa(status),
 			"v1.0.0",
 			version.ForSorting("v1.0.0"),
@@ -214,6 +233,7 @@ func TestGetNextModulesToFetchOnlyPicksUpStatus0AndStatusGreaterThan500(t *testi
 			time.Now(),
 			status,
 			strconv.Itoa(status),
+			false,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -234,61 +254,6 @@ func TestGetNextModulesToFetchOnlyPicksUpStatus0AndStatusGreaterThan500(t *testi
 			Status:     status,
 		}
 		want = append(want, m)
-	}
-	compareModules(t, got, want)
-}
-
-func TestGetNextModulesToFetchLargeModulesLimit(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-	defer ResetTestDB(testDB, t)
-
-	var (
-		modulePaths []string
-		status      = http.StatusInternalServerError
-		v           = "v1.0.0"
-		num500Mods  = 10
-		numPackages = largeModulePackageThreshold + 1
-	)
-	for i := 0; i < num500Mods; i++ {
-		mp := strconv.Itoa(status) + strconv.Itoa(i)
-		modulePaths = append(modulePaths, mp)
-		if _, err := testDB.db.Exec(ctx, `
-			INSERT INTO module_version_states AS mvs (
-				module_path,
-				version,
-				sort_version,
-				app_version,
-				index_timestamp,
-				status,
-				num_packages)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			mp,
-			v,
-			version.ForSorting(v),
-			"app-version",
-			time.Now(),
-			status,
-			numPackages,
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	largeModulesLimit = num500Mods / 2
-	got, err := testDB.GetNextModulesToFetch(ctx, num500Mods)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sort.Strings(modulePaths)
-	var want []*internal.ModuleVersionState
-	for _, mp := range modulePaths[:largeModulesLimit] {
-		want = append(want, &internal.ModuleVersionState{
-			ModulePath:  mp,
-			Version:     v,
-			Status:      status,
-			NumPackages: &numPackages,
-		})
 	}
 	compareModules(t, got, want)
 }

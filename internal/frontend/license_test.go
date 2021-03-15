@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/safehtml"
+	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/postgres"
 	"golang.org/x/pkgsite/internal/stdlib"
@@ -66,28 +67,22 @@ func TestFetchLicensesDetails(t *testing.T) {
 
 	testModule.Licenses = []*licenses.License{bsdLicense, mitLicense}
 	crlfModule.Licenses = []*licenses.License{mitLicenseCRLF}
-	sort.Slice(testModule.Directories, func(i, j int) bool {
-		return testModule.Directories[i].Path < testModule.Directories[j].Path
+	sort.Slice(testModule.Units, func(i, j int) bool {
+		return testModule.Units[i].Path < testModule.Units[j].Path
 	})
 
 	// github.com/valid/module_name
-	testModule.Directories[0].Licenses = []*licenses.Metadata{mit}
+	testModule.Units[0].Licenses = []*licenses.Metadata{mit}
 	// github.com/valid/module_name/A
-	testModule.Directories[1].Licenses = []*licenses.Metadata{mit}
+	testModule.Units[1].Licenses = []*licenses.Metadata{mit}
 	// github.com/valid/module_name/A/B
-	testModule.Directories[2].Licenses = []*licenses.Metadata{mit, bsd}
+	testModule.Units[2].Licenses = []*licenses.Metadata{mit, bsd}
 
 	defer postgres.ResetTestDB(testDB, t)
 	ctx := context.Background()
-	if err := testDB.InsertModule(ctx, testModule); err != nil {
-		t.Fatal(err)
-	}
-	if err := testDB.InsertModule(ctx, stdlibModule); err != nil {
-		t.Fatal(err)
-	}
-	if err := testDB.InsertModule(ctx, crlfModule); err != nil {
-		t.Fatal(err)
-	}
+	postgres.MustInsertModule(ctx, t, testDB, testModule)
+	postgres.MustInsertModule(ctx, t, testDB, stdlibModule)
+	postgres.MustInsertModule(ctx, t, testDB, crlfModule)
 	for _, test := range []struct {
 		err                                 error
 		name, fullPath, modulePath, version string
@@ -146,7 +141,13 @@ func TestFetchLicensesDetails(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			wantDetails := &LicensesDetails{Licenses: transformLicenses(
 				test.modulePath, test.version, test.want)}
-			got, err := fetchLicensesDetails(ctx, testDB, test.fullPath, test.modulePath, test.version)
+			got, err := fetchLicensesDetails(ctx, testDB, &internal.UnitMeta{
+				Path: test.fullPath,
+				ModuleInfo: internal.ModuleInfo{
+					ModulePath: test.modulePath,
+					Version:    test.version,
+				},
+			})
 			if err != nil {
 				t.Fatal(err)
 			}

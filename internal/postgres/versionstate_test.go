@@ -6,7 +6,9 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -17,7 +19,9 @@ import (
 )
 
 func TestModuleVersionState(t *testing.T) {
-	defer ResetTestDB(testDB, t)
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
@@ -81,7 +85,16 @@ func TestModuleVersionState(t *testing.T) {
 			Status:      500,
 		}
 	)
-	if err := testDB.UpsertModuleVersionState(ctx, fooVersion.Path, fooVersion.Version, "", fooVersion.Timestamp, statusCode, goModPath, fetchErr, []*internal.PackageVersionState{pkgVersionState}); err != nil {
+	mvs := &ModuleVersionStateForUpsert{
+		ModulePath:           fooVersion.Path,
+		Version:              fooVersion.Version,
+		Timestamp:            fooVersion.Timestamp,
+		Status:               statusCode,
+		GoModPath:            goModPath,
+		FetchErr:             fetchErr,
+		PackageVersionStates: []*internal.PackageVersionState{pkgVersionState},
+	}
+	if err := testDB.UpsertModuleVersionState(ctx, mvs); err != nil {
 		t.Fatal(err)
 	}
 	errString := fetchErr.Error()
@@ -135,4 +148,129 @@ func TestModuleVersionState(t *testing.T) {
 	if diff := cmp.Diff(wantStats, stats); diff != "" {
 		t.Errorf("testDB.GetVersionStats(ctx) mismatch (-want +got):\n%s", diff)
 	}
+
+	if _, err := testDB.GetRecentFailedVersions(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpsertModuleVersionStates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	m := sample.DefaultModule()
+	appVersion := time.Now().String()
+
+	for _, test := range []struct {
+		name                  string
+		shouldInsertModule    bool
+		insertModuleBeforeMVS bool
+		status                int
+		wantUpsertMVSError    bool
+		wantMVSStatus         int
+		wantModulesStatus     int
+	}{
+		{
+			name:                  "upsert mvs without inserting module, status 200",
+			shouldInsertModule:    false,
+			insertModuleBeforeMVS: false,
+			status:                http.StatusOK,
+			wantUpsertMVSError:    false,
+			wantMVSStatus:         http.StatusOK,
+			wantModulesStatus:     0,
+		},
+		{
+			name:                  "upsert mvs without inserting module, status 400",
+			shouldInsertModule:    false,
+			insertModuleBeforeMVS: false,
+			status:                http.StatusBadRequest,
+			wantUpsertMVSError:    false,
+			wantMVSStatus:         http.StatusBadRequest,
+			wantModulesStatus:     0,
+		},
+		{
+			name:                  "upsert mvs after inserting module, status 200",
+			shouldInsertModule:    true,
+			insertModuleBeforeMVS: true,
+			status:                http.StatusOK,
+			wantUpsertMVSError:    false,
+			wantMVSStatus:         http.StatusOK,
+			wantModulesStatus:     http.StatusOK,
+		},
+		{
+			name:                  "upsert mvs after inserting module, status 400",
+			shouldInsertModule:    true,
+			insertModuleBeforeMVS: true,
+			status:                http.StatusBadRequest,
+			wantUpsertMVSError:    false,
+			wantMVSStatus:         http.StatusBadRequest,
+			wantModulesStatus:     http.StatusBadRequest,
+		},
+		{
+			name:                  "upsert mvs before inserting module, status 200",
+			shouldInsertModule:    true,
+			insertModuleBeforeMVS: false,
+			status:                http.StatusOK,
+			wantUpsertMVSError:    false,
+			wantMVSStatus:         http.StatusOK,
+			wantModulesStatus:     0,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testDB, release := acquire(t)
+			defer release()
+
+			if test.insertModuleBeforeMVS && test.shouldInsertModule {
+				MustInsertModule(ctx, t, testDB, m)
+			}
+
+			mvsu := &ModuleVersionStateForUpsert{
+				ModulePath: m.ModulePath,
+				Version:    m.Version,
+				AppVersion: appVersion,
+				Timestamp:  time.Now(),
+				Status:     test.status,
+				HasGoMod:   true,
+			}
+			err := testDB.UpsertModuleVersionState(ctx, mvsu)
+			if test.wantUpsertMVSError != (err != nil) {
+				t.Fatalf("db.UpsertModuleVersionState(): %v, want error: %t", err, test.wantUpsertMVSError)
+			}
+			mvs, err := testDB.GetModuleVersionState(ctx, m.ModulePath, m.Version)
+			if err != nil {
+				t.Fatalf("db.GetModuleVersionState(): %v", err)
+			}
+			if mvs.Status != test.wantMVSStatus {
+				t.Errorf("module_version_states.status = %d, want %d", mvs.Status, test.wantMVSStatus)
+			}
+			if !mvs.HasGoMod {
+				t.Errorf("HasGoMod: got %t, want true", mvs.HasGoMod)
+			}
+
+			if !test.insertModuleBeforeMVS && test.shouldInsertModule {
+				MustInsertModule(ctx, t, testDB, m)
+			}
+
+			if !test.shouldInsertModule {
+				return
+			}
+
+			var gotStatus sql.NullInt64
+			err = testDB.db.QueryRow(ctx, `
+                    SELECT status
+                    FROM modules
+                    WHERE module_path = $1 AND version = $2;`,
+				m.ModulePath, m.Version).Scan(&gotStatus)
+			if err != nil {
+				t.Fatalf("db.QueryRow(): %v", err)
+			}
+			if test.insertModuleBeforeMVS != gotStatus.Valid {
+				t.Fatalf("modules.Status = %+v, want status: %t", gotStatus, test.insertModuleBeforeMVS)
+			}
+			if int(gotStatus.Int64) != test.wantModulesStatus {
+				t.Errorf("modules.status = %d, want %d", gotStatus.Int64, test.wantModulesStatus)
+			}
+		})
+	}
+
 }

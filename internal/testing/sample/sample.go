@@ -7,7 +7,10 @@
 package sample
 
 import (
+	"context"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"math"
 	"net/http"
 	"path"
@@ -17,44 +20,110 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/licensecheck"
-	"github.com/google/safehtml/template"
+	oldlicensecheck "github.com/google/licensecheck/old"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/godoc"
 	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/source"
 	"golang.org/x/pkgsite/internal/stdlib"
-	"golang.org/x/pkgsite/internal/version"
 )
 
 // These sample values can be used to construct test cases.
 var (
-	ModulePath      = "github.com/valid/module_name"
-	RepositoryURL   = "https://github.com/valid/module_name"
-	VersionString   = "v1.0.0"
-	CommitTime      = NowTruncated()
-	LicenseMetadata = []*licenses.Metadata{
-		{
-			Types:    []string{"MIT"},
-			FilePath: "LICENSE",
-			Coverage: licensecheck.Coverage{
-				Percent: 100,
-				Match:   []licensecheck.Match{{Name: "MIT", Type: licensecheck.MIT, Percent: 100}},
+	ModulePath                = "github.com/valid/module_name"
+	RepositoryURL             = "https://github.com/valid/module_name"
+	VersionString             = "v1.0.0"
+	CommitTime                = NowTruncated()
+	LicenseType               = "MIT"
+	LicenseFilePath           = "LICENSE"
+	NonRedistributableLicense = &licenses.License{
+		Metadata: &licenses.Metadata{
+			FilePath: "NONREDIST_LICENSE",
+			Types:    []string{"UNKNOWN"},
+		},
+		Contents: []byte(`unknown`),
+	}
+	PackageName    = "foo"
+	Suffix         = "foo"
+	PackagePath    = path.Join(ModulePath, Suffix)
+	V1Path         = PackagePath
+	ReadmeFilePath = "README.md"
+	ReadmeContents = "readme"
+	GOOS           = internal.All
+	GOARCH         = internal.All
+	Doc            = Documentation(GOOS, GOARCH, DocContents)
+	DocContents    = `
+		// Package p is a package.
+		//
+		//
+		// Links
+		//
+		// - pkg.go.dev, https://pkg.go.dev
+ 		package p
+		var V int
+	`
+	Constant = &internal.Symbol{
+		Name:     "Constant",
+		Synopsis: "const Constant",
+		Section:  internal.SymbolSectionConstants,
+		Kind:     internal.SymbolKindConstant,
+		GOOS:     internal.All,
+		GOARCH:   internal.All,
+	}
+	Variable = &internal.Symbol{
+		Name:     "Variable",
+		Synopsis: "var Variable",
+		Section:  internal.SymbolSectionVariables,
+		Kind:     internal.SymbolKindVariable,
+		GOOS:     internal.All,
+		GOARCH:   internal.All,
+	}
+	Function = &internal.Symbol{
+		Name:     "Function",
+		Synopsis: "func Function() error",
+		Section:  internal.SymbolSectionFunctions,
+		Kind:     internal.SymbolKindFunction,
+		GOOS:     internal.All,
+		GOARCH:   internal.All,
+	}
+	FunctionNew = &internal.Symbol{
+		Name:       "New",
+		Synopsis:   "func New() *Type",
+		Section:    internal.SymbolSectionTypes,
+		Kind:       internal.SymbolKindFunction,
+		ParentName: "Type",
+		GOOS:       internal.All,
+		GOARCH:     internal.All,
+	}
+	Type = &internal.Symbol{
+		Name:     "Type",
+		Synopsis: "type Type struct",
+		Section:  internal.SymbolSectionTypes,
+		Kind:     internal.SymbolKindType,
+		GOOS:     internal.All,
+		GOARCH:   internal.All,
+		Children: []*internal.Symbol{
+			FunctionNew,
+			{
+				Name:       "Type.Field",
+				Synopsis:   "field",
+				Section:    internal.SymbolSectionTypes,
+				Kind:       internal.SymbolKindField,
+				ParentName: "Type",
+				GOOS:       internal.All,
+				GOARCH:     internal.All,
+			},
+			{
+				Name:       "Type.Method",
+				Synopsis:   "method",
+				Section:    internal.SymbolSectionTypes,
+				Kind:       internal.SymbolKindMethod,
+				ParentName: "Type",
+				GOOS:       internal.All,
+				GOARCH:     internal.All,
 			},
 		},
 	}
-	Licenses = []*licenses.License{
-		{Metadata: LicenseMetadata[0], Contents: []byte(`Lorem Ipsum`)},
-	}
-	DocumentationHTML = template.MustParseAndExecuteToHTML("This is the documentation HTML")
-	PackageName       = "foo"
-	Suffix            = "foo"
-	PackagePath       = path.Join(ModulePath, Suffix)
-	V1Path            = PackagePath
-	Imports           = []string{"path/to/bar", "fmt"}
-	Synopsis          = "This is a package synopsis"
-	ReadmeFilePath    = "README.md"
-	ReadmeContents    = "readme"
-	GOOS              = "linux"
-	GOARCH            = "amd64"
 )
 
 // LicenseCmpOpts are options to use when comparing licenses with the cmp package.
@@ -78,95 +147,121 @@ func coveragePercentEqual(a, b float64) bool {
 // Microsecond precision:
 //   https://www.postgresql.org/docs/9.1/datatype-datetime.html
 func NowTruncated() time.Time {
-	return time.Now().Truncate(time.Microsecond)
+	return time.Now().In(time.UTC).Truncate(time.Microsecond)
 }
 
-// LegacyPackage constructs a package with the given module path and suffix.
+func DefaultModule() *internal.Module {
+	fp := constructFullPath(ModulePath, Suffix)
+	return AddPackage(Module(ModulePath, VersionString), UnitForPackage(fp, ModulePath, VersionString, path.Base(fp), true))
+}
+
+// Module creates a Module with the given path and version.
+// The list of suffixes is used to create Units within the module.
+func Module(modulePath, version string, suffixes ...string) *internal.Module {
+	mi := ModuleInfo(modulePath, version)
+	m := &internal.Module{
+		ModuleInfo: *mi,
+		Licenses:   Licenses(),
+	}
+	m.Units = []*internal.Unit{UnitForModuleRoot(mi)}
+	for _, s := range suffixes {
+		fp := constructFullPath(modulePath, s)
+		lp := UnitForPackage(fp, modulePath, VersionString, path.Base(fp), m.IsRedistributable)
+		if s != "" {
+			AddPackage(m, lp)
+		} else {
+			u := UnitForPackage(lp.Path, modulePath, version, lp.Name, lp.IsRedistributable)
+			m.Units[0].Documentation = u.Documentation
+			m.Units[0].Name = u.Name
+		}
+	}
+	if modulePath == stdlib.ModulePath {
+		m.Units[0].Readme = nil
+	}
+	// Fill in license contents.
+	for _, u := range m.Units {
+		u.LicenseContents = m.Licenses
+	}
+	return m
+}
+
+func UnitForModuleRoot(m *internal.ModuleInfo) *internal.Unit {
+	u := &internal.Unit{
+		UnitMeta:        *UnitMeta(m.ModulePath, m.ModulePath, m.Version, "", m.IsRedistributable),
+		LicenseContents: Licenses(),
+	}
+	u.Readme = &internal.Readme{
+		Filepath: ReadmeFilePath,
+		Contents: ReadmeContents,
+	}
+	return u
+}
+
+// UnitForPackage constructs a unit with the given module path and suffix.
 //
 // If modulePath is the standard library, the package path is the
 // suffix, which must not be empty. Otherwise, the package path
 // is the concatenation of modulePath and suffix.
 //
 // The package name is last component of the package path.
-func LegacyPackage(modulePath, suffix string) *internal.LegacyPackage {
-	pkgPath := suffix
-	if modulePath != stdlib.ModulePath {
-		pkgPath = path.Join(modulePath, suffix)
-	}
-	return &internal.LegacyPackage{
-		Name:              path.Base(pkgPath),
-		Path:              pkgPath,
-		V1Path:            internal.V1Path(modulePath, suffix),
-		Synopsis:          Synopsis,
-		IsRedistributable: true,
-		Licenses:          LicenseMetadata,
-		DocumentationHTML: DocumentationHTML,
-		Imports:           Imports,
-		GOOS:              GOOS,
-		GOARCH:            GOARCH,
+func UnitForPackage(path, modulePath, version, name string, isRedistributable bool) *internal.Unit {
+	// Copy Doc because some tests modify it.
+	doc := *Doc
+	imps := Imports()
+	return &internal.Unit{
+		UnitMeta:        *UnitMeta(path, modulePath, version, name, isRedistributable),
+		Documentation:   []*internal.Documentation{&doc},
+		LicenseContents: Licenses(),
+		Imports:         imps,
+		NumImports:      len(imps),
 	}
 }
 
-func PackageMeta(modulePath, suffix string) *internal.PackageMeta {
-	pkgPath := suffix
-	if modulePath != stdlib.ModulePath {
-		pkgPath = path.Join(modulePath, suffix)
+func AddPackage(m *internal.Module, pkg *internal.Unit) *internal.Module {
+	if m.ModulePath != stdlib.ModulePath && !strings.HasPrefix(pkg.Path, m.ModulePath) {
+		panic(fmt.Sprintf("package path %q not a prefix of module path %q",
+			pkg.Path, m.ModulePath))
 	}
+	AddUnit(m, UnitForPackage(pkg.Path, m.ModulePath, m.Version, pkg.Name, pkg.IsRedistributable))
+	minLen := len(m.ModulePath)
+	if m.ModulePath == stdlib.ModulePath {
+		minLen = 1
+	}
+	for pth := pkg.Path; len(pth) > minLen; pth = path.Dir(pth) {
+		found := false
+		for _, u := range m.Units {
+			if u.Path == pth {
+				found = true
+				break
+			}
+		}
+		if !found {
+			AddUnit(m, UnitEmpty(pth, m.ModulePath, m.Version))
+		}
+	}
+	return m
+}
+
+func PackageMeta(fullPath string) *internal.PackageMeta {
 	return &internal.PackageMeta{
-		DirectoryMeta: internal.DirectoryMeta{
-			Path:              pkgPath,
-			V1Path:            internal.V1Path(modulePath, suffix),
-			IsRedistributable: true,
-			Licenses:          LicenseMetadata,
-		},
-		Name:     path.Base(pkgPath),
-		Synopsis: Synopsis,
-	}
-}
-
-func LegacyModuleInfo(modulePath, versionString string) *internal.LegacyModuleInfo {
-	vtype, err := version.ParseType(versionString)
-	if err != nil {
-		panic(err)
-	}
-	mi := ModuleInfoReleaseType(modulePath, versionString)
-	mi.VersionType = vtype
-	return &internal.LegacyModuleInfo{
-		ModuleInfo:           *mi,
-		LegacyReadmeFilePath: ReadmeFilePath,
-		LegacyReadmeContents: ReadmeContents,
+		Path:              fullPath,
+		IsRedistributable: true,
+		Name:              path.Base(fullPath),
+		Synopsis:          Doc.Synopsis,
+		Licenses:          LicenseMetadata(),
 	}
 }
 
 func ModuleInfo(modulePath, versionString string) *internal.ModuleInfo {
-	vtype, err := version.ParseType(versionString)
-	if err != nil {
-		panic(err)
-	}
-	mi := ModuleInfoReleaseType(modulePath, versionString)
-	mi.VersionType = vtype
-	return mi
-}
-
-// We shouldn't need this, but some code (notably frontend/directory_test.go) creates
-// ModuleInfos with "latest" for version, which should not be valid.
-func ModuleInfoReleaseType(modulePath, versionString string) *internal.ModuleInfo {
 	return &internal.ModuleInfo{
-		ModulePath:  modulePath,
-		Version:     versionString,
-		CommitTime:  CommitTime,
-		VersionType: version.TypeRelease,
+		ModulePath: modulePath,
+		Version:    versionString,
+		CommitTime: CommitTime,
 		// Assume the module path is a GitHub-like repo name.
 		SourceInfo:        source.NewGitHubInfo("https://"+modulePath, "", versionString),
 		IsRedistributable: true,
 		HasGoMod:          true,
 	}
-}
-
-func DefaultModule() *internal.Module {
-	return AddPackage(
-		Module(ModulePath, VersionString),
-		LegacyPackage(ModulePath, Suffix))
 }
 
 func DefaultVersionMap() *internal.VersionMap {
@@ -180,117 +275,120 @@ func DefaultVersionMap() *internal.VersionMap {
 	}
 }
 
-// Module creates a Module with the given path and version.
-// The list of suffixes is used to create LegacyPackages within the module.
-func Module(modulePath, version string, suffixes ...string) *internal.Module {
-	mi := LegacyModuleInfo(modulePath, version)
-	m := &internal.Module{
-		LegacyModuleInfo: *mi,
-		LegacyPackages:   nil,
-		Licenses:         Licenses,
-	}
-	emptySuffix := false
-	for _, s := range suffixes {
-		if s == "" {
-			emptySuffix = true
-			break
-		}
-	}
-	if emptySuffix {
-		AddPackage(m, LegacyPackage(modulePath, ""))
-	} else {
-		m.Directories = []*internal.Directory{DirectoryForModuleRoot(mi, LicenseMetadata)}
-	}
-	for _, s := range suffixes {
-		if s != "" {
-			AddPackage(m, LegacyPackage(modulePath, s))
-		}
-	}
-	return m
-}
-
-func AddPackage(m *internal.Module, p *internal.LegacyPackage) *internal.Module {
-	if m.ModulePath != stdlib.ModulePath && !strings.HasPrefix(p.Path, m.ModulePath) {
-		panic(fmt.Sprintf("package path %q not a prefix of module path %q",
-			p.Path, m.ModulePath))
-	}
-	m.LegacyPackages = append(m.LegacyPackages, p)
-	AddDirectory(m, DirectoryForPackage(p))
-	minLen := len(m.ModulePath)
-	if m.ModulePath == stdlib.ModulePath {
-		minLen = 1
-	}
-	for pth := p.Path; len(pth) > minLen; pth = path.Dir(pth) {
-		found := false
-		for _, d := range m.Directories {
-			if d.Path == pth {
-				found = true
-				break
-			}
-		}
-		if !found {
-			AddDirectory(m, DirectoryEmpty(pth))
-		}
-	}
-	return m
-}
-
-func AddDirectory(m *internal.Module, d *internal.Directory) {
-	for _, e := range m.Directories {
-		if e.Path == d.Path {
+func AddUnit(m *internal.Module, u *internal.Unit) {
+	for _, e := range m.Units {
+		if e.Path == u.Path {
 			panic(fmt.Sprintf("module already has path %q", e.Path))
 		}
 	}
-	m.Directories = append(m.Directories, d)
+	m.Units = append(m.Units, u)
 }
 
-func DirectoryEmpty(path string) *internal.Directory {
-	return &internal.Directory{
-		DirectoryMeta: internal.DirectoryMeta{
-			Path:              path,
-			IsRedistributable: true,
-			Licenses:          LicenseMetadata,
-			V1Path:            path,
-		},
+func AddLicense(m *internal.Module, lic *licenses.License) {
+	m.Licenses = append(m.Licenses, lic)
+	dir := path.Dir(lic.FilePath)
+	if dir == "." {
+		dir = ""
 	}
-}
-
-func DirectoryForModuleRoot(m *internal.LegacyModuleInfo, licenses []*licenses.Metadata) *internal.Directory {
-	d := &internal.Directory{
-		DirectoryMeta: internal.DirectoryMeta{
-			Path:              m.ModulePath,
-			IsRedistributable: m.IsRedistributable,
-			Licenses:          licenses,
-			V1Path:            internal.SeriesPathForModule(m.ModulePath),
-		},
-	}
-	if m.LegacyReadmeFilePath != "" {
-		d.Readme = &internal.Readme{
-			Filepath: m.LegacyReadmeFilePath,
-			Contents: m.LegacyReadmeContents,
+	for _, u := range m.Units {
+		if strings.TrimPrefix(u.Path, m.ModulePath+"/") == dir {
+			u.Licenses = append(u.Licenses, lic.Metadata)
+			u.LicenseContents = append(u.LicenseContents, lic)
 		}
 	}
-	return d
 }
 
-func DirectoryForPackage(pkg *internal.LegacyPackage) *internal.Directory {
-	return &internal.Directory{
-		DirectoryMeta: internal.DirectoryMeta{
-			Path:              pkg.Path,
-			IsRedistributable: pkg.IsRedistributable,
-			Licenses:          pkg.Licenses,
-			V1Path:            pkg.V1Path,
+// ReplaceLicense replaces all licenses having the same file path as lic with lic.
+func ReplaceLicense(m *internal.Module, lic *licenses.License) {
+	replaceLicense(lic, m.Licenses)
+	for _, u := range m.Units {
+		for i, lm := range u.Licenses {
+			if lm.FilePath == lic.FilePath {
+				u.Licenses[i] = lic.Metadata
+			}
+		}
+		replaceLicense(lic, u.LicenseContents)
+	}
+}
+
+func replaceLicense(lic *licenses.License, lics []*licenses.License) {
+	for i, l := range lics {
+		if l.FilePath == lic.FilePath {
+			lics[i] = lic
+		}
+	}
+}
+
+func UnitEmpty(path, modulePath, version string) *internal.Unit {
+	return &internal.Unit{
+		UnitMeta: *UnitMeta(path, modulePath, version, "", true),
+	}
+}
+
+func UnitMeta(path, modulePath, version, name string, isRedistributable bool) *internal.UnitMeta {
+	return &internal.UnitMeta{
+		Path:              path,
+		Name:              name,
+		IsRedistributable: isRedistributable,
+		Licenses:          LicenseMetadata(),
+		ModuleInfo: internal.ModuleInfo{
+			ModulePath:        modulePath,
+			Version:           version,
+			CommitTime:        NowTruncated(),
+			IsRedistributable: isRedistributable,
+			SourceInfo:        source.NewGitHubInfo("https://"+modulePath, "", version),
 		},
-		Package: &internal.Package{
-			Name:    pkg.Name,
-			Path:    pkg.Path,
-			Imports: pkg.Imports,
-			Documentation: &internal.Documentation{
-				Synopsis: pkg.Synopsis,
-				HTML:     pkg.DocumentationHTML,
-				GOOS:     pkg.GOOS,
-				GOARCH:   pkg.GOARCH,
+	}
+}
+
+func constructFullPath(modulePath, suffix string) string {
+	if modulePath != stdlib.ModulePath {
+		return path.Join(modulePath, suffix)
+	}
+	return suffix
+}
+
+// Documentation returns a Documentation value for the given Go source.
+// It panics if there are errors parsing or encoding the source.
+func Documentation(goos, goarch, fileContents string) *internal.Documentation {
+	fset := token.NewFileSet()
+	pf, err := parser.ParseFile(fset, "sample.go", fileContents, parser.ParseComments)
+	if err != nil {
+		panic(err)
+	}
+	docPkg := godoc.NewPackage(fset, nil)
+	docPkg.AddFile(pf, true)
+	src, err := docPkg.Encode(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	return &internal.Documentation{
+		GOOS:     goos,
+		GOARCH:   goarch,
+		Synopsis: fmt.Sprintf("This is a package synopsis for GOOS=%s, GOARCH=%s", goos, goarch),
+		Source:   src,
+	}
+}
+
+func LicenseMetadata() []*licenses.Metadata {
+	return []*licenses.Metadata{
+		{
+			Types:    []string{LicenseType},
+			FilePath: LicenseFilePath,
+			OldCoverage: oldlicensecheck.Coverage{
+				Percent: 100,
+				Match:   []oldlicensecheck.Match{{Name: LicenseType, Type: oldlicensecheck.MIT, Percent: 100}},
 			},
 		},
 	}
+}
+
+func Licenses() []*licenses.License {
+	return []*licenses.License{
+		{Metadata: LicenseMetadata()[0], Contents: []byte(`Lorem Ipsum`)},
+	}
+}
+
+func Imports() []string {
+	return []string{"fmt", "path/to/bar"}
 }

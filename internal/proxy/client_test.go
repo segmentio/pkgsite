@@ -7,20 +7,23 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal/testing/sample"
 	"golang.org/x/pkgsite/internal/testing/testhelper"
 )
 
 const testTimeout = 5 * time.Second
 
-var sampleModule = &Module{
-	ModulePath: "github.com/my/module",
-	Version:    "v1.0.0",
+var testModule = &Module{
+	ModulePath: sample.ModulePath,
+	Version:    sample.VersionString,
 	Files: map[string]string{
 		"go.mod":      "module github.com/my/module\n\ngo 1.12",
 		"LICENSE":     testhelper.BSD0License,
@@ -52,34 +55,40 @@ var sampleModule = &Module{
 	},
 }
 
+const uncachedModulePath = "example.com/uncached"
+
+var uncachedModule = &Module{
+	ModulePath: uncachedModulePath,
+	Version:    sample.VersionString,
+	NotCached:  true,
+}
+
 func TestGetLatestInfo(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	modulePath := "foo.com/bar"
 	testModules := []*Module{
 		{
-			ModulePath: "foo.com/bar",
+			ModulePath: sample.ModulePath,
 			Version:    "v1.1.0",
 			Files:      map[string]string{"bar.go": "package bar\nconst Version = 1.1"},
 		},
 		{
-			ModulePath: "foo.com/bar",
+			ModulePath: sample.ModulePath,
 			Version:    "v1.2.0",
 			Files:      map[string]string{"bar.go": "package bar\nconst Version = 1.2"},
 		},
 	}
-
-	client, teardownProxy := SetupTestProxy(t, testModules)
+	client, teardownProxy := SetupTestClient(t, testModules)
 	defer teardownProxy()
 
-	info, err := client.GetInfo(ctx, modulePath, internal.LatestVersion)
+	info, err := client.Info(ctx, sample.ModulePath, internal.LatestVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if got, want := info.Version, "v1.2.0"; got != want {
-		t.Errorf("GetInfo(ctx, %q, %q): Version = %q, want %q", modulePath, internal.LatestVersion, got, want)
+		t.Errorf("Info(ctx, %q, %q): Version = %q, want %q", sample.ModulePath, internal.LatestVersion, got, want)
 	}
 }
 
@@ -87,87 +96,111 @@ func TestListVersions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	modulePath := "foo.com/bar"
 	testModules := []*Module{
 		{
-			ModulePath: modulePath,
+			ModulePath: sample.ModulePath,
 			Version:    "v1.1.0",
 			Files:      map[string]string{"bar.go": "package bar\nconst Version = 1.1"},
 		},
 		{
-			ModulePath: modulePath,
+			ModulePath: sample.ModulePath,
 			Version:    "v1.2.0",
 			Files:      map[string]string{"bar.go": "package bar\nconst Version = 1.2"},
 		},
 		{
-			ModulePath: modulePath + "/bar",
+			ModulePath: sample.ModulePath + "/bar",
 			Version:    "v1.3.0",
 			Files:      map[string]string{"bar.go": "package bar\nconst Version = 1.3"},
 		},
 	}
-
-	client, teardownProxy := SetupTestProxy(t, testModules)
+	client, teardownProxy := SetupTestClient(t, testModules)
 	defer teardownProxy()
 
 	want := []string{"v1.1.0", "v1.2.0"}
-	got, err := client.ListVersions(ctx, modulePath)
+	got, err := client.Versions(ctx, sample.ModulePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
-		t.Errorf("ListVersions(%q) diff:\n%s", modulePath, diff)
+		t.Errorf("Versions(%q) diff:\n%s", sample.ModulePath, diff)
 	}
 }
 
-func TestGetInfo(t *testing.T) {
+func TestInfo(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	client, teardownProxy := SetupTestProxy(t, []*Module{sampleModule})
+	client, teardownProxy := SetupTestClient(t, []*Module{testModule, uncachedModule})
 	defer teardownProxy()
 
-	path := "github.com/my/module"
-	version := "v1.0.0"
-	info, err := client.GetInfo(ctx, path, version)
+	info, err := client.Info(ctx, sample.ModulePath, sample.VersionString)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if info.Version != version {
-		t.Errorf("VersionInfo.Version for GetInfo(ctx, %q, %q) = %q, want %q", path, version, info.Version, version)
+	if info.Version != sample.VersionString {
+		t.Errorf("VersionInfo.Version for Info(ctx, %q, %q) = %q, want %q",
+			sample.ModulePath, sample.VersionString, info.Version, sample.VersionString)
 	}
-
 	expectedTime := time.Date(2019, 1, 30, 0, 0, 0, 0, time.UTC)
 	if info.Time != expectedTime {
-		t.Errorf("VersionInfo.Time for GetInfo(ctx, %q, %q) = %v, want %v", path, version, info.Time, expectedTime)
+		t.Errorf("VersionInfo.Time for Info(ctx, %q, %q) = %v, want %v", sample.ModulePath, sample.VersionString, info.Time, expectedTime)
+	}
+
+	// With fetch disabled, Info returns "NotFetched" error on uncached module.
+	noFetchClient := client.WithFetchDisabled()
+	_, err = noFetchClient.Info(ctx, uncachedModulePath, sample.VersionString)
+	if !errors.Is(err, derrors.NotFetched) {
+		t.Fatalf("got %v, want NotFetched", err)
+	}
+	// Info with fetch disabled succeeds on a cached module.
+	_, err = noFetchClient.Info(ctx, sample.ModulePath, sample.VersionString)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestGetInfoVersionDoesNotExist(t *testing.T) {
+func TestInfo_Errors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	client, teardownProxy := SetupTestProxy(t, []*Module{sampleModule})
+	proxyServer := NewServer(nil)
+	proxyServer.AddRoute(
+		fmt.Sprintf("/%s/@v/%s.info", "module.com/timeout", sample.VersionString),
+		func(w http.ResponseWriter, r *http.Request) { http.Error(w, "fetch timed out", http.StatusNotFound) })
+	client, teardownProxy, err := NewClientForServer(proxyServer)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer teardownProxy()
 
-	path := "github.com/my/module"
-	version := "v3.0.0"
-	info, _ := client.GetInfo(ctx, path, version)
-	if info != nil {
-		t.Errorf("GetInfo(ctx, %q, %q) = %v, want %v", path, version, info, nil)
+	for _, test := range []struct {
+		modulePath string
+		want       error
+	}{
+		{
+			modulePath: sample.ModulePath,
+			want:       derrors.NotFound,
+		},
+		{
+			modulePath: "module.com/timeout",
+			want:       derrors.ProxyTimedOut,
+		},
+	} {
+		if _, err := client.Info(ctx, test.modulePath, sample.VersionString); !errors.Is(err, test.want) {
+			t.Errorf("Info(ctx, %q, %q): %v, want %v", test.modulePath, sample.VersionString, err, test.want)
+		}
 	}
 }
 
-func TestGetMod(t *testing.T) {
+func TestMod(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	client, teardownProxy := SetupTestProxy(t, []*Module{sampleModule})
+	client, teardownProxy := SetupTestClient(t, []*Module{testModule})
 	defer teardownProxy()
 
-	path := "github.com/my/module"
-	version := "v1.0.0"
-	bytes, err := client.GetMod(ctx, path, version)
+	bytes, err := client.Mod(ctx, sample.ModulePath, sample.VersionString)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,65 +215,73 @@ func TestGetZip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	client, teardownProxy := SetupTestProxy(t, []*Module{sampleModule})
+	client, teardownProxy := SetupTestClient(t, []*Module{testModule})
 	defer teardownProxy()
 
-	for _, tc := range []struct {
-		path, version string
-		wantFiles     []string
-	}{
-		{
-			path:    "github.com/my/module",
-			version: "v1.0.0",
-			wantFiles: []string{
-				"github.com/my/module@v1.0.0/LICENSE",
-				"github.com/my/module@v1.0.0/README.md",
-				"github.com/my/module@v1.0.0/go.mod",
-				"github.com/my/module@v1.0.0/foo/foo.go",
-				"github.com/my/module@v1.0.0/foo/LICENSE.md",
-				"github.com/my/module@v1.0.0/bar/bar.go",
-				"github.com/my/module@v1.0.0/bar/LICENSE",
-			},
-		},
-	} {
-		t.Run(tc.path, func(t *testing.T) {
-			zipReader, err := client.GetZip(ctx, tc.path, tc.version)
-			if err != nil {
-				t.Fatal(err)
-			}
+	zipReader, err := client.Zip(ctx, sample.ModulePath, sample.VersionString)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			if len(zipReader.File) != len(tc.wantFiles) {
-				t.Errorf("GetZip(ctx, %q, %q) returned number of files: got %d, want %d",
-					tc.path, tc.version, len(zipReader.File), len(tc.wantFiles))
-			}
+	wantFiles := []string{
+		sample.ModulePath + "@" + sample.VersionString + "/LICENSE",
+		sample.ModulePath + "@" + sample.VersionString + "/README.md",
+		sample.ModulePath + "@" + sample.VersionString + "/go.mod",
+		sample.ModulePath + "@" + sample.VersionString + "/foo/foo.go",
+		sample.ModulePath + "@" + sample.VersionString + "/foo/LICENSE.md",
+		sample.ModulePath + "@" + sample.VersionString + "/bar/bar.go",
+		sample.ModulePath + "@" + sample.VersionString + "/bar/LICENSE",
+	}
+	if len(zipReader.File) != len(wantFiles) {
+		t.Errorf("Zip(ctx, %q, %q) returned number of files: got %d, want %d",
+			sample.ModulePath, sample.VersionString, len(zipReader.File), len(wantFiles))
+	}
 
-			expectedFileSet := map[string]bool{}
-			for _, ef := range tc.wantFiles {
-				expectedFileSet[ef] = true
-			}
-			for _, zipFile := range zipReader.File {
-				if !expectedFileSet[zipFile.Name] {
-					t.Errorf("GetZip(ctx, %q, %q) returned unexpected file: %q", tc.path,
-						tc.version, zipFile.Name)
-				}
-				expectedFileSet[zipFile.Name] = false
-			}
-		})
+	expectedFileSet := map[string]bool{}
+	for _, ef := range wantFiles {
+		expectedFileSet[ef] = true
+	}
+	for _, zipFile := range zipReader.File {
+		if !expectedFileSet[zipFile.Name] {
+			t.Errorf("Zip(ctx, %q, %q) returned unexpected file: %q", sample.ModulePath,
+				sample.VersionString, zipFile.Name)
+		}
+		expectedFileSet[zipFile.Name] = false
 	}
 }
 
-func TestGetZipNonExist(t *testing.T) {
+func TestZipNonExist(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	client, teardownProxy := SetupTestProxy(t, nil)
+	client, teardownProxy := SetupTestClient(t, nil)
 	defer teardownProxy()
 
-	path := "my.mod/nonexistmodule"
-	version := "v1.0.0"
-	if _, err := client.GetZip(ctx, path, version); !errors.Is(err, derrors.NotFound) {
+	if _, err := client.Zip(ctx, sample.ModulePath, sample.VersionString); !errors.Is(err, derrors.NotFound) {
 		t.Errorf("got %v, want %v", err, derrors.NotFound)
 	}
+}
+
+func TestZipSize(t *testing.T) {
+	t.Run("found", func(t *testing.T) {
+		client, teardownProxy := SetupTestClient(t, []*Module{testModule})
+		defer teardownProxy()
+		got, err := client.ZipSize(context.Background(), sample.ModulePath, sample.VersionString)
+		if err != nil {
+			t.Error(err)
+		}
+		const want = 3235
+		if got != want {
+			t.Errorf("got %d, want %d", got, want)
+		}
+	})
+	t.Run("not found", func(t *testing.T) {
+		client, teardownProxy := SetupTestClient(t, nil)
+		defer teardownProxy()
+		if _, err := client.ZipSize(context.Background(), sample.ModulePath, sample.VersionString); !errors.Is(err, derrors.NotFound) {
+			t.Errorf("got %v, want %v", err, derrors.NotFound)
+		}
+	})
 }
 
 func TestEncodedURL(t *testing.T) {

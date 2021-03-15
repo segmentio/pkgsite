@@ -25,6 +25,10 @@ var (
 	logger interface {
 		log(context.Context, logging.Severity, interface{})
 	} = stdlibLogger{}
+
+	// currentLevel holds current log level.
+	// No logs will be printed below currentLevel.
+	currentLevel = logging.Default
 )
 
 type (
@@ -34,6 +38,19 @@ type (
 	// labelsKey is the type of the context key for labels.
 	labelsKey struct{}
 )
+
+// Set the log level
+func SetLevel(v string) {
+	mu.Lock()
+	defer mu.Unlock()
+	currentLevel = toLevel(v)
+}
+
+func getLevel() logging.Severity {
+	mu.Lock()
+	defer mu.Unlock()
+	return currentLevel
+}
 
 // NewContextWithTraceID creates a new context from ctx that adds the trace ID.
 func NewContextWithTraceID(ctx context.Context, traceID string) context.Context {
@@ -85,6 +102,14 @@ func (l *stackdriverLogger) log(ctx context.Context, s logging.Severity, payload
 // stdlibLogger uses the Go standard library logger.
 type stdlibLogger struct{}
 
+func init() {
+	// Log to stdout on GKE so the log messages are severity Info, rather than Error.
+	if os.Getenv("GO_DISCOVERY_ON_GKE") != "" {
+		log.SetOutput(os.Stdout)
+
+	}
+}
+
 func (stdlibLogger) log(ctx context.Context, s logging.Severity, payload interface{}) {
 	var extras []string
 	traceID, _ := ctx.Value(traceIDKey{}).(string) // if not present, traceID is ""
@@ -126,12 +151,16 @@ func UseStackdriver(ctx context.Context, cfg *config.Config, logName string) (_ 
 	if err != nil {
 		return nil, err
 	}
-	// Configure the cloud logger using the gae_app monitored resource. It would
-	// be better to use the gae_instance monitored resource, but that's not
-	// currently supported:
-	// https://cloud.google.com/logging/docs/api/v2/resource-list#resource-types
-	parent := client.Logger(logName, logging.CommonResource(cfg.AppMonitoredResource))
-	child := client.Logger(logName+"-child", logging.CommonResource(cfg.AppMonitoredResource))
+
+	opts := []logging.LoggerOption{logging.CommonResource(cfg.MonitoredResource)}
+	if cfg.OnGKE() {
+		opts = append(opts, logging.CommonLabels(map[string]string{
+			"k8s-pod/env": cfg.DeploymentEnvironment(),
+			"k8s-pod/app": cfg.Application(),
+		}))
+	}
+	parent := client.Logger(logName, opts...)
+	child := client.Logger(logName+"-child", opts...)
 	mu.Lock()
 	defer mu.Unlock()
 	if _, ok := logger.(*stackdriverLogger); ok {
@@ -146,6 +175,11 @@ func Infof(ctx context.Context, format string, args ...interface{}) {
 	logf(ctx, logging.Info, format, args)
 }
 
+// Warningf logs a formatted string at the Warning level.
+func Warningf(ctx context.Context, format string, args ...interface{}) {
+	logf(ctx, logging.Warning, format, args)
+}
+
 // Errorf logs a formatted string at the Error level.
 func Errorf(ctx context.Context, format string, args ...interface{}) {
 	logf(ctx, logging.Error, format, args)
@@ -156,9 +190,9 @@ func Debugf(ctx context.Context, format string, args ...interface{}) {
 	logf(ctx, logging.Debug, format, args)
 }
 
-// Fatalf is equivalent to Errorf followed by exiting the program.
+// Fatalf logs formatted string at the Critical level followed by exiting the program.
 func Fatalf(ctx context.Context, format string, args ...interface{}) {
-	Errorf(ctx, format, args...)
+	logf(ctx, logging.Critical, format, args)
 	die()
 }
 
@@ -169,19 +203,25 @@ func logf(ctx context.Context, s logging.Severity, format string, args []interfa
 // Info logs arg, which can be a string or a struct, at the Info level.
 func Info(ctx context.Context, arg interface{}) { doLog(ctx, logging.Info, arg) }
 
+// Warning logs arg, which can be a string or a struct, at the Warning level.
+func Warning(ctx context.Context, arg interface{}) { doLog(ctx, logging.Warning, arg) }
+
 // Error logs arg, which can be a string or a struct, at the Error level.
 func Error(ctx context.Context, arg interface{}) { doLog(ctx, logging.Error, arg) }
 
 // Debug logs arg, which can be a string or a struct, at the Debug level.
 func Debug(ctx context.Context, arg interface{}) { doLog(ctx, logging.Debug, arg) }
 
-// Fatal is equivalent to Error followed by exiting the program.
+// Fatal logs arg, which can be a string or a struct, at the Critical level followed by exiting the program.
 func Fatal(ctx context.Context, arg interface{}) {
-	Error(ctx, arg)
+	doLog(ctx, logging.Critical, arg)
 	die()
 }
 
 func doLog(ctx context.Context, s logging.Severity, payload interface{}) {
+	if getLevel() > s {
+		return
+	}
 	mu.Lock()
 	l := logger
 	mu.Unlock()
@@ -195,4 +235,31 @@ func die() {
 	}
 	mu.Unlock()
 	os.Exit(1)
+}
+
+// toLevel returns the logging.Severity for a given string.
+// Possible input values are "", "debug", "info", "warning", "error", "fatal".
+// In case of invalid string input, it maps to DefaultLevel.
+func toLevel(v string) logging.Severity {
+	v = strings.ToLower(v)
+
+	switch v {
+	case "":
+		// default log level will print everything.
+		return logging.Default
+	case "debug":
+		return logging.Debug
+	case "info":
+		return logging.Info
+	case "warning":
+		return logging.Warning
+	case "error":
+		return logging.Error
+	case "fatal":
+		return logging.Critical
+	}
+
+	// Default log level in case of invalid input.
+	log.Printf("Error: %s is invalid LogLevel. Possible values are [debug, info, warning, error, fatal]", v)
+	return logging.Default
 }

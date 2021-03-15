@@ -10,14 +10,18 @@ import (
 )
 
 func TestIsExcluded(t *testing.T) {
-	defer ResetTestDB(testDB, t)
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	if _, err := testDB.db.Exec(ctx, "INSERT INTO excluded_prefixes (prefix, created_by, reason) VALUES ('bad', 'someone', 'because')"); err != nil {
+	if err := testDB.InsertExcludedPrefix(ctx, "bad", "someone", "because"); err != nil {
 		t.Fatal(err)
 	}
-
+	if err := testDB.InsertExcludedPrefix(ctx, "badslash/", "someone", "because"); err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct {
 		path string
 		want bool
@@ -25,8 +29,11 @@ func TestIsExcluded(t *testing.T) {
 		{"fine", false},
 		{"ba", false},
 		{"bad", true},
-		{"badness", true},
-		{"bad.com/foo", true},
+		{"badness", false},
+		{"bad/ness", true},
+		{"bad.com/foo", false},
+		{"badslash", false},
+		{"badslash/more", true},
 	} {
 		got, err := testDB.IsExcluded(ctx, test.path)
 		if err != nil {
@@ -36,4 +43,5 @@ func TestIsExcluded(t *testing.T) {
 			t.Errorf("%q: got %t, want %t", test.path, got, test.want)
 		}
 	}
+
 }

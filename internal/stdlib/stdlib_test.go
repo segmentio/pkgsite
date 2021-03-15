@@ -11,10 +11,11 @@ import (
 	"testing"
 
 	"golang.org/x/mod/semver"
+	"golang.org/x/pkgsite/internal/version"
 )
 
 func TestTagForVersion(t *testing.T) {
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		name    string
 		version string
 		want    string
@@ -56,6 +57,16 @@ func TestTagForVersion(t *testing.T) {
 			want:    "go1.13",
 		},
 		{
+			name:    "master branch",
+			version: "master",
+			want:    "master",
+		},
+		{
+			name:    "master version",
+			version: TestVersion,
+			want:    "master",
+		},
+		{
 			name:    "bad std semver",
 			version: "v1.x",
 			wantErr: true,
@@ -76,14 +87,14 @@ func TestTagForVersion(t *testing.T) {
 			wantErr: true,
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := TagForVersion(tc.version)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("TagForVersion(%q) = %q, %v, wantErr %v", tc.version, got, err, tc.wantErr)
+		t.Run(test.name, func(t *testing.T) {
+			got, err := TagForVersion(test.version)
+			if (err != nil) != test.wantErr {
+				t.Errorf("TagForVersion(%q) = %q, %v, wantErr %v", test.version, got, err, test.wantErr)
 				return
 			}
-			if got != tc.want {
-				t.Errorf("TagForVersion(%q) = %q, %v, wanted %q, %v", tc.version, got, err, tc.want, nil)
+			if got != test.want {
+				t.Errorf("TagForVersion(%q) = %q, %v, wanted %q, %v", test.version, got, err, test.want, nil)
 			}
 		})
 	}
@@ -114,12 +125,18 @@ func TestMajorVersionForVersion(t *testing.T) {
 func TestZip(t *testing.T) {
 	UseTestData = true
 	defer func() { UseTestData = false }()
-
-	for _, version := range []string{"v1.14.6", "v1.12.5", "v1.3.2"} {
-		t.Run(version, func(t *testing.T) {
-			zr, gotTime, err := Zip(version)
+	for _, resolvedVersion := range []string{"v1.14.6", "v1.12.5", "v1.3.2", TestVersion} {
+		t.Run(resolvedVersion, func(t *testing.T) {
+			zr, gotResolvedVersion, gotTime, err := Zip(resolvedVersion)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if resolvedVersion == "master" {
+				if !version.IsPseudo(gotResolvedVersion) {
+					t.Errorf("resolved version: %s is not a pseudo-version", gotResolvedVersion)
+				}
+			} else if gotResolvedVersion != resolvedVersion {
+				t.Errorf("resolved version: got %s, want %s", gotResolvedVersion, resolvedVersion)
 			}
 			if !gotTime.Equal(TestCommitTime) {
 				t.Errorf("commit time: got %s, want %s", gotTime, TestCommitTime)
@@ -129,16 +146,11 @@ func TestZip(t *testing.T) {
 				"errors/errors.go":      true,
 				"errors/errors_test.go": true,
 			}
-			if semver.Compare(version, "v1.4.0") > 0 {
-				wantFiles["README.md"] = true
-			} else {
-				wantFiles["README"] = true
-			}
-			if semver.Compare(version, "v1.13.0") > 0 {
+			if semver.Compare(resolvedVersion, "v1.13.0") > 0 || resolvedVersion == TestVersion {
 				wantFiles["cmd/README.vendor"] = true
 			}
 
-			wantPrefix := "std@" + version + "/"
+			wantPrefix := "std@" + resolvedVersion + "/"
 			readmeVendorFile := wantPrefix + "README.vendor"
 			for _, f := range zr.File {
 				if f.Name == readmeVendorFile {
@@ -174,6 +186,33 @@ func TestZip(t *testing.T) {
 	}
 }
 
+func TestZipInfo(t *testing.T) {
+	UseTestData = true
+	defer func() { UseTestData = false }()
+
+	for _, tc := range []struct {
+		requestedVersion string
+		want             string
+	}{
+		{
+			requestedVersion: "latest",
+			want:             "v1.14.6",
+		},
+		{
+			requestedVersion: "master",
+			want:             "master",
+		},
+	} {
+		gotVersion, err := ZipInfo(tc.requestedVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := tc.want; gotVersion != want {
+			t.Errorf("version: got %q, want %q", gotVersion, want)
+		}
+	}
+}
+
 func TestVersions(t *testing.T) {
 	UseTestData = true
 	defer func() { UseTestData = false }()
@@ -190,8 +229,6 @@ func TestVersions(t *testing.T) {
 		"v1.4.2",
 		"v1.9.0-rc.1",
 		"v1.11.0",
-		"v1.12.9",
-		"v1.13.0",
 		"v1.13.0-beta.1",
 	}
 	for _, w := range wants {
@@ -202,7 +239,7 @@ func TestVersions(t *testing.T) {
 }
 
 func TestVersionForTag(t *testing.T) {
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		in, want string
 	}{
 		{"", ""},
@@ -215,10 +252,11 @@ func TestVersionForTag(t *testing.T) {
 		{"go1.1beta", ""},
 		{"go1.0", ""},
 		{"weekly.2012-02-14", ""},
+		{"latest", "latest"},
 	} {
-		got := VersionForTag(tc.in)
-		if got != tc.want {
-			t.Errorf("VersionForTag(%q) = %q, want %q", tc.in, got, tc.want)
+		got := VersionForTag(test.in)
+		if got != test.want {
+			t.Errorf("VersionForTag(%q) = %q, want %q", test.in, got, test.want)
 		}
 	}
 }
@@ -237,6 +275,31 @@ func TestContains(t *testing.T) {
 		got := Contains(test.in)
 		if got != test.want {
 			t.Errorf("Contains(%q) = %t, want %t", test.in, got, test.want)
+		}
+	}
+}
+
+func TestDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		want    string
+	}{
+		{
+			version: "v1.3.0-beta2",
+			want:    "src/pkg",
+		},
+		{
+			version: "v1.16.0-beta1",
+			want:    "src",
+		},
+		{
+			version: "master",
+			want:    "src",
+		},
+	} {
+		got := Directory(tc.version)
+		if got != tc.want {
+			t.Errorf("Directory(%s) = %s, want %s", tc.version, got, tc.want)
 		}
 	}
 }

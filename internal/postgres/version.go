@@ -9,150 +9,24 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/Masterminds/squirrel"
+	"github.com/lib/pq"
 	"golang.org/x/pkgsite/internal"
+	"golang.org/x/pkgsite/internal/database"
 	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal/experiment"
+	"golang.org/x/pkgsite/internal/log"
 	"golang.org/x/pkgsite/internal/version"
+	"golang.org/x/sync/errgroup"
 )
-
-// LegacyGetTaggedVersionsForPackageSeries returns a list of tagged versions sorted in
-// descending semver order. This list includes tagged versions of packages that
-// have the same v1path.
-func (db *DB) LegacyGetTaggedVersionsForPackageSeries(ctx context.Context, pkgPath string) ([]*internal.ModuleInfo, error) {
-	return getPackageVersions(ctx, db, pkgPath, []version.Type{version.TypeRelease, version.TypePrerelease})
-}
-
-// LegacyGetPsuedoVersionsForPackageSeries returns the 10 most recent from a list of
-// pseudo-versions sorted in descending semver order. This list includes
-// pseudo-versions of packages that have the same v1path.
-func (db *DB) LegacyGetPsuedoVersionsForPackageSeries(ctx context.Context, pkgPath string) ([]*internal.ModuleInfo, error) {
-	return getPackageVersions(ctx, db, pkgPath, []version.Type{version.TypePseudo})
-}
-
-// getPackageVersions returns a list of versions sorted in descending semver
-// order. The version types included in the list are specified by a list of
-// VersionTypes.
-func getPackageVersions(ctx context.Context, db *DB, pkgPath string, versionTypes []version.Type) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "DB.getPackageVersions(ctx, db, %q, %v)", pkgPath, versionTypes)
-
-	baseQuery := `
-		SELECT
-			p.module_path,
-			p.version,
-			m.commit_time
-		FROM
-			packages p
-		INNER JOIN
-			modules m
-		ON
-			p.module_path = m.module_path
-			AND p.version = m.version
-		WHERE
-			p.v1_path = (
-				SELECT v1_path
-				FROM packages
-				WHERE path = $1
-				LIMIT 1
-			)
-			AND version_type in (%s)
-		ORDER BY
-			m.sort_version DESC %s`
-	queryEnd := `;`
-	if len(versionTypes) == 0 {
-		return nil, fmt.Errorf("error: must specify at least one version type")
-	} else if len(versionTypes) == 1 && versionTypes[0] == version.TypePseudo {
-		queryEnd = `LIMIT 10;`
-	}
-	query := fmt.Sprintf(baseQuery, versionTypeExpr(versionTypes), queryEnd)
-
-	rows, err := db.db.Query(ctx, query, pkgPath)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var versionHistory []*internal.ModuleInfo
-	for rows.Next() {
-		var mi internal.ModuleInfo
-		if err := rows.Scan(&mi.ModulePath, &mi.Version, &mi.CommitTime); err != nil {
-			return nil, fmt.Errorf("row.Scan(): %v", err)
-		}
-		versionHistory = append(versionHistory, &mi)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows.Err(): %v", err)
-	}
-
-	return versionHistory, nil
-}
-
-// versionTypeExpr returns a comma-separated list of version types,
-// for use in a clause like "WHERE version_type IN (%s)"
-func versionTypeExpr(vts []version.Type) string {
-	var vs []string
-	for _, vt := range vts {
-		vs = append(vs, fmt.Sprintf("'%s'", vt.String()))
-	}
-	return strings.Join(vs, ", ")
-}
-
-// LegacyGetTaggedVersionsForModule returns a list of tagged versions sorted in
-// descending semver order.
-func (db *DB) LegacyGetTaggedVersionsForModule(ctx context.Context, modulePath string) ([]*internal.ModuleInfo, error) {
-	return getModuleVersions(ctx, db, modulePath, []version.Type{version.TypeRelease, version.TypePrerelease})
-}
-
-// LegacyGetPsuedoVersionsForModule returns the 10 most recent from a list of
-// pseudo-versions sorted in descending semver order.
-func (db *DB) LegacyGetPsuedoVersionsForModule(ctx context.Context, modulePath string) ([]*internal.ModuleInfo, error) {
-	return getModuleVersions(ctx, db, modulePath, []version.Type{version.TypePseudo})
-}
-
-// getModuleVersions returns a list of versions sorted in descending semver
-// order. The version types included in the list are specified by a list of
-// VersionTypes.
-func getModuleVersions(ctx context.Context, db *DB, modulePath string, versionTypes []version.Type) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "getModuleVersions(ctx, db, %q, %v)", modulePath, versionTypes)
-
-	baseQuery := `
-	SELECT
-		module_path, version, commit_time
-    FROM
-		modules
-	WHERE
-		series_path = $1
-	    AND version_type in (%s)
-	ORDER BY
-		sort_version DESC %s`
-
-	queryEnd := `;`
-	if len(versionTypes) == 0 {
-		return nil, fmt.Errorf("error: must specify at least one version type")
-	} else if len(versionTypes) == 1 && versionTypes[0] == version.TypePseudo {
-		queryEnd = `LIMIT 10;`
-	}
-	query := fmt.Sprintf(baseQuery, versionTypeExpr(versionTypes), queryEnd)
-	var vinfos []*internal.ModuleInfo
-	collect := func(rows *sql.Rows) error {
-		var mi internal.ModuleInfo
-		if err := rows.Scan(&mi.ModulePath, &mi.Version, &mi.CommitTime); err != nil {
-			return err
-		}
-		vinfos = append(vinfos, &mi)
-		return nil
-	}
-	if err := db.db.RunQuery(ctx, query, collect, internal.SeriesPathForModule(modulePath)); err != nil {
-		return nil, err
-	}
-	return vinfos, nil
-}
 
 // GetVersionsForPath returns a list of tagged versions sorted in
 // descending semver order if any exist. If none, it returns the 10 most
 // recent from a list of pseudo-versions sorted in descending semver order.
 func (db *DB) GetVersionsForPath(ctx context.Context, path string) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "GetVersionsForPath(ctx, %q)", path)
+	defer derrors.WrapStack(&err, "GetVersionsForPath(ctx, %q)", path)
 
 	versions, err := getPathVersions(ctx, db, path, version.TypeRelease, version.TypePrerelease)
 	if err != nil {
@@ -172,29 +46,32 @@ func (db *DB) GetVersionsForPath(ctx context.Context, path string) (_ []*interna
 // order. The version types included in the list are specified by a list of
 // VersionTypes.
 func getPathVersions(ctx context.Context, db *DB, path string, versionTypes ...version.Type) (_ []*internal.ModuleInfo, err error) {
-	defer derrors.Wrap(&err, "getPathVersions(ctx, db, %q, %v)", path, versionTypes)
+	defer derrors.WrapStack(&err, "getPathVersions(ctx, db, %q, %v)", path, versionTypes)
 
 	baseQuery := `
 	SELECT
 		m.module_path,
 		m.version,
 		m.commit_time,
-		m.version_type,
 		m.redistributable,
 		m.has_go_mod,
+		m.deprecated_comment,
 		m.source_info
 	FROM modules m
-	INNER JOIN paths p
-	ON p.module_id = m.id
+	INNER JOIN units u
+		ON u.module_id = m.id
 	WHERE
-		p.v1_path = (
-			SELECT p2.v1_path
-			FROM paths as p2
-			WHERE p2.path = $1
+		u.v1path_id = (
+			SELECT u2.v1path_id
+			FROM units as u2
+			INNER JOIN paths p
+			ON p.id = u2.path_id
+			WHERE p.path = $1
 			LIMIT 1
 		)
 		AND version_type in (%s)
 	ORDER BY
+		m.incompatible,
 		m.module_path DESC,
 		m.sort_version DESC %s`
 
@@ -207,23 +84,443 @@ func getPathVersions(ctx context.Context, db *DB, path string, versionTypes ...v
 	query := fmt.Sprintf(baseQuery, versionTypeExpr(versionTypes), queryEnd)
 	var versions []*internal.ModuleInfo
 	collect := func(rows *sql.Rows) error {
-		var mi internal.ModuleInfo
-		if err := rows.Scan(
-			&mi.ModulePath,
-			&mi.Version,
-			&mi.CommitTime,
-			&mi.VersionType,
-			&mi.IsRedistributable,
-			&mi.HasGoMod,
-			jsonbScanner{&mi.SourceInfo},
-		); err != nil {
+		mi, err := scanModuleInfo(rows.Scan)
+		if err != nil {
 			return fmt.Errorf("row.Scan(): %v", err)
 		}
-		versions = append(versions, &mi)
+		versions = append(versions, mi)
 		return nil
 	}
 	if err := db.db.RunQuery(ctx, query, collect, path); err != nil {
 		return nil, err
 	}
+	if err := populateLatestInfos(ctx, db, versions); err != nil {
+		return nil, err
+	}
 	return versions, nil
+}
+
+// versionTypeExpr returns a comma-separated list of version types,
+// for use in a clause like "WHERE version_type IN (%s)"
+func versionTypeExpr(vts []version.Type) string {
+	var vs []string
+	for _, vt := range vts {
+		vs = append(vs, fmt.Sprintf("'%s'", vt.String()))
+	}
+	return strings.Join(vs, ", ")
+}
+
+func populateLatestInfo(ctx context.Context, db *DB, mi *internal.ModuleInfo) (err error) {
+	defer derrors.WrapStack(&err, "populateLatestInfo(%q)", mi.ModulePath)
+
+	if experiment.IsActive(ctx, internal.ExperimentRetractions) {
+		// Get information about retractions an deprecations, and apply it.
+		start := time.Now()
+		lmv, err := db.GetLatestModuleVersions(ctx, mi.ModulePath)
+		if err != nil {
+			return err
+		}
+		if lmv != nil {
+			lmv.PopulateModuleInfo(mi)
+		}
+		log.Debugf(ctx, "latest info fetched and applied in %dms", time.Since(start).Milliseconds())
+	}
+	return nil
+}
+
+func populateLatestInfos(ctx context.Context, db *DB, mis []*internal.ModuleInfo) (err error) {
+	defer derrors.WrapStack(&err, "populateLatestInfos(%d ModuleInfos)", len(mis))
+
+	if experiment.IsActive(ctx, internal.ExperimentRetractions) {
+		start := time.Now()
+		// Collect the LatestModuleVersions for all modules in the list.
+		lmvs := map[string]*internal.LatestModuleVersions{}
+		for _, mi := range mis {
+			if _, ok := lmvs[mi.ModulePath]; !ok {
+				lmv, err := db.GetLatestModuleVersions(ctx, mi.ModulePath)
+				if err != nil {
+					return err
+				}
+				lmvs[mi.ModulePath] = lmv
+			}
+		}
+		// Use the collected LatestModuleVersions to populate the ModuleInfos.
+		for _, mi := range mis {
+			lmv := lmvs[mi.ModulePath]
+			if lmv != nil {
+				lmv.PopulateModuleInfo(mi)
+			}
+		}
+		log.Debugf(ctx, "latest info fetched and applied in %dms", time.Since(start).Milliseconds())
+	}
+	return nil
+}
+
+// GetLatestInfo returns the latest information about the unit in the module.
+// See internal.LatestInfo for documentation about the returned values.
+func (db *DB) GetLatestInfo(ctx context.Context, unitPath, modulePath string) (latest internal.LatestInfo, err error) {
+	defer derrors.WrapStack(&err, "DB.GetLatestInfo(ctx, %q, %q)", unitPath, modulePath)
+
+	group, gctx := errgroup.WithContext(ctx)
+
+	group.Go(func() error {
+		um, err := db.GetUnitMeta(gctx, unitPath, internal.UnknownModulePath, internal.LatestVersion)
+		if err != nil {
+			return err
+		}
+		latest.MinorVersion = um.Version
+		latest.MinorModulePath = um.ModulePath
+		return nil
+	})
+	group.Go(func() (err error) {
+		latest.MajorModulePath, latest.MajorUnitPath, err = db.getLatestMajorVersion(gctx, unitPath, modulePath)
+		return err
+	})
+	group.Go(func() (err error) {
+		latest.UnitExistsAtMinor, err = db.unitExistsAtLatest(gctx, unitPath, modulePath)
+		return err
+	})
+
+	if err := group.Wait(); err != nil {
+		return internal.LatestInfo{}, err
+	}
+	return latest, nil
+}
+
+// getLatestMajorVersion returns the latest module path and the full package path
+// of the latest version found, given the fullPath and the modulePath.
+// For example, in the module path "github.com/casbin/casbin", there
+// is another module path with a greater major version "github.com/casbin/casbin/v3".
+// This function will return "github.com/casbin/casbin/v3" or the input module path
+// if no later module path was found. It also returns the full package path at the
+// latest module version if it exists. If not, it returns the module path.
+func (db *DB) getLatestMajorVersion(ctx context.Context, fullPath, modulePath string) (_ string, _ string, err error) {
+	defer derrors.WrapStack(&err, "DB.getLatestMajorVersion(ctx, %q, %q)", fullPath, modulePath)
+
+	var (
+		modID   int
+		modPath string
+	)
+	seriesPath := internal.SeriesPathForModule(modulePath)
+	q, args, err := squirrel.Select("m.module_path", "m.id").
+		From("modules m").
+		Where(squirrel.Eq{"m.series_path": seriesPath}).
+		OrderBy(
+			"m.incompatible", // ignore incompatible versions unless they're all we have
+			"m.sort_version DESC",
+		).
+		Limit(1).
+		PlaceholderFormat(squirrel.Dollar).
+		ToSql()
+	if err != nil {
+		return "", "", err
+	}
+	row := db.db.QueryRow(ctx, q, args...)
+	if err := row.Scan(&modPath, &modID); err != nil {
+		return "", "", err
+	}
+
+	v1Path := internal.V1Path(fullPath, modulePath)
+	row = db.db.QueryRow(ctx, `
+		SELECT p.path
+		FROM units u
+		INNER JOIN paths p ON p.id = u.path_id
+		INNER JOIN paths p2 ON p2.id = u.v1path_id
+		WHERE p2.path = $1 AND module_id = $2;`, v1Path, modID)
+	var path string
+	switch err := row.Scan(&path); err {
+	case nil:
+		return modPath, path, nil
+	case sql.ErrNoRows:
+		return modPath, modPath, nil
+	default:
+		return "", "", err
+	}
+}
+
+// unitExistsAtLatest reports whether unitPath exists at the latest version of modulePath.
+func (db *DB) unitExistsAtLatest(ctx context.Context, unitPath, modulePath string) (unitExists bool, err error) {
+	defer derrors.WrapStack(&err, "DB.unitExistsAtLatest(ctx, %q, %q)", unitPath, modulePath)
+
+	// Find the latest version of the module path in the modules table.
+	var latestGoodVersion string
+	lmv, err := db.GetLatestModuleVersions(ctx, modulePath)
+	if err != nil {
+		return false, err
+	}
+	if lmv != nil {
+		// If we have latest-version info, use it.
+		latestGoodVersion = lmv.GoodVersion
+	} else {
+		// Otherwise, query the modules table, ignoring all adjustments for incompatible and retracted versions.
+		err := db.db.QueryRow(ctx, `
+			SELECT version
+			FROM modules
+			WHERE module_path = $1
+			ORDER BY
+				version_type = 'release' DESC,
+				sort_version DESC
+			LIMIT 1
+		`, modulePath).Scan(&latestGoodVersion)
+		if err != nil {
+			return false, err
+		}
+	}
+	if latestGoodVersion == "" {
+		return true, nil
+	}
+	// See if the unit path exists at that version.
+	var x int
+	err = db.db.QueryRow(ctx, `
+		SELECT 1
+		FROM units u
+		INNER JOIN paths p ON p.id = u.path_id
+		INNER JOIN modules m ON m.id = u.module_id
+		WHERE p.path = $1 AND m.module_path = $2 AND m.version = $3
+	`, unitPath, modulePath, latestGoodVersion).Scan(&x)
+	switch err {
+	case nil:
+		return true, nil
+	case sql.ErrNoRows:
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func shouldUpdateRawLatest(newVersion, curVersion string) bool {
+	// Only update if the new one is later according to version.Later
+	// (semver except that release > prerelease). that avoids a race
+	// condition where worker 1 sees a version, but worker 2 sees a
+	// newer version and updates before worker 1 proceeds.
+	//
+	// However, the raw latest version can go backwards if it was an
+	// incompatible version, but then a compatible version with a go.mod
+	// file is published. For example, the module starts with a
+	// v2.0.0+incompatible, but then the author adds a v1.0.0 with a
+	// go.mod file, making v1.0.0 the new latest. Take that case into
+	// account.
+	return version.Later(newVersion, curVersion) ||
+		(version.IsIncompatible(curVersion) && !version.IsIncompatible(newVersion))
+}
+
+func (db *DB) getMultiLatestModuleVersions(ctx context.Context, modulePaths []string) (lmvs []*internal.LatestModuleVersions, err error) {
+	derrors.WrapStack(&err, "getMultiLatestModuleVersions(%v)", modulePaths)
+
+	collect := func(rows *sql.Rows) error {
+		var (
+			modulePath, raw, cooked, good string
+			goModBytes                    []byte
+		)
+		if err := rows.Scan(&modulePath, &raw, &cooked, &good, &goModBytes); err != nil {
+			return err
+		}
+		lmv, err := internal.NewLatestModuleVersions(modulePath, raw, cooked, good, goModBytes)
+		if err != nil {
+			return err
+		}
+		lmvs = append(lmvs, lmv)
+		return nil
+	}
+
+	err = db.db.RunQuery(ctx, `
+		SELECT p.path, r.raw_version, r.cooked_version, r.good_version, r.raw_go_mod_bytes
+		FROM latest_module_versions r
+		INNER JOIN paths p ON p.id = r.module_path_id
+		WHERE p.path = ANY($1)
+		AND r.status = 200
+		ORDER BY p.path DESC
+	`, collect, pq.Array(modulePaths))
+	if err != nil {
+		return nil, err
+	}
+	return lmvs, nil
+}
+
+// GetLatestModuleVersions returns the row of the latest_module_versions table for modulePath.
+// If the module path is not found, it returns nil, nil.
+func (db *DB) GetLatestModuleVersions(ctx context.Context, modulePath string) (_ *internal.LatestModuleVersions, err error) {
+	lmv, _, err := getLatestModuleVersions(ctx, db.db, modulePath)
+	return lmv, err
+}
+
+func getLatestModuleVersions(ctx context.Context, db *database.DB, modulePath string) (_ *internal.LatestModuleVersions, id int, err error) {
+	derrors.WrapStack(&err, "getLatestModuleVersions(%q)", modulePath)
+
+	var (
+		raw, cooked, good string
+		goModBytes        []byte
+		status            int
+	)
+	err = db.QueryRow(ctx, `
+		SELECT
+			r.module_path_id, r.raw_version, r.cooked_version, r.good_version, r.raw_go_mod_bytes, r.status
+		FROM latest_module_versions r
+		INNER JOIN paths p ON p.id = r.module_path_id
+		WHERE p.path = $1`,
+		modulePath).Scan(&id, &raw, &cooked, &good, &goModBytes, &status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	if status != 200 {
+		// No information for this module path, but the ID is still useful.
+		return nil, id, nil
+	}
+	lmv, err := internal.NewLatestModuleVersions(modulePath, raw, cooked, good, goModBytes)
+	if err != nil {
+		return nil, 0, err
+	}
+	return lmv, id, nil
+}
+
+// UpdateLatestModuleVersions upserts its argument into the latest_module_versions table
+// if the row doesn't exist, or the new version is later.
+// It also updates lmv.GoodVersion to the latest good version, always.
+func (db *DB) UpdateLatestModuleVersions(ctx context.Context, vNew *internal.LatestModuleVersions) (err error) {
+	defer derrors.WrapStack(&err, "UpdateLatestModuleVersions(%q)", vNew.ModulePath)
+
+	// We need RepeatableRead here because the INSERT...ON CONFLICT does a read.
+	return db.db.Transact(ctx, sql.LevelRepeatableRead, func(tx *database.DB) error {
+		vCur, id, err := getLatestModuleVersions(ctx, tx, vNew.ModulePath)
+		if err != nil {
+			return err
+		}
+		// Is vNew the most recent information, or does the DB already have
+		//something more up to date?
+		update := vCur == nil || shouldUpdateRawLatest(vNew.RawVersion, vCur.RawVersion)
+		// Set lmv to the information that is now in force.
+		lmv := vCur
+		if update {
+			lmv = vNew
+		}
+
+		// Even if we don't update the raw and cooked versions, we might need to
+		// update the good version. For instance, we could have just added a
+		// version that is later than all the other good ones but still not the
+		// same as the raw or cooked version. So find the latest good version,
+		// using the most up-to-date information.
+		latestGoodVersion, err := getLatestGoodVersion(ctx, tx, lmv)
+		if err != nil {
+			return err
+		}
+		// Update the good version if it differs from the current value.
+		update = update || latestGoodVersion != vCur.GoodVersion
+		if !update {
+			log.Debugf(ctx, "%s: not updating latest module versions", vNew.ModulePath)
+			return nil
+		}
+		lmv.GoodVersion = latestGoodVersion
+		if vCur == nil {
+			log.Debugf(ctx, "%s: inserting latest_module_versions raw=%q, cooked=%q, good=%q",
+				lmv.ModulePath, lmv.RawVersion, lmv.CookedVersion, lmv.GoodVersion)
+		} else {
+			log.Debugf(ctx, "%s: updating latest_module_versions raw=%q, cooked=%q, good=%q to raw=%q, cooked=%q, good=%q",
+				lmv.ModulePath, vCur.RawVersion, vCur.CookedVersion, vCur.GoodVersion,
+				lmv.RawVersion, lmv.CookedVersion, lmv.GoodVersion)
+		}
+		return upsertLatestModuleVersions(ctx, tx, lmv.ModulePath, id, lmv, 200)
+	})
+}
+
+// UpdateLatestModuleVersionsStatus updates or inserts a failure status into the
+// latest_module_versions table.
+// It only updates the table if it doesn't have valid information for the module path.
+func (db *DB) UpdateLatestModuleVersionsStatus(ctx context.Context, modulePath string, newStatus int) (err error) {
+	defer derrors.WrapStack(&err, "UpdateLatestModuleVersionsStatus(%q, %d)", modulePath, newStatus)
+
+	// We need RepeatableRead here because the INSERT...ON CONFLICT does a read.
+	return db.db.Transact(ctx, sql.LevelRepeatableRead, func(tx *database.DB) error {
+		var id, curStatus int
+		err := tx.QueryRow(ctx, `
+				SELECT r.module_path_id, r.status
+				FROM latest_module_versions r
+				INNER JOIN paths p ON p.id = r.module_path_id
+				WHERE p.path = $1`,
+			modulePath).Scan(&id, &curStatus)
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if curStatus == 200 {
+			return nil
+		}
+		log.Debugf(ctx, "%s: updating latest_module_versions status to %d", modulePath, newStatus)
+		return upsertLatestModuleVersions(ctx, tx, modulePath, id, nil, newStatus)
+	})
+}
+
+// getLatestGoodVersion returns the latest version of a module in the modules table,
+// respecting the retractions and other information in the given LatestModuleVersions.
+func getLatestGoodVersion(ctx context.Context, tx *database.DB, lmv *internal.LatestModuleVersions) (_ string, err error) {
+	defer derrors.WrapStack(&err, "getLatestGoodVersion(%q)", lmv.ModulePath)
+
+	// Read the versions from the modules table.
+	// If the cooked latest version is incompatible, then include
+	// incompatible versions. If it isn't, then either there are no
+	// incompatible versions, or there are but the latest compatible version
+	// has a go.mod file. Either way, ignore incompatible versions.
+	q := squirrel.Select("version").
+		From("modules").
+		Where(squirrel.Eq{"module_path": lmv.ModulePath}).
+		PlaceholderFormat(squirrel.Dollar)
+	if !version.IsIncompatible(lmv.CookedVersion) {
+		q = q.Where("NOT incompatible")
+	}
+	query, args, err := q.ToSql()
+	if err != nil {
+		return "", err
+	}
+	vs, err := collectStrings(ctx, tx, query, args...)
+	if err != nil {
+		return "", err
+	}
+	// Choose the latest good version from the unretracted versions.
+	return version.LatestOf(version.RemoveIf(vs, lmv.IsRetracted)), nil
+}
+
+func upsertLatestModuleVersions(ctx context.Context, tx *database.DB, modulePath string, id int, lmv *internal.LatestModuleVersions, status int) (err error) {
+	defer derrors.WrapStack(&err, "upsertLatestModuleVersions(%s, %d)", modulePath, status)
+
+	// If the row doesn't exist, get a path ID for the module path.
+	if id == 0 {
+		id, err = upsertPath(ctx, tx, modulePath)
+		if err != nil {
+			return err
+		}
+	}
+	var (
+		raw, cooked, good string
+		goModBytes        = []byte{} // not nil, a zero-length slice
+	)
+	if lmv != nil {
+		raw = lmv.RawVersion
+		cooked = lmv.CookedVersion
+		good = lmv.GoodVersion
+		// Convert the go.mod file into bytes.
+		goModBytes, err = lmv.GoModFile.Format()
+		if err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO latest_module_versions (
+			module_path_id,
+			raw_version,
+			cooked_version,
+			good_version,
+			raw_go_mod_bytes,
+			status
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (module_path_id)
+		DO UPDATE SET
+			raw_version=excluded.raw_version,
+			cooked_version=excluded.cooked_version,
+			good_version=excluded.good_version,
+			raw_go_mod_bytes=excluded.raw_go_mod_bytes,
+			status=excluded.status
+		`,
+		id, raw, cooked, good, goModBytes, status)
+	return err
 }

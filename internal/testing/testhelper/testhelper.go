@@ -13,11 +13,15 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
+
+	"golang.org/x/pkgsite/internal/derrors"
 )
 
 const (
@@ -32,7 +36,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.`
 
 	// BSD0License is the contents of the BSD-0-Clause license. It is detectable
-	// by the licensecheck package, but not considered redistributable.
+	// by the licensecheck package, and is considered redistributable.
 	BSD0License = `Copyright 2019 Google Inc
 
 Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted.
@@ -105,4 +109,36 @@ func TestDataPath(rel string) string {
 		panic("unable to determine relative path")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(filename), filepath.FromSlash(rel)))
+}
+
+// CreateTestDirectory creates a directory to hold a module when testing
+// local fetching, and returns the directory.
+func CreateTestDirectory(files map[string]string) (_ string, err error) {
+	defer derrors.Wrap(&err, "CreateTestDirectory(files)")
+	tempDir, err := ioutil.TempDir("", "")
+	if err != nil {
+		return "", err
+	}
+
+	for path, contents := range files {
+		path = filepath.Join(tempDir, path)
+
+		parent, _ := filepath.Split(path)
+		if err := os.MkdirAll(parent, 0755); err != nil {
+			return "", err
+		}
+
+		file, err := os.Create(path)
+		if err != nil {
+			return "", err
+		}
+		if _, err := file.WriteString(contents); err != nil {
+			return "", err
+		}
+		if err := file.Close(); err != nil {
+			return "", err
+		}
+	}
+
+	return tempDir, nil
 }

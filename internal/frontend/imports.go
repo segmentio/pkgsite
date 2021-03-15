@@ -6,6 +6,8 @@ package frontend
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"golang.org/x/pkgsite/internal"
@@ -32,14 +34,20 @@ type ImportsDetails struct {
 
 // fetchImportsDetails fetches imports for the package version specified by
 // pkgPath, modulePath and version from the database and returns a ImportsDetails.
-func fetchImportsDetails(ctx context.Context, ds internal.DataSource, pkgPath, modulePath, resolvedVersion string) (*ImportsDetails, error) {
-	dsImports, err := ds.GetImports(ctx, pkgPath, modulePath, resolvedVersion)
+func fetchImportsDetails(ctx context.Context, ds internal.DataSource, pkgPath, modulePath, resolvedVersion string) (_ *ImportsDetails, err error) {
+	u, err := ds.GetUnit(ctx, &internal.UnitMeta{
+		Path: pkgPath,
+		ModuleInfo: internal.ModuleInfo{
+			ModulePath: modulePath,
+			Version:    resolvedVersion,
+		},
+	}, internal.WithImports)
 	if err != nil {
 		return nil, err
 	}
 
 	var externalImports, moduleImports, std []string
-	for _, p := range dsImports {
+	for _, p := range u.Imports {
 		if stdlib.Contains(p) {
 			std = append(std, p)
 		} else if strings.HasPrefix(p+"/", modulePath+"/") {
@@ -60,6 +68,7 @@ func fetchImportsDetails(ctx context.Context, ds internal.DataSource, pkgPath, m
 // ImportedByDetails contains information for the collection of packages that
 // import a given package.
 type ImportedByDetails struct {
+	// ModulePath is the module path for the package referenced on this page.
 	ModulePath string
 
 	// ImportedBy is the collection of packages that import the
@@ -67,13 +76,21 @@ type ImportedByDetails struct {
 	// They are organized into a tree of sections by prefix.
 	ImportedBy []*Section
 
-	Total        int  // number of packages in ImportedBy
-	TotalIsExact bool // if false, then there may be more than Total
+	// NumImportedByDisplay is the display text at the top of the imported by
+	// tab section, which shows the imported by count and package limit.
+	NumImportedByDisplay string
+
+	// Total is the total number of importers.
+	Total int
 }
 
-const importedByLimit = 20001
+var (
+	// tabImportedByLimit is the maximum number of importers displayed on the imported
+	// by page.
+	tabImportedByLimit = 20001
+)
 
-// etchImportedByDetails fetches importers for the package version specified by
+// fetchImportedByDetails fetches importers for the package version specified by
 // path and version from the database and returns a ImportedByDetails.
 func fetchImportedByDetails(ctx context.Context, ds internal.DataSource, pkgPath, modulePath string) (*ImportedByDetails, error) {
 	db, ok := ds.(*postgres.DB)
@@ -82,24 +99,24 @@ func fetchImportedByDetails(ctx context.Context, ds internal.DataSource, pkgPath
 		return nil, proxydatasourceNotSupportedErr()
 	}
 
-	importedBy, err := db.GetImportedBy(ctx, pkgPath, modulePath, importedByLimit)
+	importedBy, err := db.GetImportedBy(ctx, pkgPath, modulePath, tabImportedByLimit)
 	if err != nil {
 		return nil, err
 	}
-	// If we reached the query limit, then we don't know the total.
-	// Say so, and show one less than the limit.
-	// For example, if the limit is 101 and we get 101 results, then we'll
-	// say there are more than 100, and show the first 100.
-	totalIsExact := true
-	if len(importedBy) == importedByLimit {
-		importedBy = importedBy[:len(importedBy)-1]
-		totalIsExact = false
+	numImportedBy, err := db.GetImportedByCount(ctx, pkgPath, modulePath)
+	if err != nil {
+		return nil, err
 	}
 	sections := Sections(importedBy, nextPrefixAccount)
+
+	display := strconv.Itoa(numImportedBy)
+	if numImportedBy >= tabImportedByLimit {
+		display += fmt.Sprintf(" (displaying %d packages)", tabImportedByLimit-1)
+	}
 	return &ImportedByDetails{
-		ModulePath:   modulePath,
-		ImportedBy:   sections,
-		Total:        len(importedBy),
-		TotalIsExact: totalIsExact,
+		ModulePath:           modulePath,
+		ImportedBy:           sections,
+		NumImportedByDisplay: display,
+		Total:                numImportedBy,
 	}, nil
 }

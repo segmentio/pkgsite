@@ -5,33 +5,47 @@
 package fetch
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sort"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/safehtml/template"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
-	"golang.org/x/pkgsite/internal/experiment"
+	"golang.org/x/pkgsite/internal/godoc"
+	"golang.org/x/pkgsite/internal/godoc/dochtml"
+	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/proxy"
 	"golang.org/x/pkgsite/internal/source"
 	"golang.org/x/pkgsite/internal/stdlib"
 	"golang.org/x/pkgsite/internal/testing/sample"
-	"golang.org/x/pkgsite/internal/testing/testhelper"
 )
 
+var testTimeout = 30 * time.Second
+
 var (
-	testTimeout   = 30 * time.Second
-	sourceTimeout = 1 * time.Second
+	templateSource = template.TrustedSourceFromConstant("../../content/static/html/doc")
+	testModules    []*proxy.Module
 )
+
+type fetchFunc func(t *testing.T, withLicenseDetector bool, ctx context.Context, mod *proxy.Module, fetchVersion string) (*FetchResult, *licenses.Detector)
+
+func TestMain(m *testing.M) {
+	dochtml.LoadTemplates(templateSource)
+	testModules = proxy.LoadTestModules("../proxy/testdata")
+	licenses.OmitExceptions = true
+	os.Exit(m.Run())
+}
 
 func TestFetchModule(t *testing.T) {
 	stdlib.UseTestData = true
@@ -45,69 +59,121 @@ func TestFetchModule(t *testing.T) {
 	}
 	defer func() { httpPost = origPost }()
 
-	defer func(oldmax int) { MaxDocumentationHTML = oldmax }(MaxDocumentationHTML)
-	MaxDocumentationHTML = 1 * megabyte
+	defer func(oldmax int) { godoc.MaxDocumentationHTML = oldmax }(godoc.MaxDocumentationHTML)
+	godoc.MaxDocumentationHTML = megabyte / 2
 
 	for _, test := range []struct {
-		name string
-		mod  *testModule
+		name         string
+		mod          *testModule
+		fetchVersion string
+		proxyOnly    bool
 	}{
-		{name: "basic", mod: moduleNoGoMod},
+		{name: "single", mod: moduleOnePackage},
 		{name: "wasm", mod: moduleWasm},
-		{name: "no go.mod file", mod: moduleOnePackage},
-		{name: "has go.mod", mod: moduleMultiPackage},
-		{name: "module with bad packages", mod: moduleBadPackages},
-		{name: "module with build constraints", mod: moduleBuildConstraints},
-		{name: "module with packages with bad import paths", mod: moduleBadImportPath},
-		{name: "module with documentation", mod: moduleDocTest},
+		{name: "no go.mod file", mod: moduleNoGoMod},
+		{name: "multi", mod: moduleMultiPackage},
+		{name: "bad packages", mod: moduleBadPackages},
+		{name: "build constraints", mod: moduleBuildConstraints},
+		{name: "packages with bad import paths", mod: moduleBadImportPath},
+		{name: "documentation", mod: moduleDocTest},
 		{name: "documentation too large", mod: moduleDocTooLarge},
-		{name: "module with package-level example", mod: modulePackageExample},
-		{name: "module with function example", mod: moduleFuncExample},
-		{name: "module with type example", mod: moduleTypeExample},
-		{name: "module with method example", mod: moduleMethodExample},
-		{name: "module with nonredistributable packages", mod: moduleNonRedist},
-		{name: "stdlib module", mod: moduleStd},
+		{name: "package-level example", mod: modulePackageExample},
+		{name: "function example", mod: moduleFuncExample},
+		{name: "type example", mod: moduleTypeExample},
+		{name: "method example", mod: moduleMethodExample},
+		{name: "nonredistributable packages", mod: moduleNonRedist},
+		// Proxy only as stdlib is not accounted for in local mode
+		{name: "stdlib module", mod: moduleStd, proxyOnly: true},
+		// Proxy only as version is pre specified in local mode
+		{name: "master version of stdlib module", mod: moduleStdMaster, fetchVersion: "master", proxyOnly: true},
+		// Proxy only as version is pre specified in local mode
+		{name: "master version of module", mod: moduleMaster, fetchVersion: "master", proxyOnly: true},
+		// Proxy only as version is pre specified in local mode
+		{name: "latest version of module", mod: moduleLatest, fetchVersion: "latest", proxyOnly: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ctx := experiment.NewContext(context.Background(), internal.ExperimentExecutableExamples)
-			ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			defer cancel()
+			mod := test.mod.mod
+			if mod == nil {
+				mod = test.mod.modfunc()
+			}
+			if mod == nil {
+				t.Fatal("nil module")
+			}
+			test.mod.fr = cleanFetchResult(t, test.mod.fr)
 
-			modulePath := test.mod.mod.ModulePath
-			version := test.mod.mod.Version
-			if version == "" {
-				version = "v1.0.0"
+			for _, fetcher := range []struct {
+				name  string
+				fetch fetchFunc
+			}{
+				{name: "proxy", fetch: proxyFetcher},
+				{name: "local", fetch: localFetcher},
+			} {
+				if test.proxyOnly && fetcher.name == "local" {
+					continue
+				}
+				t.Run(fetcher.name, func(t *testing.T) {
+					ctx := context.Background()
+					ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
+					defer cancel()
+
+					got, d := fetcher.fetch(t, true, ctx, mod, test.fetchVersion)
+					defer got.Defer()
+					if got.Error != nil {
+						t.Fatalf("fetching failed: %v", got.Error)
+					}
+					test.mod.fr = cleanLicenses(t, test.mod.fr, d)
+					fr := updateFetchResultVersions(t, test.mod.fr, fetcher.name == "local")
+					sortFetchResult(fr)
+					sortFetchResult(got)
+					opts := []cmp.Option{
+						cmpopts.IgnoreFields(internal.Documentation{}, "Source"),
+						cmpopts.IgnoreFields(internal.PackageVersionState{}, "Error"),
+						cmpopts.IgnoreFields(FetchResult{}, "Defer"),
+						cmp.AllowUnexported(source.Info{}),
+						cmpopts.EquateEmpty(),
+					}
+					if fetcher.name == "local" {
+						opts = append(opts,
+							[]cmp.Option{
+								// Pre specified for all modules
+								cmpopts.IgnoreFields(internal.Module{}, "SourceInfo"),
+								cmpopts.IgnoreFields(internal.Module{}, "Version"),
+								cmpopts.IgnoreFields(FetchResult{}, "RequestedVersion"),
+								cmpopts.IgnoreFields(FetchResult{}, "ResolvedVersion"),
+								cmpopts.IgnoreFields(internal.Module{}, "CommitTime"),
+							}...)
+					}
+					opts = append(opts, sample.LicenseCmpOpts...)
+					if diff := cmp.Diff(fr, got, opts...); diff != "" {
+						t.Fatalf("mismatch (-want +got):\n%s", diff)
+					}
+					validateDocumentationHTML(t, got.Module, test.mod.docStrings)
+				})
 			}
-			sourceClient := source.NewClient(sourceTimeout)
-			proxyClient, teardownProxy := proxy.SetupTestProxy(t, []*proxy.Module{{
-				ModulePath: modulePath,
-				Version:    version,
-				Files:      test.mod.mod.Files,
-			}})
-			defer teardownProxy()
-			got := FetchModule(ctx, modulePath, version, proxyClient, sourceClient)
-			if got.Error != nil {
-				t.Fatal(got.Error)
-			}
-			d := licenseDetector(ctx, t, modulePath, version, proxyClient)
-			fr := cleanFetchResult(test.mod.fr, d)
-			sortFetchResult(fr)
-			sortFetchResult(got)
-			opts := []cmp.Option{
-				cmpopts.IgnoreFields(internal.LegacyPackage{}, "DocumentationHTML"),
-				cmpopts.IgnoreFields(internal.Documentation{}, "HTML"),
-				cmpopts.IgnoreFields(internal.PackageVersionState{}, "Error"),
-				cmp.AllowUnexported(source.Info{}),
-				cmpopts.EquateEmpty(),
-			}
-			opts = append(opts, sample.LicenseCmpOpts...)
-			if diff := cmp.Diff(fr, got, opts...); diff != "" {
-				t.Fatalf("mismatch (-want +got):\n%s", diff)
-			}
-			validateDocumentationHTML(t, got.Module, fr.Module)
 		})
 	}
 }
+
+// validateDocumentationHTML checks that the doc HTMLs for units in the module
+// contain a set of substrings.
+func validateDocumentationHTML(t *testing.T, got *internal.Module, want map[string][]string) {
+	ctx := context.Background()
+	for _, u := range got.Units {
+		if wantStrings := want[u.Path]; wantStrings != nil {
+			parts, err := godoc.RenderPartsFromUnit(ctx, u)
+			if err != nil && !errors.Is(err, godoc.ErrTooLarge) {
+				t.Fatal(err)
+			}
+			gotDoc := parts.Body.String()
+			for _, w := range wantStrings {
+				if !strings.Contains(gotDoc, w) {
+					t.Errorf("doc for %s:\nmissing %q; got\n%q", u.Path, w, gotDoc)
+				}
+			}
+		}
+	}
+}
+
 func TestFetchModule_Errors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -116,260 +182,104 @@ func TestFetchModule_Errors(t *testing.T) {
 		mod           *testModule
 		wantErr       error
 		wantGoModPath string
-	}{
-		{name: "alternative", mod: moduleAlternative, wantErr: derrors.AlternativeModule, wantGoModPath: "canonical"},
-		{name: "empty module", mod: moduleEmpty, wantErr: derrors.BadModule},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			modulePath := test.mod.mod.ModulePath
-			version := test.mod.mod.Version
-			if version == "" {
-				version = "v1.0.0"
-			}
-			proxyClient, teardownProxy := proxy.SetupTestProxy(t, []*proxy.Module{{
-				ModulePath: modulePath,
-				Files:      test.mod.mod.Files,
-			}})
-			defer teardownProxy()
-
-			sourceClient := source.NewClient(sourceTimeout)
-			got := FetchModule(ctx, modulePath, "v1.0.0", proxyClient, sourceClient)
-			if !errors.Is(got.Error, test.wantErr) {
-				t.Fatalf("FetchModule(ctx, %q, v1.0.0, proxyClient, sourceClient): %v; wantErr = %v)", modulePath, got.Error, test.wantErr)
-			}
-			if test.wantGoModPath != "" {
-				if got == nil || got.GoModPath != test.wantGoModPath {
-					t.Errorf("got %+v, wanted GoModPath %q", got, test.wantGoModPath)
-				}
-			}
-		})
-	}
-}
-
-func TestExtractReadmesFromZip(t *testing.T) {
-	stdlib.UseTestData = true
-
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	sortReadmes := func(readmes []*internal.Readme) {
-		sort.Slice(readmes, func(i, j int) bool {
-			return readmes[i].Filepath < readmes[j].Filepath
-		})
-	}
-
-	for _, test := range []struct {
-		modulePath, version string
-		files               map[string]string
-		want                []*internal.Readme
+		wantHasGoMod  bool
 	}{
 		{
-			modulePath: stdlib.ModulePath,
-			version:    "v1.12.5",
-			want: []*internal.Readme{
-				{
-					Filepath: "README.md",
-					Contents: "# The Go Programming Language\n",
-				},
-				{
-					Filepath: "cmd/pprof/README",
-					Contents: "This directory is the copy of Google's pprof shipped as part of the Go distribution.\n",
-				},
-			},
+			name:          "alternative",
+			mod:           moduleAlternative,
+			wantErr:       derrors.AlternativeModule,
+			wantGoModPath: "canonical",
+			wantHasGoMod:  true,
 		},
 		{
-			modulePath: "github.com/my/module",
-			version:    "v1.0.0",
-			files: map[string]string{
-				"README.md":  "README FILE FOR TESTING.",
-				"foo/README": "Another README",
-			},
-			want: []*internal.Readme{
-				{
-					Filepath: "README.md",
-					Contents: "README FILE FOR TESTING.",
-				},
-				{
-					Filepath: "foo/README",
-					Contents: "Another README",
-				},
-			},
+			name:          "empty module",
+			mod:           moduleEmpty,
+			wantErr:       derrors.BadModule,
+			wantGoModPath: "emp.ty/module",
+			wantHasGoMod:  false,
 		},
 		{
-			modulePath: "emp.ty/module",
-			version:    "v1.0.0",
-			files:      map[string]string{},
+			name:          "go.mod but no go files",
+			mod:           moduleNoGo,
+			wantErr:       derrors.BadModule,
+			wantGoModPath: "no.go/files",
+			wantHasGoMod:  true,
 		},
 	} {
-		t.Run(test.modulePath, func(t *testing.T) {
-			var (
-				reader *zip.Reader
-				err    error
-			)
-			if test.modulePath == stdlib.ModulePath {
-				reader, _, err = stdlib.Zip(test.version)
-				if err != nil {
-					t.Fatal(err)
+		for _, fetcher := range []struct {
+			name  string
+			fetch fetchFunc
+		}{
+			{name: "proxy", fetch: proxyFetcher},
+			{name: "local", fetch: localFetcher},
+		} {
+			t.Run(fmt.Sprintf("%s:%s", fetcher.name, test.name), func(t *testing.T) {
+				got, _ := fetcher.fetch(t, false, ctx, test.mod.mod, "")
+				defer got.Defer()
+				if !errors.Is(got.Error, test.wantErr) {
+					t.Fatalf("got error = %v; wantErr = %v)", got.Error, test.wantErr)
 				}
-			} else {
-				proxyClient, teardownProxy := proxy.SetupTestProxy(t, []*proxy.Module{
-					{ModulePath: test.modulePath, Files: test.files}})
-				defer teardownProxy()
-				reader, err = proxyClient.GetZip(ctx, test.modulePath, "v1.0.0")
-				if err != nil {
-					t.Fatal(err)
+				if got == nil {
+					t.Fatal("got nil")
 				}
-			}
-
-			got, err := extractReadmesFromZip(test.modulePath, test.version, reader)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			sortReadmes(test.want)
-			sortReadmes(got)
-			if diff := cmp.Diff(test.want, got); diff != "" {
-				t.Errorf("mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestIsReadme(t *testing.T) {
-	for _, test := range []struct {
-		name, file string
-		want       bool
-	}{
-		{
-			name: "README in nested dir returns true",
-			file: "github.com/my/module@v1.0.0/README.md",
-			want: true,
-		},
-		{
-			name: "case insensitive",
-			file: "rEaDme",
-			want: true,
-		},
-		{
-			name: "random extension returns true",
-			file: "README.FOO",
-			want: true,
-		},
-		{
-			name: "{prefix}readme will return false",
-			file: "FOO_README",
-			want: false,
-		},
-		{
-			file: "README_FOO",
-			name: "readme{suffix} will return false",
-			want: false,
-		},
-		{
-			file: "README.FOO.FOO",
-			name: "README file with multiple extensions will return false",
-			want: false,
-		},
-		{
-			file: "Readme.go",
-			name: ".go README file will return false",
-			want: false,
-		},
-		{
-			file: "",
-			name: "empty filename returns false",
-			want: false,
-		},
-	} {
-		{
-			t.Run(test.file, func(t *testing.T) {
-				if got := isReadme(test.file); got != test.want {
-					t.Errorf("isReadme(%q) = %t: %t", test.file, got, test.want)
+				if g, w := got.GoModPath, test.wantGoModPath; g != w {
+					t.Errorf("GoModPath: got %q, want %q", g, w)
+				}
+				if g, w := got.HasGoMod, test.wantHasGoMod; g != w {
+					t.Errorf("HasGoMod: got %t, want %t", g, w)
 				}
 			})
 		}
 	}
 }
 
-func TestMatchingFiles(t *testing.T) {
-	plainGoBody := `
-		package plain
-		type Value int`
-	jsGoBody := `
-		// +build js,wasm
-
-		// Package js only works with wasm.
-		package js
-		type Value int`
-
-	plainContents := map[string]string{
-		"README.md":      "THIS IS A README",
-		"LICENSE.md":     testhelper.MITLicense,
-		"plain/plain.go": plainGoBody,
-	}
-
-	jsContents := map[string]string{
-		"README.md":  "THIS IS A README",
-		"LICENSE.md": testhelper.MITLicense,
-		"js/js.go":   jsGoBody,
-	}
+func TestExtractDeprecatedComment(t *testing.T) {
 	for _, test := range []struct {
-		name         string
-		goos, goarch string
-		contents     map[string]string
-		want         map[string][]byte
+		name        string
+		in          string
+		wantHas     bool
+		wantComment string
 	}{
-		{
-			name:     "plain-linux",
-			goos:     "linux",
-			goarch:   "amd64",
-			contents: plainContents,
-			want: map[string][]byte{
-				"plain.go": []byte(plainGoBody),
-			},
-		},
-		{
-			name:     "plain-js",
-			goos:     "js",
-			goarch:   "wasm",
-			contents: plainContents,
-			want: map[string][]byte{
-				"plain.go": []byte(plainGoBody),
-			},
-		},
-		{
-			name:     "wasm-linux",
-			goos:     "linux",
-			goarch:   "amd64",
-			contents: jsContents,
-			want:     map[string][]byte{},
-		},
-		{
-			name:     "wasm-js",
-			goos:     "js",
-			goarch:   "wasm",
-			contents: jsContents,
-			want: map[string][]byte{
-				"js.go": []byte(jsGoBody),
-			},
+		{"no comment", `module m`, false, ""},
+		{"valid comment",
+			`
+			// Deprecated: use v2
+			module m
+		`, true, "use v2"},
+		{"take first",
+			`
+			// Deprecated: use v2
+			// Deprecated: use v3
+			module m
+		`, true, "use v2"},
+		{"ignore others",
+			`
+			// c1
+			// Deprecated: use v2
+			// c2
+			module m
+		`, true, "use v2"},
+		{"must be capitalized",
+			`
+			// c1
+			// deprecated: use v2
+			// c2
+			module m
+		`, false, ""},
+		{"suffix",
+			`
+			// c1
+			module m // Deprecated: use v2
+		`, true, "use v2",
 		},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			data, err := testhelper.ZipContents(test.contents)
-			if err != nil {
-				t.Fatal(err)
-			}
-			r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := matchingFiles(test.goos, test.goarch, r.File)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(test.want, got); diff != "" {
-				t.Errorf("mismatch (-want +got):\n%s", diff)
-			}
-		})
+		mf, err := modfile.Parse("test", []byte(test.in), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotHas, gotComment := extractDeprecatedComment(mf)
+		if gotHas != test.wantHas || gotComment != test.wantComment {
+			t.Errorf("%s: got (%t, %q), want(%t, %q)", test.name, gotHas, gotComment, test.wantHas, test.wantComment)
+		}
 	}
 }

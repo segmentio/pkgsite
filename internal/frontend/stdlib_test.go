@@ -40,15 +40,15 @@ func TestParseStdLibURLPath(t *testing.T) {
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			gotPkg, gotVersion, err := parseStdLibURLPath(tc.url)
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseStdLibURLPath(test.url)
 			if err != nil {
-				t.Fatalf("parseStdLibURLPath(%q): %v)", tc.url, err)
+				t.Fatalf("parseStdLibURLPath(%q): %v)", test.url, err)
 			}
-			if tc.wantVersion != gotVersion || tc.wantPath != gotPkg {
+			if test.wantVersion != got.requestedVersion || test.wantPath != got.fullPath {
 				t.Fatalf("parseStdLibURLPath(%q): %q, %q, %v; want = %q, %q",
-					tc.url, gotPkg, gotVersion, err, tc.wantPath, tc.wantVersion)
+					test.url, got.fullPath, got.requestedVersion, err, test.wantPath, test.wantVersion)
 			}
 		})
 	}

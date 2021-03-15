@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -43,7 +44,7 @@ func TestFromHTTPStatus(t *testing.T) {
 }
 
 func TestToHTTPStatus(t *testing.T) {
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		in   error
 		want int
 	}{
@@ -56,9 +57,9 @@ func TestToHTTPStatus(t *testing.T) {
 		{fmt.Errorf("wrapping: %w", NotFound), http.StatusNotFound},
 		{io.ErrUnexpectedEOF, http.StatusInternalServerError},
 	} {
-		got := ToStatus(tc.in)
-		if got != tc.want {
-			t.Errorf("ToHTTPStatus(%v) = %d, want %d", tc.in, got, tc.want)
+		got := ToStatus(test.in)
+		if got != test.want {
+			t.Errorf("ToHTTPStatus(%v) = %d, want %d", test.in, got, test.want)
 		}
 	}
 }
@@ -97,5 +98,20 @@ func TestWrap(t *testing.T) {
 	}
 	if got := errors.Unwrap(err); got != orig {
 		t.Errorf("Unwrap: got %#v, want %#v", got, orig)
+	}
+}
+
+func TestWrapStack(t *testing.T) {
+	var err error = io.ErrShortWrite
+	WrapStack(&err, "while frobbing")
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Error("is not io.ErrShortWrite")
+	}
+	var se *StackError
+	if !errors.As(err, &se) {
+		t.Fatal("not as StackError")
+	}
+	if !strings.Contains(string(se.Stack), "WrapStack") {
+		t.Fatal("bad stack trace")
 	}
 }

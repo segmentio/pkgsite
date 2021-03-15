@@ -23,11 +23,13 @@ import (
 	"go.opencensus.io/stats/view"
 	"golang.org/x/pkgsite/internal"
 	"golang.org/x/pkgsite/internal/derrors"
+	"golang.org/x/pkgsite/internal/licenses"
 	"golang.org/x/pkgsite/internal/testing/sample"
 )
 
 func TestPathTokens(t *testing.T) {
-	for _, tc := range []struct {
+	t.Parallel()
+	for _, test := range []struct {
 		path string
 		want []string
 	}{
@@ -140,10 +142,10 @@ func TestPathTokens(t *testing.T) {
 			want: nil,
 		},
 	} {
-		t.Run(tc.path, func(t *testing.T) {
-			got := GeneratePathTokens(tc.path)
-			if diff := cmp.Diff(tc.want, got); diff != "" {
-				t.Errorf("generatePathTokens(%q) mismatch (-want +got):\n%s", tc.path, diff)
+		t.Run(test.path, func(t *testing.T) {
+			got := GeneratePathTokens(test.path)
+			if diff := cmp.Diff(test.want, got); diff != "" {
+				t.Errorf("generatePathTokens(%q) mismatch (-want +got):\n%s", test.path, diff)
 			}
 		})
 	}
@@ -154,17 +156,23 @@ func TestPathTokens(t *testing.T) {
 // a single importing module.
 func importGraph(popularPath, importerModule string, importerCount int) []*internal.Module {
 	m := sample.Module(popularPath, "v1.2.3", "")
-	m.LegacyPackages[0].Imports = nil
+	m.Packages()[0].Imports = nil
 	// Try to improve the ts_rank of the 'foo' search term.
-	m.LegacyPackages[0].Synopsis = "foo"
-	m.LegacyReadmeContents = "foo"
+	m.Packages()[0].Documentation[0].Synopsis = "foo"
+	m.Units[0].Readme.Contents = "foo"
 	mods := []*internal.Module{m}
+
 	if importerCount > 0 {
 		m := sample.Module(importerModule, "v1.2.3")
 		for i := 0; i < importerCount; i++ {
-			p := sample.LegacyPackage(importerModule, fmt.Sprintf("importer%d", i))
-			p.Imports = []string{popularPath}
-			sample.AddPackage(m, p)
+			name := fmt.Sprintf("importer%d", i)
+			fullPath := importerModule + "/" + name
+			u := &internal.Unit{
+				UnitMeta:      *sample.UnitMeta(fullPath, importerModule, m.Version, name, true),
+				Documentation: []*internal.Documentation{sample.Doc},
+				Imports:       []string{popularPath},
+			}
+			sample.AddUnit(m, u)
 		}
 		mods = append(mods, m)
 	}
@@ -188,18 +196,6 @@ func resultGuard(resultOrder []string) func(string) func() {
 		}
 	}
 	guardTestResult := func(source string) func() {
-		// This test is inherently racy as 'estimate' results are are on a
-		// separate channel, and therefore even after guarding still race to
-		// the select statement.
-		//
-		// Since this is a concern only for testing, and since this test is
-		// rather slow anyway, just wait for a healthy amount of time in order
-		// to de-flake the test. If the test still proves flaky, we can either
-		// increase this sleep or refactor so that all asynchronous results
-		// arrive on the same channel.
-		if source == "estimate" {
-			time.Sleep(100 * time.Millisecond)
-		}
 		if await, ok := waitFor[source]; ok {
 			<-done[await]
 		}
@@ -209,6 +205,9 @@ func resultGuard(resultOrder []string) func(string) func() {
 }
 
 func TestSearch(t *testing.T) {
+	// Cannot be run in parallel with other search tests, because it reads
+	// metrics before and after (see responseDelta below).
+	ctx := context.Background()
 	tests := []struct {
 		label       string
 		modules     []*internal.Module
@@ -218,42 +217,50 @@ func TestSearch(t *testing.T) {
 		wantTotal   uint64
 	}{
 		{
-			label:       "single package",
+			label:       "single package from popular",
 			modules:     importGraph("foo.com/A", "", 0),
-			resultOrder: []string{"popular", "estimate", "deep"},
+			resultOrder: []string{"popular", "deep"},
 			wantSource:  "popular",
+			wantResults: []string{"foo.com/A"},
+			wantTotal:   1,
+		},
+		{
+			label:       "single package from deep",
+			modules:     importGraph("foo.com/A", "", 0),
+			resultOrder: []string{"deep", "popular"},
+			wantSource:  "deep",
 			wantResults: []string{"foo.com/A"},
 			wantTotal:   1,
 		},
 		{
 			label:       "empty results",
 			modules:     []*internal.Module{},
-			resultOrder: []string{"deep", "estimate", "popular"},
+			resultOrder: []string{"deep", "popular"},
 			wantSource:  "deep",
 			wantResults: nil,
 		},
 		{
 			label:       "both popular and unpopular results",
 			modules:     importGraph("foo.com/popular", "bar.com/foo", 10),
-			resultOrder: []string{"popular", "estimate", "deep"},
+			resultOrder: []string{"popular", "deep"},
 			wantSource:  "popular",
 			wantResults: []string{"foo.com/popular", "bar.com/foo/importer0"},
-			wantTotal:   11, // HLL result count (happens to be right in this case)
+			wantTotal:   100, // popular assumes 100 results
 		},
 		{
-			label: "popular results, estimate before deep",
+			label: "popular before deep",
 			modules: append(importGraph("foo.com/popularA", "bar.com", 60),
 				importGraph("foo.com/popularB", "baz.com/foo", 70)...),
-			resultOrder: []string{"popular", "estimate", "deep"},
+			resultOrder: []string{"popular", "deep"},
 			wantSource:  "popular",
 			wantResults: []string{"foo.com/popularB", "foo.com/popularA"},
-			wantTotal:   76, // HLL result count (actual count is 72)
+			wantTotal:   100, // popular assumes 100 results
 		},
 		{
-			label: "popular results, deep before estimate",
+			label: "deep before popular",
 			modules: append(importGraph("foo.com/popularA", "bar.com/foo", 60),
 				importGraph("foo.com/popularB", "bar.com/foo", 70)...),
-			resultOrder: []string{"popular", "deep", "estimate"},
+			resultOrder: []string{"deep", "popular"},
 			wantSource:  "deep",
 			wantResults: []string{"foo.com/popularB", "foo.com/popularA"},
 			wantTotal:   72,
@@ -287,19 +294,16 @@ func TestSearch(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.label, func(t *testing.T) {
-			defer ResetTestDB(testDB, t)
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			for _, v := range test.modules {
-				if err := testDB.InsertModule(ctx, v); err != nil {
-					t.Fatal(err)
-				}
+			testDB, release := acquire(t)
+			defer release()
+			for _, m := range test.modules {
+				MustInsertModule(ctx, t, testDB, m)
 			}
 			if _, err := testDB.UpdateSearchDocumentsImportedByCount(ctx); err != nil {
 				t.Fatal(err)
 			}
 			guardTestResult := resultGuard(test.resultOrder)
-			resp, err := testDB.hedgedSearch(ctx, "foo", 2, 0, searchers, guardTestResult)
+			resp, err := testDB.hedgedSearch(ctx, "foo", 2, 0, 100, searchers, guardTestResult)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -327,6 +331,8 @@ func TestSearch(t *testing.T) {
 }
 
 func TestSearchErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
 	// errorIn returns a copy of searchers for which searcherName returns an
 	// error.
 	errorIn := func(searcherName string) map[string]searcher {
@@ -334,7 +340,7 @@ func TestSearchErrors(t *testing.T) {
 		for name, search := range searchers {
 			if name == searcherName {
 				name := name
-				newSearchers[name] = func(*DB, context.Context, string, int, int) searchResponse {
+				newSearchers[name] = func(*DB, context.Context, string, int, int, int) searchResponse {
 					return searchResponse{
 						source: name,
 						err:    errors.New("bad"),
@@ -357,44 +363,35 @@ func TestSearchErrors(t *testing.T) {
 		{
 			label:       "error in first result",
 			searchers:   errorIn("popular"),
-			resultOrder: []string{"popular", "estimate", "deep"},
+			resultOrder: []string{"popular", "deep"},
 			wantErr:     true,
 		},
 		{
 			label:       "return before error",
 			searchers:   errorIn("deep"),
-			resultOrder: []string{"popular", "estimate", "deep"},
+			resultOrder: []string{"popular", "deep"},
 			wantSource:  "popular",
-		},
-		{
-			label:       "error waiting for count",
-			searchers:   errorIn("deep"),
-			resultOrder: []string{"popular", "deep", "estimate"},
-			wantErr:     true,
 		},
 		{
 			label:       "counted result before error",
 			searchers:   errorIn("popular"),
-			resultOrder: []string{"deep", "popular", "estimate"},
+			resultOrder: []string{"deep", "popular"},
 			wantSource:  "deep",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.label, func(t *testing.T) {
-			defer ResetTestDB(testDB, t)
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
+			testDB, release := acquire(t)
+			defer release()
 			modules := importGraph("foo.com/A", "", 0)
 			for _, v := range modules {
-				if err := testDB.InsertModule(ctx, v); err != nil {
-					t.Fatal(err)
-				}
+				MustInsertModule(ctx, t, testDB, v)
 			}
 			if _, err := testDB.UpdateSearchDocumentsImportedByCount(ctx); err != nil {
 				t.Fatal(err)
 			}
 			guardTestResult := resultGuard(test.resultOrder)
-			resp, err := testDB.hedgedSearch(ctx, "foo", 2, 0, test.searchers, guardTestResult)
+			resp, err := testDB.hedgedSearch(ctx, "foo", 2, 0, 100, test.searchers, guardTestResult)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("hedgedSearch(): got error %v, want error: %t", err, test.wantErr)
 			}
@@ -409,28 +406,44 @@ func TestSearchErrors(t *testing.T) {
 }
 
 func TestInsertSearchDocumentAndSearch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
 	var (
 		modGoCDK = "gocloud.dev"
-		pkgGoCDK = &internal.LegacyPackage{
-			Name:              "cloud",
-			Path:              "gocloud.dev/cloud",
-			Synopsis:          "Package cloud contains a library and tools for open cloud development in Go. The Go Cloud Development Kit (Go CDK)",
-			IsRedistributable: true, // required because some test cases depend on the README contents
+		pkgGoCDK = &internal.Unit{
+			UnitMeta: internal.UnitMeta{
+				Name:              "cloud",
+				Path:              "gocloud.dev/cloud",
+				IsRedistributable: true, // required because some test cases depend on the README contents
+			},
+			Documentation: []*internal.Documentation{{
+				GOOS:     sample.GOOS,
+				GOARCH:   sample.GOARCH,
+				Synopsis: "Package cloud contains a library and tools for open cloud development in Go. The Go Cloud Development Kit (Go CDK)",
+				Source:   []byte{},
+			}},
 		}
 
 		modKube = "k8s.io"
-		pkgKube = &internal.LegacyPackage{
-			Name:              "client-go",
-			Path:              "k8s.io/client-go",
-			Synopsis:          "Package client-go implements a Go client for Kubernetes.",
-			IsRedistributable: true, // required because some test cases depend on the README contents
+		pkgKube = &internal.Unit{
+			UnitMeta: internal.UnitMeta{
+				Name:              "client-go",
+				Path:              "k8s.io/client-go",
+				IsRedistributable: true, // required because some test cases depend on the README contents
+			},
+			Documentation: []*internal.Documentation{{
+				GOOS:     sample.GOOS,
+				GOARCH:   sample.GOARCH,
+				Synopsis: "Package client-go implements a Go client for Kubernetes.",
+				Source:   []byte{},
+			}},
 		}
 
 		kubeResult = func(score float64, numResults uint64) *internal.SearchResult {
 			return &internal.SearchResult{
 				Name:        pkgKube.Name,
 				PackagePath: pkgKube.Path,
-				Synopsis:    pkgKube.Synopsis,
+				Synopsis:    pkgKube.Documentation[0].Synopsis,
 				Licenses:    []string{"MIT"},
 				CommitTime:  sample.CommitTime,
 				Version:     sample.VersionString,
@@ -444,7 +457,7 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 			return &internal.SearchResult{
 				Name:        pkgGoCDK.Name,
 				PackagePath: pkgGoCDK.Path,
-				Synopsis:    pkgGoCDK.Synopsis,
+				Synopsis:    pkgGoCDK.Documentation[0].Synopsis,
 				Licenses:    []string{"MIT"},
 				CommitTime:  sample.CommitTime,
 				Version:     sample.VersionString,
@@ -461,9 +474,9 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 		cloudScore    = 0.8654518127441406
 	)
 
-	for _, tc := range []struct {
+	for _, test := range []struct {
 		name          string
-		packages      map[string]*internal.LegacyPackage
+		packages      map[string]*internal.Unit
 		limit, offset int
 		searchQuery   string
 		want          []*internal.SearchResult
@@ -471,7 +484,7 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 		{
 			name:        "two documents, single term search",
 			searchQuery: "package",
-			packages: map[string]*internal.LegacyPackage{
+			packages: map[string]*internal.Unit{
 				modGoCDK: pkgGoCDK,
 				modKube:  pkgKube,
 			},
@@ -485,7 +498,7 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 			limit:       1,
 			offset:      0,
 			searchQuery: "package",
-			packages: map[string]*internal.LegacyPackage{
+			packages: map[string]*internal.Unit{
 				modKube:  pkgKube,
 				modGoCDK: pkgGoCDK,
 			},
@@ -498,7 +511,7 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 			limit:       1,
 			offset:      1,
 			searchQuery: "package",
-			packages: map[string]*internal.LegacyPackage{
+			packages: map[string]*internal.Unit{
 				modGoCDK: pkgGoCDK,
 				modKube:  pkgKube,
 			},
@@ -509,7 +522,7 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 		{
 			name:        "two documents, multiple term search",
 			searchQuery: "go & cdk",
-			packages: map[string]*internal.LegacyPackage{
+			packages: map[string]*internal.Unit{
 				modGoCDK: pkgGoCDK,
 				modKube:  pkgKube,
 			},
@@ -520,7 +533,7 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 		{
 			name:        "one document, single term search",
 			searchQuery: "cloud",
-			packages: map[string]*internal.LegacyPackage{
+			packages: map[string]*internal.Unit{
 				modGoCDK: pkgGoCDK,
 			},
 			want: []*internal.SearchResult{
@@ -529,26 +542,22 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 		},
 	} {
 		for method, searcher := range searchers {
-			t.Run(tc.name+":"+method, func(t *testing.T) {
-				defer ResetTestDB(testDB, t)
+			t.Run(test.name+":"+method, func(t *testing.T) {
+				testDB, release := acquire(t)
+				defer release()
 
-				ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-				defer cancel()
-
-				for modulePath, pkg := range tc.packages {
-					pkg.Licenses = sample.LicenseMetadata
+				for modulePath, pkg := range test.packages {
+					pkg.Licenses = sample.LicenseMetadata()
 					m := sample.Module(modulePath, sample.VersionString)
-					sample.AddPackage(m, pkg)
-					if err := testDB.InsertModule(ctx, m); err != nil {
-						t.Fatal(err)
-					}
+					sample.AddUnit(m, pkg)
+					MustInsertModule(ctx, t, testDB, m)
 				}
 
-				if tc.limit < 1 {
-					tc.limit = 10
+				if test.limit < 1 {
+					test.limit = 10
 				}
 
-				got := searcher(testDB, ctx, tc.searchQuery, tc.limit, tc.offset)
+				got := searcher(testDB, ctx, test.searchQuery, test.limit, test.offset, 100)
 				if got.err != nil {
 					t.Fatal(got.err)
 				}
@@ -556,14 +565,14 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 				if err := testDB.addPackageDataToSearchResults(ctx, got.results); err != nil {
 					t.Fatal(err)
 				}
-				if len(got.results) != len(tc.want) {
-					t.Errorf("testDB.Search(%v, %d, %d) mismatch: len(got) = %d, want = %d\n", tc.searchQuery, tc.limit, tc.offset, len(got.results), len(tc.want))
+				if len(got.results) != len(test.want) {
+					t.Errorf("testDB.Search(%v, %d, %d) mismatch: len(got) = %d, want = %d\n", test.searchQuery, test.limit, test.offset, len(got.results), len(test.want))
 				}
 
 				// The searchers differ in these two fields.
 				opt := cmpopts.IgnoreFields(internal.SearchResult{}, "Approximate", "NumResults")
-				if diff := cmp.Diff(tc.want, got.results, opt); diff != "" {
-					t.Errorf("testDB.Search(%v, %d, %d) mismatch (-want +got):\n%s", tc.searchQuery, tc.limit, tc.offset, diff)
+				if diff := cmp.Diff(test.want, got.results, opt); diff != "" {
+					t.Errorf("testDB.Search(%v, %d, %d) mismatch (-want +got):\n%s", test.searchQuery, test.limit, test.offset, diff)
 				}
 			})
 		}
@@ -573,8 +582,9 @@ func TestInsertSearchDocumentAndSearch(t *testing.T) {
 func TestSearchPenalties(t *testing.T) {
 	// Verify that the penalties for non-redistributable modules and modules without
 	// go.mod files are applied correctly.
-	defer ResetTestDB(testDB, t)
-
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
@@ -593,17 +603,15 @@ func TestSearchPenalties(t *testing.T) {
 
 	for path, m := range modules {
 		v := sample.Module(path, sample.VersionString, "p")
-		v.LegacyPackages[0].IsRedistributable = m.redist
+		v.Packages()[0].IsRedistributable = m.redist
 		v.IsRedistributable = m.redist
 		v.HasGoMod = m.hasGoMod
-		if err := testDB.InsertModule(ctx, v); err != nil {
-			t.Fatal(err)
-		}
+		MustInsertModule(ctx, t, testDB, v)
 	}
 
 	for method, searcher := range searchers {
 		t.Run(method, func(t *testing.T) {
-			res := searcher(testDB, ctx, "foo", 10, 0)
+			res := searcher(testDB, ctx, "foo", 10, 0, 100)
 			if res.err != nil {
 				t.Fatal(res.err)
 			}
@@ -623,22 +631,22 @@ func TestSearchPenalties(t *testing.T) {
 
 func TestExcludedFromSearch(t *testing.T) {
 	// Verify that excluded paths are omitted from search results.
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	defer ResetTestDB(testDB, t)
 
 	// Insert a module with two packages.
 	const domain = "exclude.com"
-	sm := sample.Module(domain, "v1.2.3", "pkg", "exclude")
-	if err := testDB.InsertModule(ctx, sm); err != nil {
-		t.Fatal(err)
-	}
+	sm := sample.Module(domain, "v1.2.3", "pkg", "ex/clude")
+	MustInsertModule(ctx, t, testDB, sm)
 	// Exclude a prefix that matches one of the packages.
 	if err := testDB.InsertExcludedPrefix(ctx, domain+"/ex", "no user", "no reason"); err != nil {
 		t.Fatal(err)
 	}
 	// Search for both packages.
-	gotResults, err := testDB.Search(ctx, domain, 10, 0)
+	gotResults, err := testDB.Search(ctx, domain, 10, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -648,6 +656,62 @@ func TestExcludedFromSearch(t *testing.T) {
 	}
 	want := []string{"pkg"}
 	if !cmp.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestSearchBypass(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	bypassDB := NewBypassingLicenseCheck(testDB.db)
+
+	m := nonRedistributableModule()
+	MustInsertModule(ctx, t, bypassDB, m)
+
+	for _, test := range []struct {
+		db        *DB
+		wantEmpty bool
+	}{
+		{testDB, true},
+		{bypassDB, false},
+	} {
+		rs, err := test.db.Search(ctx, m.ModulePath, 10, 0, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := (rs[0].Synopsis == ""); got != test.wantEmpty {
+			t.Errorf("bypass %t: got empty %t, want %t", test.db == bypassDB, got, test.wantEmpty)
+		}
+	}
+}
+
+func TestSearchLicenseDedup(t *testing.T) {
+	// Verify that a license type appears only once even if there are multiple
+	// licenses of that type.
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+	ctx := context.Background()
+	m := sample.Module("example.com/mod", "v1.2.3", "pkg")
+	// Add a second MIT license in the pkg directory.
+	sample.AddLicense(m, &licenses.License{
+		Metadata: &licenses.Metadata{
+			Types:    []string{"MIT"},
+			FilePath: "pkg/LICENSE.md",
+		},
+	})
+	MustInsertModule(ctx, t, testDB, m)
+	got, err := testDB.Search(ctx, m.ModulePath, 10, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+	if got, want := got[0].Licenses, []string{"MIT"}; !cmp.Equal(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 }
@@ -706,7 +770,9 @@ func getSearchDocument(ctx context.Context, db *DB, path string) (*searchDocumen
 func TestUpsertSearchDocument(t *testing.T) {
 	// Verify that inserting into search_documents populates all columns correctly,
 	// both with and without a conflict.
-	defer ResetTestDB(testDB, t)
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
@@ -722,15 +788,18 @@ func TestUpsertSearchDocument(t *testing.T) {
 	}
 
 	insertModule := func(version string, gomod bool) {
-		v := sample.Module(sample.ModulePath, version, "A")
-		v.HasGoMod = gomod
-		v.LegacyPackages[0].Synopsis = "syn-" + version
-		if err := testDB.InsertModule(ctx, v); err != nil {
-			t.Fatal(err)
-		}
+		m := sample.Module(sample.ModulePath, version, "A")
+		m.HasGoMod = gomod
+		m.Packages()[0].Documentation[0].Synopsis = "syn-" + version
+		MustInsertModule(ctx, t, testDB, m)
 	}
 
 	insertModule("v1.0.0", false)
+
+	// Ensures the row updated in the search_document table for a given module
+	// is updated with a version that prefers non-incompatible modules. (The
+	// latest version after this insertion should remain v1.0.0)
+	insertModule("v2.0.0+incompatible", false)
 	sdOriginal := getSearchDocument()
 
 	insertModule("v0.5.0", true)
@@ -756,17 +825,16 @@ func TestUpsertSearchDocument(t *testing.T) {
 }
 
 func TestUpsertSearchDocumentVersionHasGoMod(t *testing.T) {
-	defer ResetTestDB(testDB, t)
-
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
 	for _, hasGoMod := range []bool{true, false} {
 		m := sample.Module(fmt.Sprintf("foo.com/%t", hasGoMod), "v1.2.3", "bar")
 		m.HasGoMod = hasGoMod
-		if err := testDB.InsertModule(ctx, m); err != nil {
-			t.Fatal(err)
-		}
+		MustInsertModule(ctx, t, testDB, m)
 	}
 
 	for _, hasGoMod := range []bool{true, false} {
@@ -782,32 +850,35 @@ func TestUpsertSearchDocumentVersionHasGoMod(t *testing.T) {
 }
 
 func TestUpdateSearchDocumentsImportedByCount(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
+	t.Parallel()
+	ctx := context.Background()
+
+	pkgPath := func(m *internal.Module) string { return m.Packages()[0].Path }
 
 	// insert package with suffix at version, return the module
-	insertPackageVersion := func(suffix, version string, imports []string) *internal.Module {
+	insertPackageVersion := func(t *testing.T, db *DB, suffix, version string, imports []string) *internal.Module {
 		t.Helper()
 		m := sample.Module("mod.com/"+suffix, version, suffix)
-		pkg := m.LegacyPackages[0]
+		// Units[0] is the module itself.
+		pkg := m.Units[1]
 		pkg.Imports = nil
 		for _, imp := range imports {
 			pkg.Imports = append(pkg.Imports, fmt.Sprintf("mod.com/%s/%[1]s", imp))
 		}
-		if err := testDB.InsertModule(ctx, m); err != nil {
-			t.Fatal(err)
-		}
+		MustInsertModule(ctx, t, db, m)
 		return m
 	}
-	updateImportedByCount := func() {
+
+	updateImportedByCount := func(db *DB) {
 		t.Helper()
-		if _, err := testDB.UpdateSearchDocumentsImportedByCount(ctx); err != nil {
+		if _, err := db.UpdateSearchDocumentsImportedByCount(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	validateImportedByCountAndGetSearchDocument := func(path string, count int) *searchDocument {
+
+	validateImportedByCountAndGetSearchDocument := func(t *testing.T, db *DB, path string, count int) *searchDocument {
 		t.Helper()
-		sd, err := getSearchDocument(ctx, testDB, path)
+		sd, err := getSearchDocument(ctx, db, path)
 		if err != nil {
 			t.Fatalf("testDB.getSearchDocument(ctx, %q): %v", path, err)
 		}
@@ -820,28 +891,27 @@ func TestUpdateSearchDocumentsImportedByCount(t *testing.T) {
 		return sd
 	}
 
-	pkgPath := func(m *internal.Module) string { return m.LegacyPackages[0].Path }
-
 	t.Run("basic", func(t *testing.T) {
-		defer ResetTestDB(testDB, t)
+		testDB, release := acquire(t)
+		defer release()
 
 		// Test imported_by_count = 0 when only pkgA is added.
-		mA := insertPackageVersion("A", "v1.0.0", nil)
-		updateImportedByCount()
-		_ = validateImportedByCountAndGetSearchDocument(pkgPath(mA), 0)
+		mA := insertPackageVersion(t, testDB, "A", "v1.0.0", nil)
+		updateImportedByCount(testDB)
+		_ = validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mA), 0)
 
 		// Test imported_by_count = 1 for pkgA when pkgB is added.
-		mB := insertPackageVersion("B", "v1.0.0", []string{"A"})
-		updateImportedByCount()
-		_ = validateImportedByCountAndGetSearchDocument(pkgPath(mA), 1)
-		sdB := validateImportedByCountAndGetSearchDocument(pkgPath(mB), 0)
+		mB := insertPackageVersion(t, testDB, "B", "v1.0.0", []string{"A"})
+		updateImportedByCount(testDB)
+		_ = validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mA), 1)
+		sdB := validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mB), 0)
 		wantSearchDocBUpdatedAt := sdB.importedByCountUpdatedAt
 
 		// Test imported_by_count = 2 for pkgA, when C is added.
-		mC := insertPackageVersion("C", "v1.0.0", []string{"A"})
-		updateImportedByCount()
-		sdA := validateImportedByCountAndGetSearchDocument(pkgPath(mA), 2)
-		sdC := validateImportedByCountAndGetSearchDocument(pkgPath(mC), 0)
+		mC := insertPackageVersion(t, testDB, "C", "v1.0.0", []string{"A"})
+		updateImportedByCount(testDB)
+		sdA := validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mA), 2)
+		sdC := validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mC), 0)
 
 		// Nothing imports C, so it has never been updated.
 		if !sdC.importedByCountUpdatedAt.IsZero() {
@@ -852,7 +922,7 @@ func TestUpdateSearchDocumentsImportedByCount(t *testing.T) {
 		}
 
 		// Test imported_by_count_updated_at for B has not changed.
-		sdB = validateImportedByCountAndGetSearchDocument(pkgPath(mB), 0)
+		sdB = validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mB), 0)
 		if sdB.importedByCountUpdatedAt != wantSearchDocBUpdatedAt {
 			t.Fatalf("expected imported_by_count_updated_at for pkgB not to have changed; old = %v, new = %v",
 				wantSearchDocBUpdatedAt, sdB.importedByCountUpdatedAt)
@@ -860,62 +930,80 @@ func TestUpdateSearchDocumentsImportedByCount(t *testing.T) {
 
 		// When an older version of A imports D, nothing happens to the counts,
 		// because imports_unique only records the latest version of each package.
-		mD := insertPackageVersion("D", "v1.0.0", nil)
-		insertPackageVersion("A", "v0.9.0", []string{"D"})
-		updateImportedByCount()
-		_ = validateImportedByCountAndGetSearchDocument(pkgPath(mA), 2)
-		_ = validateImportedByCountAndGetSearchDocument(pkgPath(mD), 0)
+		mD := insertPackageVersion(t, testDB, "D", "v1.0.0", nil)
+		insertPackageVersion(t, testDB, "A", "v0.9.0", []string{"D"})
+		updateImportedByCount(testDB)
+		_ = validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mA), 2)
+		_ = validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mD), 0)
 
 		// When a newer version of A imports D, however, the counts do change.
-		insertPackageVersion("A", "v1.1.0", []string{"D"})
-		updateImportedByCount()
-		_ = validateImportedByCountAndGetSearchDocument(pkgPath(mA), 2)
-		_ = validateImportedByCountAndGetSearchDocument(pkgPath(mD), 1)
+		insertPackageVersion(t, testDB, "A", "v1.1.0", []string{"D"})
+		updateImportedByCount(testDB)
+		_ = validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mA), 2)
+		_ = validateImportedByCountAndGetSearchDocument(t, testDB, pkgPath(mD), 1)
 	})
 
 	t.Run("alternative", func(t *testing.T) {
 		// Test with alternative modules that are removed from search_documents.
-		defer ResetTestDB(testDB, t)
+		testDB, release := acquire(t)
+		defer release()
 
-		insertPackageVersion("B", "v1.0.0", nil)
+		insertPackageVersion(t, testDB, "B", "v1.0.0", nil)
 
 		// Insert a package with the canonical module path.
-		canonicalModule := insertPackageVersion("A", "v1.0.0", []string{"B"})
+		canonicalModule := insertPackageVersion(t, testDB, "A", "v1.0.0", []string{"B"})
 
 		// Imagine we see a package with an alternative path at v1.2.0.
 		// We add that information to module_version_states.
 		alternativeModulePath := strings.ToLower(canonicalModule.ModulePath)
 		alternativeStatus := derrors.ToStatus(derrors.AlternativeModule)
-		err := testDB.UpsertModuleVersionState(ctx, alternativeModulePath, "v1.2.0", "",
-			time.Now(), alternativeStatus, canonicalModule.ModulePath, nil, nil)
-		if err != nil {
+		mvs := &ModuleVersionStateForUpsert{
+			ModulePath: alternativeModulePath,
+			Version:    "v1.2.0",
+			Timestamp:  time.Now(),
+			Status:     alternativeStatus,
+			GoModPath:  canonicalModule.ModulePath,
+		}
+		if err := testDB.UpsertModuleVersionState(ctx, mvs); err != nil {
 			t.Fatal(err)
 		}
 
 		// Now we see an earlier version of that package, without a go.mod file, so we insert it.
 		// It should not get inserted into search_documents.
 		mAlt := sample.Module(alternativeModulePath, "v1.0.0", "A")
-		mAlt.LegacyPackages[0].Imports = []string{"B"}
-		if err := testDB.InsertModule(ctx, mAlt); err != nil {
-			t.Fatal(err)
-		}
+		mAlt.Packages()[0].Imports = []string{"B"}
+		MustInsertModule(ctx, t, testDB, mAlt)
 		// Although B is imported by two packages, only one is in search_documents, so its
 		// imported-by count is 1.
-		updateImportedByCount()
-		validateImportedByCountAndGetSearchDocument("mod.com/B/B", 1)
+		updateImportedByCount(testDB)
+		validateImportedByCountAndGetSearchDocument(t, testDB, "mod.com/B/B", 1)
 	})
 }
 
 func TestGetPackagesForSearchDocumentUpsert(t *testing.T) {
-	defer ResetTestDB(testDB, t)
-
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
 	moduleA := sample.Module("mod.com", "v1.2.3",
 		"A", "A/notinternal", "A/internal", "A/internal/B")
-	if err := testDB.InsertModule(ctx, moduleA); err != nil {
-		t.Fatal(err)
+
+	// moduleA.Units[1] is mod.com/A.
+	moduleA.Units[1].Readme = &internal.Readme{
+		Filepath: sample.ReadmeFilePath,
+		Contents: sample.ReadmeContents,
+	}
+	// moduleA.Units[2] is mod.com/A/notinternal.
+	moduleA.Units[2].Readme = &internal.Readme{
+		Filepath: sample.ReadmeFilePath,
+		Contents: sample.ReadmeContents,
+	}
+	moduleN := nonRedistributableModule()
+	bypassDB := NewBypassingLicenseCheck(testDB.db)
+	for _, m := range []*internal.Module{moduleA, moduleN} {
+		MustInsertModule(ctx, t, bypassDB, m)
 	}
 
 	// We are asking for all packages in search_documents updated before now, which is
@@ -925,24 +1013,50 @@ func TestGetPackagesForSearchDocumentUpsert(t *testing.T) {
 		t.Fatal(err)
 	}
 	sort.Slice(got, func(i, j int) bool { return got[i].PackagePath < got[j].PackagePath })
-	want := []upsertSearchDocumentArgs{
+	want := []UpsertSearchDocumentArgs{
+		{
+			PackagePath:    moduleN.ModulePath,
+			ModulePath:     moduleN.ModulePath,
+			Version:        "v1.2.3",
+			ReadmeFilePath: "",
+			ReadmeContents: "",
+			Synopsis:       "",
+		},
 		{
 			PackagePath:    "mod.com/A",
 			ModulePath:     "mod.com",
+			Version:        "v1.2.3",
 			ReadmeFilePath: "README.md",
 			ReadmeContents: "readme",
-			Synopsis:       "This is a package synopsis",
+			Synopsis:       sample.Doc.Synopsis,
 		},
 		{
 			PackagePath:    "mod.com/A/notinternal",
 			ModulePath:     "mod.com",
+			Version:        "v1.2.3",
 			ReadmeFilePath: "README.md",
 			ReadmeContents: "readme",
-			Synopsis:       "This is a package synopsis",
+			Synopsis:       sample.Doc.Synopsis,
 		},
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("testDB.GetPackagesForSearchDocumentUpsert mismatch(-want +got):\n%s", diff)
+	}
+
+	// Reading with license bypass should return the non-redistributable fields.
+	got, err = bypassDB.GetPackagesForSearchDocumentUpsert(ctx, time.Now(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("len(got)==0")
+	}
+	sort.Slice(got, func(i, j int) bool { return got[i].PackagePath < got[j].PackagePath })
+	gm := got[0]
+	for _, got := range []string{gm.ReadmeFilePath, gm.ReadmeContents, gm.Synopsis} {
+		if got == "" {
+			t.Errorf("got empty field, want non-empty")
+		}
 	}
 
 	// pkgPaths should be an empty slice, all packages were inserted more recently than yesterday.
@@ -956,6 +1070,10 @@ func TestGetPackagesForSearchDocumentUpsert(t *testing.T) {
 }
 
 func TestHllHash(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
+
 	tests := []string{
 		"",
 		"The lazy fox.",
@@ -978,6 +1096,9 @@ func TestHllHash(t *testing.T) {
 }
 
 func TestHllZeros(t *testing.T) {
+	t.Parallel()
+	testDB, release := acquire(t)
+	defer release()
 	tests := []struct {
 		i    int64
 		want int
@@ -1003,8 +1124,10 @@ func TestHllZeros(t *testing.T) {
 }
 
 func TestDeleteOlderVersionFromSearch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
-	defer ResetTestDB(testDB, t)
+	testDB, release := acquire(t)
+	defer release()
 
 	const (
 		modulePath = "deleteme.com"
@@ -1019,9 +1142,7 @@ func TestDeleteOlderVersionFromSearch(t *testing.T) {
 	}
 	insert := func(m module) {
 		sm := sample.Module(m.path, m.version, m.pkg)
-		if err := testDB.InsertModule(ctx, sm); err != nil {
-			t.Fatal(err)
-		}
+		MustInsertModule(ctx, t, testDB, sm)
 	}
 
 	check := func(m module) {
