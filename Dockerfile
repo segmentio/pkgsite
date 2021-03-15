@@ -48,4 +48,4 @@ EXPOSE 3000
 #
 #    docker run pkgsite <proxy-url>
 #
-ENTRYPOINT ["frontend", "-host", ":3000", "-static", "/var/lib/pkgsite/content/static", "-third_party", "/var/lib/pkgsite/third_party", "-direct_proxy", "-proxy_url", "-bypass_license_check"]
+ENTRYPOINT ["frontend", "-host", ":3000", "-static", "/var/lib/pkgsite/content/static", "-third_party", "/var/lib/pkgsite/third_party", "-bypass_license_check", "-direct_proxy", "-proxy_url"]
