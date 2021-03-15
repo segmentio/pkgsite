@@ -1,4 +1,4 @@
-FROM golang:1.14.2 as build
+FROM golang:1.16.2 as build
 RUN apt-get update && apt-get install -y build-essential git libc-dev
 
 # Pull dependencies first to leverage docker layer caching.
@@ -48,4 +48,4 @@ EXPOSE 3000
 #
 #    docker run pkgsite <proxy-url>
 #
-ENTRYPOINT ["frontend", "-http", ":3000", "-static", "/var/lib/pkgsite/content/static", "-third_party", "/var/lib/pkgsite/third_party", "-direct_proxy", "-proxy_url"]
+ENTRYPOINT ["frontend", "-host", ":3000", "-static", "/var/lib/pkgsite/content/static", "-third_party", "/var/lib/pkgsite/third_party", "-direct_proxy", "-proxy_url", "-bypass_license_check"]
